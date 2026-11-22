@@ -487,3 +487,81 @@ test("createLlmClient sets redirect error, sanitizes HTTP errors, bounds SSE siz
   assert.equal(fuzzyGate.shouldReply, false);
   assert.equal(fuzzyGate.usedGateModel, true);
 });
+
+test("B1-REWORK-2: trailing SSE catch, bounded gate response, extraBody omission, and empty ?/# URLs", async () => {
+  // 1. loadConfig rejects trailing empty ? and # URL delimiters
+  assert.throws(
+    () => loadConfig({ env: { LLM_BASE_URL: "https://api.example.com/v1?" }, fsImpl: makeMemoryFs() }),
+    RangeError,
+  );
+  assert.throws(
+    () => loadConfig({ env: { LLM_BASE_URL: "https://api.example.com/v1#" }, fsImpl: makeMemoryFs() }),
+    RangeError,
+  );
+
+  // 2. redactConfig omits llm.extraBody completely so arbitrary fields never leak
+  const cfgWithExtra = loadConfig({
+    env: { LLM_PROVIDER: "opencode", LLM_API_KEY: "oc-key" },
+    configPath: "config.json",
+    fsImpl: makeMemoryFs({
+      "config.json": JSON.stringify({
+        llm: {
+          headers: { "x-opencode-client": "discord-voice-companion" },
+          extraBody: { custom_auth: "leak" },
+        },
+      }),
+    }),
+  });
+  const redacted = redactConfig(cfgWithExtra);
+  assert.equal(redacted.llm.headers["x-opencode-client"], "discord-voice-companion");
+  assert.equal(Object.hasOwn(redacted.llm, "extraBody"), false);
+
+  // 3. Final SSE data: chunk without trailing \n must not swallow onToken or maxReplyChars errors
+  const tokenErrClient = createLlmClient({
+    config: cfgWithExtra,
+    fetchImpl: async () => makeSseResponse(['data: {"choices":[{"delta":{"content":"tail"}}]}']),
+  });
+  await assert.rejects(
+    () =>
+      tokenErrClient.streamReply({
+        messages: [{ role: "user", content: "hi" }],
+        onToken: () => {
+          throw new Error("token sink boom");
+        },
+      }),
+    /token sink boom/,
+  );
+
+  const maxCharsClient = createLlmClient({
+    config: cfgWithExtra,
+    maxReplyChars: 3,
+    fetchImpl: async () => makeSseResponse(['data: {"choices":[{"delta":{"content":"abcd"}}]}']),
+  });
+  await assert.rejects(
+    () => maxCharsClient.streamReply({ messages: [{ role: "user", content: "hi" }] }),
+    /size limit/i,
+  );
+
+  // 4. shouldChimeIn cancels and fails closed with gate_error on >16384-byte response body
+  let cancelledBigGate = false;
+  const bigGateClient = createLlmClient({
+    config: cfgWithExtra,
+    fetchImpl: async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode("x".repeat(20000)));
+        },
+        cancel() {
+          cancelledBigGate = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    },
+  });
+  const bigGate = await bigGateClient.shouldChimeIn({
+    transcript: "Anyone home?",
+    speakerName: "Nate",
+  });
+  assert.deepEqual(bigGate, { shouldReply: false, reason: "gate_error", usedGateModel: true });
+  assert.equal(cancelledBigGate, true);
+});

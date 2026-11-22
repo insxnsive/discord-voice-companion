@@ -7,6 +7,7 @@ const DEFAULT_REPLY_TIMEOUT_MS = 15000;
 const DEFAULT_MAX_STREAM_BYTES = 262144;
 const DEFAULT_MAX_LINE_CHARS = 16384;
 const DEFAULT_MAX_REPLY_CHARS = 8192;
+const MAX_GATE_BYTES = 16384;
 
 /**
  * Remove bracketed performance tags like [laughs] or [whispers] while keeping
@@ -204,6 +205,42 @@ function createTimeoutController(timeoutMs, label) {
   };
 }
 
+async function readBoundedJson(response, maxBytes = MAX_GATE_BYTES) {
+  if (!response.body) {
+    const buf = await response.arrayBuffer();
+    if (buf.byteLength > maxBytes) {
+      throw new Error("Gate response exceeded size limit");
+    }
+    return JSON.parse(new TextDecoder("utf-8").decode(buf));
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error("Gate response exceeded size limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8").decode(combined));
+}
+
 /**
  * Create an OpenAI-compatible streaming reply and 1-token turn-gate client.
  */
@@ -371,11 +408,14 @@ export function createLlmClient({
         }
         const tailData = carry.trim().slice(5).trim();
         if (tailData && tailData !== "[DONE]") {
+          let chunk = null;
           try {
-            const chunk = JSON.parse(tailData);
-            appendDelta(chunk?.choices?.[0]?.delta?.content);
+            chunk = JSON.parse(tailData);
           } catch {
             // Ignore incomplete trailing JSON fragment at stream EOF.
+          }
+          if (chunk) {
+            appendDelta(chunk?.choices?.[0]?.delta?.content);
           }
         }
       }
@@ -455,7 +495,7 @@ export function createLlmClient({
         return { shouldReply: false, reason: "gate_http_error", usedGateModel: true };
       }
 
-      const payload = await response.json();
+      const payload = await readBoundedJson(response, MAX_GATE_BYTES);
       const answer = payload?.choices?.[0]?.message?.content?.trim() ?? "";
       if (/^yes$/i.test(answer)) {
         return { shouldReply: true, reason: "gate_yes", usedGateModel: true };

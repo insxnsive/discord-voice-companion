@@ -151,13 +151,13 @@ export function validateEndpointUrl(rawUrl, label = "url") {
   if (parsed.username || parsed.password) {
     throw new RangeError(`${label} must not contain credentials`);
   }
-  if (parsed.search || parsed.hash) {
+  if (rawUrl.includes("?") || rawUrl.includes("#") || parsed.search || parsed.hash) {
     throw new RangeError(`${label} must not contain query parameters or fragments`);
   }
   if (parsed.protocol === "http:" && !LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
     throw new RangeError(`${label} must use https: for non-loopback hosts`);
   }
-  return rawUrl.replace(/\/+$/, "");
+  return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
 }
 
 function parseEnum(raw, allowed, fallback, label) {
@@ -450,7 +450,7 @@ function redactNode(value, inHeaders = false) {
 
   const copy = {};
   for (const key of Object.keys(value)) {
-    if (FORBIDDEN_KEYS.has(key)) continue;
+    if (FORBIDDEN_KEYS.has(key) || key === "extraBody") continue;
     const entry = value[key];
     if (inHeaders) {
       copy[key] =
