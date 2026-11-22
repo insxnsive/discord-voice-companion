@@ -1412,3 +1412,51 @@ test("eviction reset that re-enters admission is caught by the recheck", async (
   assert.deepEqual([...vad.speakers.keys()].sort(), ["b", "v"]);
   assert.equal(vad.speakers.size, 2);
 });
+
+test("the VAD default timestamp uses the monotonic clock, not Date.now", async () => {
+  const realDateNow = Date.now;
+  Date.now = () => 1_000_000_000_000;
+  try {
+    const vad = new PerSpeakerVad({
+      detectorFactory: () => () => 0.1,
+      maxSpeakers: 2,
+    });
+    await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(0) });
+    const state = vad.speakers.get("u1");
+    assert.ok(state.lastSeenAt < 1_000_000_000_000);
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test("flushSpeaker finalizes after frames queued behind the speaker chain", async () => {
+  const ends = [];
+  let releaseGate;
+  const gate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+  let detections = 0;
+
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => async () => {
+      detections += 1;
+      if (detections === 1) await gate;
+      return 0.9;
+    },
+    minSpeechMs: 20,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  const frame = monoFrame(9000);
+  const first = vad.pushFrame({ userId: "u1", pcm16kMono: frame, timestampMs: 20 });
+  await new Promise((resolve) => setImmediate(resolve));
+  const flush = vad.flushSpeaker("u1", 100);
+  releaseGate();
+  await first;
+  const result = await flush;
+
+  assert.equal(result.flushed, true);
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0].pcm16kMono.length, VAD_FRAME_BYTES);
+  assert.equal(ends[0].durationMs, 20);
+});

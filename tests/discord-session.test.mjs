@@ -2447,3 +2447,333 @@ test("a throwing receiver removal cannot mask the setup error or skip cleanup", 
   assert.equal(orchestrator.getStatus().guildId, null);
   assert.deepEqual(orchestrator.getStatus().mutedUsers, []);
 });
+
+test("the tail dedupe keeps a flush-enqueued clause from being spoken twice", async () => {
+  const tts = makeTts();
+  const llm = {
+    async shouldChimeIn() {
+      return { shouldReply: true };
+    },
+    async streamReply({ onToken }) {
+      onToken("Hello there.");
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    ttsAdapter: tts,
+    llmClient: llm,
+    createClauseSplitterImpl: ({ onClause }) => {
+      let buffer = "";
+      return {
+        push(delta) {
+          buffer += delta;
+          return [];
+        },
+        flush() {
+          const clause = buffer.trim();
+          buffer = "";
+          if (!clause) return [];
+          onClause(clause);
+          return [clause];
+        },
+      };
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.deepEqual(tts.state.calls, ["Hello there."]);
+});
+
+test("a finished turn's deadline does not fire later", async () => {
+  const { orchestrator, vad } = buildOrchestrator({
+    config: {
+      reactions: { mode: "adaptive", fillerDelayMs: 165 },
+      chime: { mode: "smart" },
+      turnDeadlineMs: 40,
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(orchestrator.getStatus().lastError, null);
+});
+
+test("the orchestrator clock drives VAD utterance timestamps", async () => {
+  const CLOCK = 424242;
+  const starts = [];
+  const tracker = {
+    startTurn(turnId, t0) {
+      starts.push(t0);
+    },
+    mark() {},
+    finishTurn() {},
+    formatSummary() {
+      return "";
+    },
+    getLast() {
+      return null;
+    },
+  };
+
+  let decodeCalls = 0;
+  const opusTranscoder = {
+    backend: "opusscript",
+    encode: () => Buffer.alloc(2),
+    decode() {
+      decodeCalls += 1;
+      const buffer = Buffer.alloc(3840);
+      if (decodeCalls <= 13) {
+        for (let offset = 0; offset < buffer.length; offset += 2) {
+          buffer.writeInt16LE(9000, offset);
+        }
+      }
+      return buffer;
+    },
+  };
+
+  const orchestrator = createVoiceOrchestrator({
+    config: {},
+    botUserId: "bot-1",
+    sttAdapter: makeStt(),
+    llmClient: makeLlm(),
+    ttsAdapter: makeTts(),
+    opusTranscoder,
+    latencyTracker: tracker,
+    now: () => CLOCK,
+    playerSink: makePlayerSink(),
+    loadVoiceDeps: async () => {
+      throw new Error("voice deps disabled in tests");
+    },
+    verifyDaveImpl: async () => ({ daveReady: true, opusBackend: "opusscript" }),
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  for (let i = 0; i < 25; i += 1) {
+    await orchestrator.handleOpusPacket({
+      guildId: "g1",
+      channelId: "c1",
+      userId: "u1",
+      displayName: "Ana",
+      opusPacket: Buffer.alloc(8),
+    });
+  }
+  await tick(5);
+
+  assert.ok(starts.length >= 1);
+  assert.equal(starts[0], CLOCK);
+});
+
+test("the first speech after launch is not a follow-up", async () => {
+  const llm = makeLlm();
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(llm.state.gateArgs[0].lastBotReplyAt, null);
+});
+
+test("a speaker lookup that spans a reset does not seed the new session cache", async () => {
+  let fetchCalls = 0;
+  let releaseFirst;
+  const client = {
+    user: { id: "bot-1" },
+    users: { cache: new Map() },
+    guilds: {
+      cache: new Map([
+        [
+          "g1",
+          {
+            members: {
+              cache: new Map(),
+              fetch() {
+                fetchCalls += 1;
+                if (fetchCalls === 1) {
+                  return new Promise((resolve) => {
+                    releaseFirst = resolve;
+                  });
+                }
+                return Promise.resolve({ user: { bot: false } });
+              },
+            },
+          },
+        ],
+      ]),
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ client, botUserId: "bot-1" });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const stale = orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "late",
+    opusPacket: Buffer.alloc(8),
+  });
+  await tick(5);
+  assert.equal(fetchCalls, 1);
+
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+  releaseFirst({ user: { bot: false } });
+  await stale;
+
+  await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c2",
+    userId: "late",
+    opusPacket: Buffer.alloc(8),
+  });
+
+  assert.equal(fetchCalls, 2);
+  assert.equal(vad.pushes.length, 1);
+});
+
+test("a failed lookup that spans a reset does not negative-cache the new session", async () => {
+  let fetchCalls = 0;
+  let rejectFirst;
+  const client = {
+    user: { id: "bot-1" },
+    users: { cache: new Map() },
+    guilds: {
+      cache: new Map([
+        [
+          "g1",
+          {
+            members: {
+              cache: new Map(),
+              fetch() {
+                fetchCalls += 1;
+                if (fetchCalls === 1) {
+                  return new Promise((resolve, reject) => {
+                    rejectFirst = reject;
+                  });
+                }
+                return Promise.resolve({ user: { bot: false } });
+              },
+            },
+          },
+        ],
+      ]),
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ client, botUserId: "bot-1" });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const stale = orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "late",
+    opusPacket: Buffer.alloc(8),
+  });
+  await tick(5);
+  assert.equal(fetchCalls, 1);
+
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+  rejectFirst(new Error("rest down"));
+  await stale;
+
+  await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c2",
+    userId: "late",
+    opusPacket: Buffer.alloc(8),
+  });
+
+  assert.equal(fetchCalls, 2);
+  assert.equal(vad.pushes.length, 1);
+});
+
+test("a superseded turn's deadline handle is canceled before its STT finishes", async () => {
+  let sttCalls = 0;
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe() {
+      sttCalls += 1;
+      if (sttCalls === 1) return await new Promise(() => {});
+      return "hello";
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    sttAdapter: stt,
+    config: {
+      reactions: { mode: "adaptive", fillerDelayMs: 165 },
+      chime: { mode: "smart" },
+      turnDeadlineMs: 5000,
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const scheduled = new Map();
+  let nextTimerId = 1;
+  globalThis.setTimeout = (fn) => {
+    const id = nextTimerId;
+    nextTimerId += 1;
+    scheduled.set(id, fn);
+    return id;
+  };
+  globalThis.clearTimeout = (id) => {
+    scheduled.delete(id);
+  };
+
+  try {
+    vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "Ana",
+      pcm16kMono: PCM16K,
+      durationMs: 300,
+      endedAt: 0,
+    });
+    await Promise.resolve();
+    const firstDeadline = scheduled.keys().next().value;
+    assert.ok(firstDeadline !== undefined);
+
+    const second = vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "Ana",
+      pcm16kMono: PCM16K,
+      durationMs: 300,
+      endedAt: 100,
+    });
+    await Promise.resolve();
+
+    assert.equal(scheduled.has(firstDeadline), false);
+    assert.equal(orchestrator.getStatus().lastError, null);
+
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    await second;
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+});
