@@ -5,6 +5,8 @@ import {
   DISCORD_FRAME_BYTES,
   DISCORD_FRAME_SAMPLES,
   DISCORD_SAMPLE_RATE,
+  MAX_AUDIO_CHUNK_BYTES,
+  MAX_OPUS_PACKET_BYTES,
   TTS_SAMPLE_RATE,
   VAD_SAMPLE_RATE,
   createFrameAccumulator,
@@ -19,6 +21,7 @@ import {
   PerSpeakerVad,
   computeRms,
   createRmsSpeechDetector,
+  createSileroDetector,
 } from "../src/audio/vad.mjs";
 
 const VAD_FRAME_SAMPLES = (VAD_SAMPLE_RATE * 20) / 1000;
@@ -174,7 +177,7 @@ test("createOpusTranscoder prefers native, falls back to opusscript, and forward
     loadNative: async () => ({ OpusEncoder: MockNativeEncoder }),
   });
   assert.equal(nativeOnly.backend, "native");
-  assert.deepEqual(nativeOnly.encode(Buffer.from([1, 2, 3]))[0], 0x0a);
+  assert.deepEqual(nativeOnly.encode(Buffer.alloc(DISCORD_FRAME_BYTES, 3))[0], 0x0a);
 
   const calls = [];
   class MockOpusScript {
@@ -203,9 +206,11 @@ test("createOpusTranscoder prefers native, falls back to opusscript, and forward
   assert.equal(transcoder.backend, "opusscript");
   assert.deepEqual(calls, [[DISCORD_SAMPLE_RATE, 2, 2049]]);
 
-  const encoded = transcoder.encode(Buffer.from([9, 8, 7, 6, 5]));
+  const frame = Buffer.alloc(DISCORD_FRAME_BYTES, 7);
+  frame.writeUInt8(9, 0);
+  const encoded = transcoder.encode(frame);
   assert.equal(encoded[0], 0x01);
-  assert.ok(encoded.subarray(1).equals(Buffer.from([9, 8, 7, 6])));
+  assert.ok(encoded.subarray(1).equals(frame.subarray(0, 4)));
 
   const decoded = transcoder.decode(Buffer.from([4, 3]));
   assert.equal(decoded[0], 0x02);
@@ -338,4 +343,227 @@ test("computeRms tracks amplitude and the RMS detector maps it to confidence", (
   const quietProbability = detect(quiet);
   assert.ok(quietProbability > 0);
   assert.ok(quietProbability < 0.5);
+});
+
+test("PerSpeakerVad rejects malformed frames before creating speaker state", async () => {
+  const { vad } = makeVad();
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "u1", pcm16kMono: Buffer.alloc(641), timestampMs: 0 }),
+    RangeError,
+  );
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "u1", pcm16kMono: Buffer.alloc(6401), timestampMs: 0 }),
+    RangeError,
+  );
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "u1", pcm16kMono: new Float32Array(320), timestampMs: 0 }),
+    TypeError,
+  );
+
+  assert.equal(vad.speakers.size, 0);
+});
+
+test("PerSpeakerVad stops an utterance at the byte budget during short pauses", async () => {
+  const { vad, events } = makeVad({ minSpeechMs: 40, maxUtteranceBytes: 1920, hangoverMs: 240 });
+  let timestampMs = 0;
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: (timestampMs += 20) });
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: (timestampMs += 20) });
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(0), timestampMs: (timestampMs += 20) });
+
+  assert.equal(events.drops.length, 0);
+  assert.equal(events.ends.length, 1);
+  assert.equal(events.ends[0].durationMs, 40);
+  assert.equal(events.ends[0].pcm16kMono.length, 3 * VAD_FRAME_BYTES);
+});
+
+test("PerSpeakerVad bounds the speaker map and evicts idle speakers", async () => {
+  const bounded = makeVad({ maxSpeakers: 3 }).vad;
+  for (let i = 0; i < 5; i += 1) {
+    await bounded.pushFrame({ userId: `user-${i}`, pcm16kMono: monoFrame(0), timestampMs: 1000 });
+  }
+  assert.equal(bounded.speakers.size, 3);
+
+  const transient = makeVad({ maxSpeakers: 4, idleSpeakerTtlMs: 100 }).vad;
+  for (let i = 0; i < 100; i += 1) {
+    await transient.pushFrame({ userId: `transient-${i}`, pcm16kMono: monoFrame(0), timestampMs: i * 1000 });
+  }
+  assert.ok(transient.speakers.size <= 4);
+});
+
+test("PerSpeakerVad drops buffered state when muted or reset mid-detection", async () => {
+  let releaseMute;
+  const muteGate = new Promise((resolve) => {
+    releaseMute = resolve;
+  });
+  const muted = { starts: [], ends: [] };
+  const vadMuted = new PerSpeakerVad({
+    detectorFactory: () => async () => {
+      await muteGate;
+      return 0.9;
+    },
+    onSpeechStart: (event) => muted.starts.push(event),
+    onSpeechEnd: (event) => muted.ends.push(event),
+  });
+
+  const mutedFrame = vadMuted.pushFrame({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 20,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  vadMuted.setIgnoredUsers(["u1"]);
+  releaseMute();
+  await mutedFrame;
+
+  assert.equal(vadMuted.speakers.has("u1"), false);
+  assert.equal(muted.starts.length, 0);
+  assert.equal(muted.ends.length, 0);
+
+  let releaseReset;
+  const resetGate = new Promise((resolve) => {
+    releaseReset = resolve;
+  });
+  const reset = { ends: [] };
+  const vadReset = new PerSpeakerVad({
+    detectorFactory: () => async () => {
+      await resetGate;
+      return 0.9;
+    },
+    onSpeechEnd: (event) => reset.ends.push(event),
+  });
+
+  const resetFrame = vadReset.pushFrame({ userId: "u2", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  await new Promise((resolve) => setImmediate(resolve));
+  vadReset.resetSpeaker("u2");
+  releaseReset();
+  await resetFrame;
+
+  assert.equal(vadReset.speakers.has("u2"), false);
+  assert.equal(reset.ends.length, 0);
+});
+
+test("PerSpeakerVad serializes concurrent frames and applies backpressure", async () => {
+  let factoryCalls = 0;
+  const vad = new PerSpeakerVad({
+    maxPendingFrames: 4,
+    detectorFactory: async () => {
+      factoryCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return () => 0.9;
+    },
+  });
+
+  const results = await Promise.all(
+    Array.from({ length: 10 }, (_, index) =>
+      vad.pushFrame({ userId: "new-user", pcm16kMono: monoFrame(9000), timestampMs: index * 20 }),
+    ),
+  );
+
+  assert.equal(factoryCalls, 1);
+  assert.equal(vad.speakers.size, 1);
+  assert.ok(results.filter((result) => result?.dropped === "backpressure").length > 0);
+});
+
+test("createFrameAccumulator copies frames and rejects oversized chunks", () => {
+  assert.throws(() => createFrameAccumulator().push(Buffer.alloc(MAX_AUDIO_CHUNK_BYTES + 2)), RangeError);
+
+  const accumulator = createFrameAccumulator(DISCORD_FRAME_BYTES, { maxChunkBytes: 8192 });
+  assert.throws(() => accumulator.push(Buffer.alloc(8193)), RangeError);
+
+  const chunk = Buffer.alloc(8192, 7);
+  const frames = accumulator.push(chunk);
+  assert.equal(frames.length, 2);
+  assert.notEqual(frames[0].buffer, chunk.buffer);
+  chunk.fill(0);
+  assert.equal(frames[0][0], 7);
+  assert.equal(frames[1][0], 7);
+});
+
+test("createOpusTranscoder validates frame size and packet bounds", async () => {
+  class MockEncoder {
+    encode(frame) {
+      return Buffer.from([frame.length % 256]);
+    }
+
+    decode(packet) {
+      return Buffer.alloc(packet.length);
+    }
+  }
+
+  const transcoder = await createOpusTranscoder({
+    loadNative: async () => ({ OpusEncoder: MockEncoder }),
+  });
+
+  assert.throws(() => transcoder.encode(Buffer.alloc(DISCORD_FRAME_BYTES - 2)), RangeError);
+  assert.throws(() => transcoder.encode(Buffer.alloc(DISCORD_FRAME_BYTES + 2)), RangeError);
+  assert.throws(() => transcoder.encode("not pcm"), TypeError);
+  assert.equal(transcoder.encode(Buffer.alloc(DISCORD_FRAME_BYTES))[0], DISCORD_FRAME_BYTES % 256);
+
+  assert.throws(() => transcoder.decode(Buffer.alloc(0)), RangeError);
+  assert.throws(() => transcoder.decode(Buffer.alloc(MAX_OPUS_PACKET_BYTES + 1)), RangeError);
+  assert.throws(() => transcoder.decode(new Float32Array(2)), TypeError);
+  assert.equal(transcoder.decode(Buffer.alloc(MAX_OPUS_PACKET_BYTES)).length, MAX_OPUS_PACKET_BYTES);
+  assert.equal(transcoder.decode(Buffer.alloc(1)).length, 1);
+});
+
+function createOrtMock(probabilities) {
+  const runs = [];
+  const ort = {
+    Tensor: class {
+      constructor(type, data, dims) {
+        this.type = type;
+        this.data = data;
+        this.dims = dims;
+      }
+    },
+    InferenceSession: {
+      create: async () => ({
+        run: async (feeds) => {
+          runs.push({ dims: feeds.input.dims, samples: feeds.input.data.length });
+          const probability = probabilities[Math.min(runs.length - 1, probabilities.length - 1)];
+          return {
+            output: { data: Float32Array.from([probability]) },
+            stateN: { data: new Float32Array(256), dims: [2, 1, 128] },
+          };
+        },
+      }),
+    },
+  };
+  return { ort, runs };
+}
+
+test("createSileroDetector rebuffers into 512-sample windows and validates its input", async () => {
+  const silent = createOrtMock([0.5]);
+
+  await assert.rejects(
+    () => createSileroDetector({ modelPath: "silero.onnx", sampleRate: 8000, ort: silent.ort }),
+    RangeError,
+  );
+  await assert.rejects(
+    () => createSileroDetector({ modelPath: "silero\u0000.onnx", ort: silent.ort }),
+    (error) => error instanceof TypeError || error instanceof RangeError,
+  );
+
+  const { ort, runs } = createOrtMock([0.2, 0.9]);
+  const detect = await createSileroDetector({ modelPath: "silero.onnx", ort });
+
+  assert.equal(await detect(new Float32Array(320)), 0);
+  assert.equal(runs.length, 0);
+
+  assert.equal(await detect(new Float32Array(192)), Math.fround(0.2));
+  assert.equal(runs.length, 1);
+  assert.deepEqual(runs[0].dims, [1, 512]);
+
+  assert.equal(await detect(new Float32Array(1024)), Math.fround(0.9));
+  assert.equal(runs.length, 3);
+  assert.deepEqual(runs[2].dims, [1, 512]);
+
+  detect.reset();
+  assert.equal(await detect(new Float32Array(320)), 0);
+
+  await assert.rejects(() => detect(new Float32Array([Number.NaN])), TypeError);
+  await assert.rejects(() => detect(new Float32Array([Number.POSITIVE_INFINITY])), TypeError);
 });

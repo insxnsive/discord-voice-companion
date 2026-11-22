@@ -8,12 +8,24 @@ export const DISCORD_FRAME_BYTES = 3840;
 export const VAD_SAMPLE_RATE = 16000;
 export const TTS_SAMPLE_RATE = 24000;
 
+// Hard caps so a malformed or hostile producer cannot force a huge allocation.
+export const MAX_AUDIO_CHUNK_BYTES = 1048576;
+export const MAX_OPUS_PACKET_BYTES = 4000;
+
 function toBuffer(input, what = "PCM16LE audio") {
   if (Buffer.isBuffer(input)) return input;
   if (input instanceof Uint8Array) {
     return Buffer.from(input.buffer, input.byteOffset, input.byteLength);
   }
   throw new TypeError(`expected a Buffer or Uint8Array of ${what}`);
+}
+
+function assertAudioChunk(input, maxBytes = MAX_AUDIO_CHUNK_BYTES) {
+  if (input.byteLength > maxBytes) {
+    throw new RangeError(
+      `audio chunk is ${input.byteLength} bytes, above the ${maxBytes} byte limit`,
+    );
+  }
 }
 
 /**
@@ -23,6 +35,7 @@ function toBuffer(input, what = "PCM16LE audio") {
  */
 export function downsample48kStereoTo16kMono(pcm48Stereo) {
   const input = toBuffer(pcm48Stereo);
+  assertAudioChunk(input);
   const groupBytes = 12;
   const groups = Math.floor(input.length / groupBytes);
   const output = Buffer.allocUnsafe(groups * 2);
@@ -45,6 +58,7 @@ export function downsample48kStereoTo16kMono(pcm48Stereo) {
 /** Signed 16-bit LE mono PCM to float32 samples in [-1, 1] for Silero VAD. */
 export function pcm16MonoToFloat32(pcm16Mono) {
   const input = toBuffer(pcm16Mono);
+  assertAudioChunk(input);
   const count = Math.floor(input.length / 2);
   const samples = new Float32Array(count);
   for (let i = 0; i < count; i += 1) {
@@ -65,6 +79,7 @@ export function createUpsampler24kTo48kStereo() {
   return {
     push(pcm24Mono) {
       const input = toBuffer(pcm24Mono);
+      assertAudioChunk(input);
       const samples = Math.floor(input.length / 2);
       const output = Buffer.allocUnsafe(samples * 8);
       let offset = 0;
@@ -102,7 +117,10 @@ export function upsample24kMonoTo48kStereo(pcm24Mono) {
  * Buffers arbitrary chunk sizes and hands back exact Opus frame buffers. The
  * short tail is retained until flushPadded() turns it into a final frame.
  */
-export function createFrameAccumulator(frameBytes = DISCORD_FRAME_BYTES) {
+export function createFrameAccumulator(
+  frameBytes = DISCORD_FRAME_BYTES,
+  { maxChunkBytes = MAX_AUDIO_CHUNK_BYTES } = {},
+) {
   if (!Number.isInteger(frameBytes) || frameBytes <= 0) {
     throw new RangeError("frameBytes must be a positive integer");
   }
@@ -111,14 +129,19 @@ export function createFrameAccumulator(frameBytes = DISCORD_FRAME_BYTES) {
   return {
     push(chunk) {
       const input = toBuffer(chunk);
+      assertAudioChunk(input, maxChunkBytes);
       if (input.length === 0) return [];
       pending = pending.length === 0 ? Buffer.from(input) : Buffer.concat([pending, input]);
 
       const frames = [];
-      while (pending.length >= frameBytes) {
-        frames.push(Buffer.from(pending.subarray(0, frameBytes)));
-        pending = pending.subarray(frameBytes);
+      let offset = 0;
+      while (pending.length - offset >= frameBytes) {
+        frames.push(Buffer.from(pending.subarray(offset, offset + frameBytes)));
+        offset += frameBytes;
       }
+      // Copy the short remainder instead of keeping a view that pins the
+      // concatenated parent buffer.
+      if (offset > 0) pending = Buffer.from(pending.subarray(offset));
       return frames;
     },
     flushPadded() {
@@ -138,6 +161,42 @@ function describeError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function assertPcmFrame(frame) {
+  if (!Buffer.isBuffer(frame) && !(frame instanceof Uint8Array)) {
+    throw new TypeError("pcm48StereoFrame must be a Buffer or Uint8Array");
+  }
+  if (frame.byteLength !== DISCORD_FRAME_BYTES) {
+    throw new RangeError(
+      `pcm48StereoFrame must be exactly ${DISCORD_FRAME_BYTES} bytes, got ${frame.byteLength}`,
+    );
+  }
+}
+
+function assertOpusPacket(packet) {
+  if (!Buffer.isBuffer(packet) && !(packet instanceof Uint8Array)) {
+    throw new TypeError("opusPacket must be a Buffer or Uint8Array");
+  }
+  if (packet.byteLength < 1 || packet.byteLength > MAX_OPUS_PACKET_BYTES) {
+    throw new RangeError(
+      `opusPacket must be 1..${MAX_OPUS_PACKET_BYTES} bytes, got ${packet.byteLength}`,
+    );
+  }
+}
+
+function wrapEncoder(backend, encoder) {
+  return {
+    backend,
+    encode(pcm48StereoFrame) {
+      assertPcmFrame(pcm48StereoFrame);
+      return encoder.encode(pcm48StereoFrame);
+    },
+    decode(opusPacket) {
+      assertOpusPacket(opusPacket);
+      return encoder.decode(opusPacket);
+    },
+  };
+}
+
 /**
  * Build an Opus encoder for 48kHz stereo frames, preferring the native
  * @discordjs/opus binding and falling back to the pure-JS opusscript wasm
@@ -155,11 +214,7 @@ export async function createOpusTranscoder({ loadNative, loadJs } = {}) {
       throw new TypeError("@discordjs/opus did not expose an OpusEncoder constructor");
     }
     const encoder = new OpusEncoder(DISCORD_SAMPLE_RATE, DISCORD_CHANNELS);
-    return {
-      backend: "native",
-      encode: (pcm48StereoFrame) => encoder.encode(pcm48StereoFrame),
-      decode: (opusPacket) => encoder.decode(opusPacket),
-    };
+    return wrapEncoder("native", encoder);
   } catch (error) {
     nativeFailure = error;
   }
@@ -173,11 +228,7 @@ export async function createOpusTranscoder({ loadNative, loadJs } = {}) {
     }
     const application = (OpusScript.Application ?? module?.Application ?? { AUDIO: 2049 }).AUDIO ?? 2049;
     const encoder = new OpusScript(DISCORD_SAMPLE_RATE, DISCORD_CHANNELS, application);
-    return {
-      backend: "opusscript",
-      encode: (pcm48StereoFrame) => encoder.encode(pcm48StereoFrame),
-      decode: (opusPacket) => encoder.decode(opusPacket),
-    };
+    return wrapEncoder("opusscript", encoder);
   } catch (error) {
     jsFailure = error;
   }
