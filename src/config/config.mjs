@@ -434,10 +434,21 @@ export function loadConfig({
 }
 
 const SECRET_KEY_PATTERN = /^(token|apiKey|.*ApiKey|secret|password)$/i;
+const URL_KEY_PATTERN = /^(baseUrl|localUrl)$/;
 
 function isNonEmptySecret(value) {
   if (typeof value === "string") return value.length > 0;
   return value !== null && value !== undefined && value !== "";
+}
+
+function redactUrlCredentials(value) {
+  if (typeof value !== "string" || value.length === 0) return value;
+  try {
+    const parsed = new URL(value);
+    return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
+  } catch {
+    return "[REDACTED]";
+  }
 }
 
 function redactNode(value, inHeaders = false) {
@@ -459,6 +470,8 @@ function redactNode(value, inHeaders = false) {
           : "[REDACTED]";
     } else if (SECRET_KEY_PATTERN.test(key) && isNonEmptySecret(entry)) {
       copy[key] = "[REDACTED]";
+    } else if (URL_KEY_PATTERN.test(key) && typeof entry === "string" && entry.length > 0) {
+      copy[key] = redactUrlCredentials(entry);
     } else {
       copy[key] = redactNode(entry, key === "headers");
     }

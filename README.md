@@ -37,7 +37,7 @@ Configuration loads with explicit environment variables overriding `.env`, follo
 - `/join` connects the companion to your active voice channel
 - `/leave` disconnects from voice playback and tears down listeners
 - `/mode` updates the live turn-taking chime or reaction mode
-- `/status` shows active providers, loaded reaction clip count, and recent turn latency averages
+- `/status` reports active session state, chime and filler modes, DAVE E2EE readiness, and latency status
 - `/mute-user` stops transcribing and replying to a selected user in the channel
 
 ## Audio security and privacy

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import path from "node:path";
 
 import { loadConfig } from "../src/config/config.mjs";
@@ -1230,4 +1231,460 @@ test("ReactionPool.loadFromDirectory enforces trustedRootDir containment, realpa
     },
   });
   assert.equal(loadedMismatched, 0);
+});
+
+function buildCustomWavBuffer({
+  audioFormat = 1,
+  numChannels = 1,
+  sampleRate = 24000,
+  bitsPerSample = 16,
+  blockAlign = numChannels * (bitsPerSample / 8),
+  junkChunkSizes = [],
+  includeData = true,
+  pcmBytes = Buffer.from([1, 2, 3, 4]),
+} = {}) {
+  const chunks = [];
+  const fmt = Buffer.alloc(24);
+  fmt.write("fmt ", 0, 4, "ascii");
+  fmt.writeUInt32LE(16, 4);
+  fmt.writeUInt16LE(audioFormat, 8);
+  fmt.writeUInt16LE(numChannels, 10);
+  fmt.writeUInt32LE(sampleRate, 12);
+  fmt.writeUInt32LE(sampleRate * blockAlign, 16);
+  fmt.writeUInt16LE(blockAlign, 20);
+  fmt.writeUInt16LE(bitsPerSample, 22);
+  chunks.push(fmt);
+
+  for (const size of junkChunkSizes) {
+    const padded = size + (size % 2);
+    const junk = Buffer.alloc(8 + padded);
+    junk.write("JUNK", 0, 4, "ascii");
+    junk.writeUInt32LE(size, 4);
+    chunks.push(junk);
+  }
+
+  if (includeData) {
+    const dataHeader = Buffer.alloc(8);
+    dataHeader.write("data", 0, 4, "ascii");
+    dataHeader.writeUInt32LE(pcmBytes.length, 4);
+    chunks.push(dataHeader, pcmBytes);
+  }
+
+  const body = Buffer.concat(chunks);
+  const riff = Buffer.alloc(12);
+  riff.write("RIFF", 0, 4, "ascii");
+  riff.writeUInt32LE(4 + body.length, 4);
+  riff.write("WAVE", 8, 4, "ascii");
+  return Buffer.concat([riff, body]);
+}
+
+test("ElevenLabs WS adapter close() aborts in-flight warmup and rejects subsequent synthesis", async () => {
+  const sockets = [];
+  class PendingWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.closeCalls = 0;
+      this.listeners = new Map();
+      sockets.push(this);
+    }
+    on(event, fn) {
+      const list = this.listeners.get(event) ?? [];
+      list.push(fn);
+      this.listeners.set(event, list);
+    }
+    removeListener(event, fn) {
+      const list = this.listeners.get(event) ?? [];
+      this.listeners.set(
+        event,
+        list.filter((entry) => entry !== fn),
+      );
+    }
+    close() {
+      this.closeCalls += 1;
+      this.readyState = 3;
+    }
+    send() {}
+  }
+
+  const adapter = createElevenLabsWsAdapter({
+    apiKey: "el-key",
+    voiceId: "voice-1",
+    timeoutMs: 500,
+    WebSocketImpl: PendingWebSocket,
+  });
+
+  const w1 = adapter.warmup();
+  const w2 = adapter.warmup();
+  const settled = Promise.allSettled([w1, w2]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(sockets.length >= 1, "warmup must open a socket");
+
+  adapter.close();
+  const allClosedImmediately = sockets.every((socket) => socket.closeCalls >= 1);
+  const results = await settled;
+  assert.ok(allClosedImmediately, "every pending warmup socket must be closed immediately on close()");
+  assert.equal(results.length, 2);
+  for (const result of results) {
+    assert.equal(result.status, "rejected");
+    assert.match(String(result.reason?.message ?? result.reason), /aborted|closed/i);
+  }
+
+  await assert.rejects(adapter.warmup(), /closed/i);
+  await assert.rejects(adapter.synthesizeClause({ text: "hello" }), /closed/i);
+  const countAfterClose = sockets.length;
+  assert.ok(countAfterClose >= 1);
+  await assert.rejects(adapter.warmup(), /closed/i);
+  assert.equal(sockets.length, countAfterClose, "closed adapter must not open new sockets");
+});
+
+test("ElevenLabs WS overlapping warmup() calls retain exactly one socket and close any surplus before close()", async () => {
+  const sockets = [];
+  class OpeningWebSocket {
+    constructor() {
+      this.readyState = 0;
+      this.closeCalls = 0;
+      this.handlers = new Map();
+      sockets.push(this);
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.emit("open");
+      });
+    }
+    on(event, fn) {
+      const list = this.handlers.get(event) ?? [];
+      list.push(fn);
+      this.handlers.set(event, list);
+    }
+    removeListener(event, fn) {
+      const list = this.handlers.get(event) ?? [];
+      this.handlers.set(
+        event,
+        list.filter((entry) => entry !== fn),
+      );
+    }
+    emit(event, ...args) {
+      for (const fn of [...(this.handlers.get(event) ?? [])]) fn(...args);
+    }
+    send() {}
+    close() {
+      this.closeCalls += 1;
+      this.readyState = 3;
+    }
+  }
+
+  const adapter = createElevenLabsWsAdapter({
+    apiKey: "el-key",
+    voiceId: "voice-1",
+    WebSocketImpl: OpeningWebSocket,
+  });
+
+  const w1 = adapter.warmup();
+  const w2 = adapter.warmup();
+  await Promise.all([w1, w2]);
+
+  const live = sockets.filter((socket) => socket.readyState === 1);
+  const surplus = sockets.filter((socket) => socket.readyState !== 1);
+  assert.equal(live.length, 1, "exactly one warmup socket must be retained");
+  assert.equal(
+    surplus.length,
+    sockets.length - 1,
+    "every surplus warmup socket must be closed before close() is called",
+  );
+  assert.ok(
+    surplus.every((socket) => socket.closeCalls >= 1),
+    "surplus sockets must record a close call",
+  );
+
+  adapter.close();
+  assert.ok(
+    sockets.every((socket) => socket.readyState === 3),
+    "every opened socket must be closed after adapter close()",
+  );
+});
+
+test("ElevenLabs WS concurrent warmup() clears all deadline timers on close() and cleans external AbortSignal listeners on open and abort", async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const activeTimers = new Set();
+
+  globalThis.setTimeout = (...args) => {
+    const handle = originalSetTimeout(...args);
+    activeTimers.add(handle);
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    activeTimers.delete(handle);
+    return originalClearTimeout(handle);
+  };
+
+  const originalAny = AbortSignal.any;
+  try {
+    const combinedSignals = [];
+    AbortSignal.any = function captureAny(signals) {
+      const combined = originalAny.call(AbortSignal, signals);
+      combinedSignals.push(combined);
+      return combined;
+    };
+
+    const pendingSockets = [];
+    class HangingWebSocket {
+      constructor() {
+        this.readyState = 0;
+        this.closeCalls = 0;
+      }
+      on() {}
+      removeListener() {}
+      close() {
+        this.closeCalls += 1;
+        this.readyState = 3;
+      }
+    }
+
+    const adapter1 = createElevenLabsWsAdapter({
+      apiKey: "el-key",
+      voiceId: "voice-1",
+      timeoutMs: 250,
+      WebSocketImpl: class extends HangingWebSocket {
+        constructor() {
+          super();
+          pendingSockets.push(this);
+        }
+      },
+    });
+
+    const p1 = adapter1.warmup();
+    const p2 = adapter1.warmup();
+    const settled = Promise.allSettled([p1, p2]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(pendingSockets.length >= 1, "warmup must open a socket");
+
+    adapter1.close();
+    const allClosedImmediately = pendingSockets.every((s) => s.closeCalls >= 1);
+    const results = await settled;
+    assert.ok(allClosedImmediately, "every pending warmup socket must be closed immediately on close()");
+    assert.ok(results.every((result) => result.status === "rejected"));
+    assert.equal(activeTimers.size, 0, "all warmup deadline timers must be cleared on close()");
+
+    // Verify external AbortSignal listeners are removed on both normal open+complete and mid-stream abort
+    class ControllableWebSocket {
+      constructor() {
+        this.readyState = 0;
+        this.handlers = new Map();
+      }
+      on(event, fn) {
+        const list = this.handlers.get(event) ?? [];
+        list.push(fn);
+        this.handlers.set(event, list);
+        if (event === "open") {
+          queueMicrotask(() => {
+            this.readyState = 1;
+            this.emit("open");
+          });
+        }
+      }
+      removeListener(event, fn) {
+        const list = this.handlers.get(event) ?? [];
+        this.handlers.set(event, list.filter((entry) => entry !== fn));
+      }
+      emit(event, ...args) {
+        for (const fn of [...(this.handlers.get(event) ?? [])]) {
+          fn(...args);
+        }
+      }
+      send(raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed.text === "") {
+          queueMicrotask(() => {
+            this.emit("message", JSON.stringify({ audio: Buffer.from([1, 2]).toString("base64"), isFinal: true }));
+          });
+        }
+      }
+      close() {
+        this.readyState = 3;
+      }
+    }
+
+    const openAc = new AbortController();
+    const openAdapter = createElevenLabsWsAdapter({
+      apiKey: "el-key",
+      voiceId: "voice-1",
+      timeoutMs: 60000,
+      WebSocketImpl: ControllableWebSocket,
+    });
+    await openAdapter.synthesizeClause({ text: "hi", signal: openAc.signal, onPcmChunk: () => {} });
+    assert.equal(getEventListeners(openAc.signal, "abort").length, 0);
+    assert.ok(combinedSignals.length > 0, "synthesizeClause must build a combined abort signal");
+    for (const combined of combinedSignals) {
+      assert.equal(
+        getEventListeners(combined, "abort").length,
+        0,
+        "no abort listener may remain on the combined signal after a normal open and completion",
+      );
+    }
+    assert.equal(activeTimers.size, 0);
+
+    combinedSignals.length = 0;
+    const abortAc = new AbortController();
+    const abortAdapter = createElevenLabsWsAdapter({
+      apiKey: "el-key",
+      voiceId: "voice-1",
+      timeoutMs: 60000,
+      WebSocketImpl: HangingWebSocket,
+    });
+    const synthPromise = abortAdapter.synthesizeClause({ text: "bye", signal: abortAc.signal });
+    await Promise.resolve();
+    abortAc.abort(new Error("user interrupted"));
+    await assert.rejects(synthPromise, /interrupted|aborted/i);
+    assert.equal(getEventListeners(abortAc.signal, "abort").length, 0);
+    assert.ok(combinedSignals.length > 0, "aborted synthesizeClause must build a combined abort signal");
+    for (const combined of combinedSignals) {
+      assert.equal(
+        getEventListeners(combined, "abort").length,
+        0,
+        "no abort listener may remain on the combined signal after a mid-stream abort",
+      );
+    }
+    assert.equal(activeTimers.size, 0);
+  } finally {
+    AbortSignal.any = originalAny;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});
+
+test("WAV header parsers reject stereo, non-24kHz, and >4096-byte single chunks exceeding scan cap", async () => {
+  const stereoWav = buildCustomWavBuffer({ numChannels: 2, sampleRate: 24000 });
+  const stereoMonoAlignWav = buildCustomWavBuffer({
+    numChannels: 2,
+    sampleRate: 24000,
+    bitsPerSample: 16,
+    blockAlign: 2,
+  });
+  const wav48k = buildCustomWavBuffer({ numChannels: 1, sampleRate: 48000 });
+  const wav16k = buildCustomWavBuffer({ numChannels: 1, sampleRate: 16000 });
+
+  assert.throws(() => stripWavHeaderIfPresent(stereoWav), /Unsupported/i);
+  assert.throws(() => stripWavHeaderIfPresent(stereoMonoAlignWav), /Unsupported/i);
+  assert.throws(() => stripWavHeaderIfPresent(wav48k), /Unsupported/i);
+  assert.throws(() => stripWavHeaderIfPresent(wav16k), /Unsupported/i);
+  assert.deepEqual(
+    stripWavHeaderIfPresent(wav16k, { sampleRate: 16000 }),
+    Buffer.from([1, 2, 3, 4]),
+  );
+
+  // Single large chunk (> 4096 bytes) whose data chunk sits past MAX_WAV_SCAN_BYTES
+  const oversizedHeaderWav = buildCustomWavBuffer({
+    junkChunkSizes: Array.from({ length: 36 }, () => 128),
+  });
+  assert.ok(oversizedHeaderWav.length > 4096);
+
+  for (const badWav of [stereoWav, stereoMonoAlignWav, wav48k, oversizedHeaderWav]) {
+    const adapter = createOpenAiTtsAdapter({
+      apiKey: "oa-key",
+      fetchImpl: async () =>
+        new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(badWav);
+            controller.close();
+          },
+        }), { status: 200 }),
+    });
+    await assert.rejects(
+      adapter.synthesizeClause({ text: "test", onPcmChunk: () => {} }),
+      /Unsupported|exceeded maximum scan size/i,
+    );
+  }
+});
+
+function makeNoCloneUint8Array(byteLength) {
+  const view = new Uint8Array(byteLength);
+  Object.defineProperty(view, "buffer", {
+    get() {
+      throw new Error("cloned before limit check");
+    },
+  });
+  return view;
+}
+
+test("ReactionPool.registerClip validates Buffer/Uint8Array types and enforces file, aggregate, and maxClips limits before cloning", () => {
+  const pool = new ReactionPool();
+  for (const badPcm of [{ type: "Buffer", data: [1, 2, 3] }, "raw-string", 12345]) {
+    assert.throws(
+      () => pool.registerClip({ id: "subtle_breath_bad", mood: "subtle_breath", pcm24k: badPcm }),
+      TypeError,
+    );
+  }
+  for (const badFrame of [{ type: "Buffer", data: [1, 2] }, "opus-str", [1, 2]]) {
+    assert.throws(
+      () =>
+        pool.registerClip({
+          id: "subtle_breath_bad_frame",
+          mood: "subtle_breath",
+          frames48kOpus: [badFrame],
+        }),
+      TypeError,
+    );
+  }
+  assert.equal(pool.size, 0);
+
+  const oversizePcm = makeNoCloneUint8Array(600 * 1024);
+  assert.throws(
+    () => pool.registerClip({ id: "subtle_breath_big", mood: "subtle_breath", pcm24k: oversizePcm }),
+    RangeError,
+  );
+
+  const tinyPool = new ReactionPool({ maxFileBytes: 512 * 1024, maxTotalBytes: 256 * 1024 });
+  assert.equal(
+    tinyPool.registerClip({
+      id: "subtle_breath_ok",
+      mood: "subtle_breath",
+      pcm24k: Buffer.alloc(150 * 1024),
+    }),
+    true,
+  );
+  const aggregateOverPcm = makeNoCloneUint8Array(200 * 1024);
+  assert.throws(
+    () =>
+      tinyPool.registerClip({
+        id: "subtle_breath_over",
+        mood: "subtle_breath",
+        pcm24k: aggregateOverPcm,
+      }),
+    RangeError,
+  );
+  assert.equal(tinyPool.size, 1);
+
+  const opusOverPool = new ReactionPool({ maxFileBytes: 128 * 1024, maxTotalBytes: 200 * 1024 });
+  assert.equal(
+    opusOverPool.registerClip({
+      id: "subtle_breath_1",
+      mood: "subtle_breath",
+      frames48kOpus: [Buffer.alloc(100 * 1024)],
+    }),
+    true,
+  );
+  assert.throws(
+    () =>
+      opusOverPool.registerClip({
+        id: "subtle_breath_opus_over",
+        mood: "subtle_breath",
+        pcm24k: Buffer.alloc(0),
+        frames48kOpus: [Buffer.alloc(60 * 1024), Buffer.alloc(60 * 1024)],
+      }),
+    RangeError,
+  );
+  assert.equal(opusOverPool.size, 1);
+
+  const cappedPool = new ReactionPool({ maxClips: 1 });
+  cappedPool.registerClip({ id: "subtle_breath_1", mood: "subtle_breath", pcm24k: Buffer.alloc(4) });
+  const uncopiedFrame = makeNoCloneUint8Array(4);
+  assert.equal(
+    cappedPool.registerClip({
+      id: "subtle_breath_2",
+      mood: "subtle_breath",
+      frames48kOpus: [uncopiedFrame],
+    }),
+    false,
+  );
 });
