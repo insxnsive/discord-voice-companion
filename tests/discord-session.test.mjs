@@ -2120,3 +2120,330 @@ test("the real client call order speaks each clause exactly once", async () => {
 
   assert.deepEqual(tts.state.calls, ["Hello there.", "How are you today?"]);
 });
+
+test("a filler fired before TTS plays and is followed by reply audio", async () => {
+  const llm = makeLlm({ blockGate: true });
+  const { orchestrator, vad, filler, playerSink } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await tick(5);
+  assert.ok(filler.state.onFire);
+  filler.state.onFire();
+  assert.ok(playerSink.frames.length >= 1);
+
+  llm.releaseGate({ shouldReply: true });
+  await turn;
+  assert.ok(playerSink.frames.length >= 2);
+});
+
+test("the 24-clause cap stops further synthesis", async () => {
+  const tts = makeTts();
+  const llm = {
+    async shouldChimeIn() {
+      return { shouldReply: true };
+    },
+    async streamReply({ onClause }) {
+      for (let i = 0; i < 30; i += 1) onClause(`clause ${i}`);
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ ttsAdapter: tts, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(tts.state.calls.length, 24);
+});
+
+test("turnDeadlineMs rejects out-of-range values", () => {
+  for (const bad of [0, -1, Number.NaN]) {
+    assert.throws(
+      () =>
+        createVoiceOrchestrator({
+          config: { turnDeadlineMs: bad },
+          reactionPool: makeReactionPool(),
+          llmClient: makeLlm(),
+          ttsAdapter: makeTts(),
+          sttAdapter: makeStt(),
+        }),
+      RangeError,
+    );
+  }
+});
+
+test("decoder admission declines a new speaker when every cached decoder is live", async () => {
+  const shapes = makeRealVoiceDeps();
+  let created = 0;
+  let deleted = 0;
+  const synth = {
+    encode: () => Buffer.alloc(2),
+    decode: () => Buffer.alloc(3840),
+    createDecoder() {
+      created += 1;
+      return {
+        decode: () => Buffer.alloc(3840),
+        close() {
+          deleted += 1;
+        },
+      };
+    },
+  };
+  const vadFactory = () => ({
+    speakers: new Map(),
+    async pushFrame() {
+      return { ignored: false };
+    },
+    clear() {},
+    setIgnoredUsers() {},
+    flushSpeaker() {},
+  });
+
+  const { orchestrator } = buildOrchestrator({
+    opusTranscoder: synth,
+    vadFactory,
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  for (let i = 0; i < 33; i += 1) {
+    shapes.speaking.emit("start", `user-${i}`);
+    await tick(5);
+  }
+
+  assert.equal(created, 32);
+  assert.equal(deleted, 0);
+});
+
+test("a failed rejoin clears moderation and restores configured modes", async () => {
+  const deps = {
+    EndBehaviorType: { AfterSilence: 2 },
+    StreamType: { Opus: "opus" },
+    joinVoiceChannel() {
+      throw new Error("join failed");
+    },
+  };
+  const { orchestrator } = buildOrchestrator({
+    voiceDeps: deps,
+    playerSink: null,
+    config: {
+      reactions: { mode: "adaptive" },
+      chime: { mode: "smart" },
+    },
+  });
+  await orchestrator.start();
+  orchestrator.muteUser("u1", true);
+  orchestrator.setChimeMode("always");
+
+  await assert.rejects(
+    () => orchestrator.joinChannel({ guildId: "g1", channelId: "c1" }),
+    /join failed/,
+  );
+
+  const status = orchestrator.getStatus();
+  assert.deepEqual(status.mutedUsers, []);
+  assert.equal(status.chimeMode, "smart");
+});
+
+test("a listener registration failure rolls back and destroys the connection", async () => {
+  const destroyed = [];
+  const speaking = new EventEmitter();
+  const client = {
+    user: { id: "bot-1" },
+    guilds: { cache: new Map() },
+    on() {
+      throw new Error("listener failed");
+    },
+    off() {},
+  };
+  const deps = {
+    EndBehaviorType: { AfterSilence: 2 },
+    StreamType: { Opus: "opus" },
+    joinVoiceChannel() {
+      return {
+        receiver: { speaking },
+        subscribe() {},
+        on() {},
+        off() {},
+        destroy() {
+          destroyed.push(true);
+        },
+        joinConfig: { channelId: "c1" },
+      };
+    },
+  };
+  const { orchestrator } = buildOrchestrator({
+    client,
+    voiceDeps: deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+
+  await assert.rejects(
+    () => orchestrator.joinChannel({ guildId: "g1", channelId: "c1" }),
+    /listener failed/,
+  );
+  assert.ok(destroyed.length >= 1);
+  assert.equal(orchestrator.getStatus().guildId, null);
+});
+
+test("a throwing listener-removal hook cannot block rollback cleanup", async () => {
+  const shapes = makeRealVoiceDeps();
+  const client = new EventEmitter();
+  client.user = { id: "bot-1" };
+  client.guilds = { cache: new Map() };
+  client.off = () => {
+    throw new Error("off failed");
+  };
+  client.removeListener = () => {
+    throw new Error("remove failed");
+  };
+
+  const { orchestrator } = buildOrchestrator({
+    client,
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await assert.doesNotReject(() => orchestrator.leaveChannel({ guildId: "g1" }));
+  assert.equal(orchestrator.getStatus().guildId, null);
+  assert.equal(orchestrator.getStatus().channelId, null);
+});
+
+function makeDecoderFixture() {
+  const shapes = makeRealVoiceDeps();
+  const closedIds = [];
+  let created = 0;
+  const synth = {
+    encode: () => Buffer.alloc(2),
+    decode: () => Buffer.alloc(3840),
+    createDecoder() {
+      created += 1;
+      const id = created;
+      return {
+        decode: () => Buffer.alloc(3840),
+        close() {
+          closedIds.push(id);
+        },
+      };
+    },
+  };
+  const vadFactory = () => ({
+    speakers: new Map(),
+    async pushFrame() {
+      return { ignored: false };
+    },
+    clear() {},
+    setIgnoredUsers() {},
+    flushSpeaker() {},
+  });
+  return { shapes, synth, vadFactory, closedIds, created: () => created };
+}
+
+test("idle decoder eviction closes the oldest idle decoder and skips live ones", async () => {
+  const fixture = makeDecoderFixture();
+  const { orchestrator } = buildOrchestrator({
+    opusTranscoder: fixture.synth,
+    vadFactory: fixture.vadFactory,
+    voiceDeps: fixture.shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  for (let i = 0; i < 32; i += 1) {
+    fixture.shapes.speaking.emit("start", `user-${i}`);
+    await tick(5);
+    fixture.shapes.subscriptions[i].stream.emit("end");
+    await tick(5);
+  }
+
+  fixture.shapes.speaking.emit("start", "user-0");
+  await tick(5);
+  fixture.shapes.speaking.emit("start", "user-32");
+  await tick(5);
+
+  assert.equal(fixture.created(), 33);
+  assert.deepEqual(fixture.closedIds, [2]);
+});
+
+test("idle decoder eviction follows LRU refresh on reuse", async () => {
+  const fixture = makeDecoderFixture();
+  const { orchestrator } = buildOrchestrator({
+    opusTranscoder: fixture.synth,
+    vadFactory: fixture.vadFactory,
+    voiceDeps: fixture.shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  for (let i = 0; i < 32; i += 1) {
+    fixture.shapes.speaking.emit("start", `user-${i}`);
+    await tick(5);
+    fixture.shapes.subscriptions[i].stream.emit("end");
+    await tick(5);
+  }
+
+  fixture.shapes.speaking.emit("start", "user-0");
+  await tick(5);
+  fixture.shapes.subscriptions[32].stream.emit("end");
+  await tick(5);
+  fixture.shapes.speaking.emit("start", "user-32");
+  await tick(5);
+
+  assert.equal(fixture.created(), 33);
+  assert.deepEqual(fixture.closedIds, [2]);
+});
+
+test("a throwing receiver removal cannot mask the setup error or skip cleanup", async () => {
+  const shapes = makeRealVoiceDeps();
+  const client = new EventEmitter();
+  client.user = { id: "bot-1" };
+  client.guilds = { cache: new Map() };
+  shapes.speaking.off = () => {
+    throw new Error("receiver off failed");
+  };
+  shapes.speaking.removeListener = () => {
+    throw new Error("receiver remove failed");
+  };
+  const deps = {
+    ...shapes.deps,
+    createAudioPlayer() {
+      throw new Error("player failed");
+    },
+  };
+
+  const { orchestrator } = buildOrchestrator({
+    client,
+    voiceDeps: deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+
+  await assert.rejects(
+    () => orchestrator.joinChannel({ guildId: "g1", channelId: "c1" }),
+    /player failed/,
+  );
+  assert.equal(client.listenerCount("voiceStateUpdate"), 0);
+  assert.equal(shapes.connection.destroyed, true);
+  assert.equal(orchestrator.getStatus().guildId, null);
+  assert.deepEqual(orchestrator.getStatus().mutedUsers, []);
+});

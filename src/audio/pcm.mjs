@@ -216,6 +216,7 @@ function wrapEncoder(backend, encoder, decoderFactory) {
           let closed = false;
           return {
             decode(opusPacket) {
+              if (closed) throw new Error("Opus decoder is closed");
               assertOpusPacket(opusPacket);
               return decoder.decode(opusPacket);
             },
