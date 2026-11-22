@@ -741,3 +741,259 @@ test("createFrameAccumulator rejects invalid frame and chunk limits", () => {
   );
   assert.doesNotThrow(() => createFrameAccumulator(2048, { maxChunkBytes: 2048 }));
 });
+
+test("resetSpeaker inside onSpeechStart suppresses the utterance", async () => {
+  const ends = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 10,
+    maxUtteranceBytes: 640,
+    onSpeechStart: () => vad.resetSpeaker("u1"),
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+
+  assert.equal(ends.length, 0);
+  assert.equal(vad.speakers.has("u1"), false);
+});
+
+test("resetSpeaker inside onBargeIn suppresses the stale speech end", async () => {
+  const ends = [];
+  const barges = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 40,
+    maxUtteranceBytes: 9 * VAD_FRAME_BYTES,
+    isBotSpeaking: () => true,
+    onBargeIn: (event) => {
+      barges.push(event);
+      vad.resetSpeaker("u2");
+    },
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  for (let i = 0; i < 9; i += 1) {
+    await vad.pushFrame({
+      userId: "u2",
+      displayName: "Ben",
+      pcm16kMono: monoFrame(9000),
+      timestampMs: i * 20,
+    });
+  }
+
+  assert.equal(barges.length, 1);
+  assert.equal(ends.length, 0);
+});
+
+test("a slow onSpeechEnd does not hold VAD in-flight slots", async () => {
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 40,
+    maxUtteranceBytes: 3 * VAD_FRAME_BYTES,
+    hangoverMs: 240,
+    maxInFlightFrames: 1,
+    onSpeechEnd: () => new Promise(() => {}),
+  });
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 40 });
+
+  const hung = vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(0), timestampMs: 60 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const next = await vad.pushFrame({
+    userId: "u1",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 80,
+  });
+
+  assert.notEqual(next.dropped, "global_backpressure");
+  assert.equal(vad.inFlightCount, 0);
+  void hung;
+});
+
+test("maxInFlightFrames must be an integer between 1 and 256", () => {
+  for (const invalid of [0, -1, 1.5, 257]) {
+    assert.throws(() => new PerSpeakerVad({ maxInFlightFrames: invalid }), RangeError);
+  }
+  assert.doesNotThrow(() => new PerSpeakerVad({ maxInFlightFrames: 1 }));
+  assert.doesNotThrow(() => new PerSpeakerVad({ maxInFlightFrames: 256 }));
+
+  for (const invalid of [0, -1, 1.5, 30001]) {
+    assert.throws(() => new PerSpeakerVad({ detectorTimeoutMs: invalid }), RangeError);
+  }
+  assert.doesNotThrow(() => new PerSpeakerVad({ detectorTimeoutMs: 5000 }));
+});
+
+test("resetSpeaker inside isBotSpeaking suppresses barge-in dispatch", async () => {
+  const barges = [];
+  const ends = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 40,
+    maxUtteranceBytes: 9 * VAD_FRAME_BYTES,
+    isBotSpeaking: () => {
+      vad.resetSpeaker("u3");
+      return true;
+    },
+    onBargeIn: (event) => barges.push(event),
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  for (let i = 0; i < 9; i += 1) {
+    await vad.pushFrame({ userId: "u3", pcm16kMono: monoFrame(9000), timestampMs: i * 20 });
+  }
+
+  assert.equal(barges.length, 0);
+  assert.equal(ends.length, 0);
+});
+
+test("a stalled detector times out and frees the in-flight slot", { timeout: 3000 }, async () => {
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => () => new Promise(() => {}),
+    detectorTimeoutMs: 25,
+    maxInFlightFrames: 1,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "u4", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+
+  assert.equal(vad.inFlightCount, 0);
+  assert.equal(vad.speakers.get("u4").pendingCount, 0);
+});
+
+test("a reset queued on the final frame suppresses onSpeechEnd", async () => {
+  const ends = [];
+  let vad;
+  let resetQueued = false;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => {
+      if (!resetQueued) {
+        resetQueued = true;
+        queueMicrotask(() => vad.resetSpeaker("u6"));
+      }
+      return 0.9;
+    },
+    minSpeechMs: 10,
+    maxUtteranceBytes: VAD_FRAME_BYTES,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u6", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(ends.length, 0);
+});
+
+test("a timed-out detector is quarantined until it settles", async () => {
+  let calls = 0;
+  let rejectHung;
+  const hung = new Promise((resolve, reject) => {
+    rejectHung = reject;
+  });
+
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      calls += 1;
+      if (calls === 1) return () => hung;
+      return () => 0.9;
+    },
+    detectorTimeoutMs: 20,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "u7", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+  assert.equal(calls, 1);
+
+  const quarantined = await vad.pushFrame({
+    userId: "u7",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 20,
+  });
+  assert.equal(quarantined.dropped, "detector_quarantined");
+  assert.equal(calls, 1);
+
+  vad.resetSpeaker("u7");
+  const afterReset = await vad.pushFrame({
+    userId: "u7",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 30,
+  });
+  assert.equal(afterReset.dropped, "detector_quarantined");
+  assert.equal(calls, 1);
+
+  rejectHung(new Error("late detector rejection"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const recovered = await vad.pushFrame({
+    userId: "u7",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 40,
+  });
+  assert.notEqual(recovered.dropped, "detector_quarantined");
+  assert.equal(calls, 2);
+});
+
+test("a detector reset that drops the speaker suppresses onSpeechEnd", async () => {
+  const ends = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      const detect = () => 0.9;
+      detect.reset = () => vad.resetSpeaker("u8");
+      return detect;
+    },
+    minSpeechMs: 10,
+    maxUtteranceBytes: VAD_FRAME_BYTES,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u8", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(ends.length, 0);
+});
+
+test("resetSpeaker while a detector is unsettled quarantines the speaker", async () => {
+  let calls = 0;
+  let resolveDetector;
+  const pendingDetector = new Promise((resolve) => {
+    resolveDetector = resolve;
+  });
+
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      calls += 1;
+      return () => pendingDetector;
+    },
+    detectorTimeoutMs: 5000,
+    maxInFlightFrames: 1,
+  });
+
+  const pendingFrame = vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  vad.resetSpeaker("u1");
+
+  const blocked = await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  assert.deepEqual(blocked, { ignored: true, dropped: "detector_quarantined" });
+  assert.equal(calls, 1);
+
+  const other = await vad.pushFrame({ userId: "u2", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  assert.equal(other.dropped, "global_backpressure");
+
+  resolveDetector(0.9);
+  await pendingFrame.catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const recovered = await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 40 });
+  assert.notEqual(recovered.dropped, "detector_quarantined");
+  assert.equal(calls, 2);
+});

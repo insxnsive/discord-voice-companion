@@ -183,6 +183,7 @@ export class PerSpeakerVad {
     idleSpeakerTtlMs = 60000,
     maxPendingFrames = 8,
     maxInFlightFrames = 64,
+    detectorTimeoutMs = 5000,
     isBotSpeaking = () => false,
     onSpeechStart,
     onSpeechEnd,
@@ -204,7 +205,22 @@ export class PerSpeakerVad {
     this.maxSpeakers = maxSpeakers;
     this.idleSpeakerTtlMs = idleSpeakerTtlMs;
     this.maxPendingFrames = maxPendingFrames;
+    if (
+      !Number.isSafeInteger(maxInFlightFrames) ||
+      maxInFlightFrames < 1 ||
+      maxInFlightFrames > 256
+    ) {
+      throw new RangeError("maxInFlightFrames must be an integer between 1 and 256");
+    }
     this.maxInFlightFrames = maxInFlightFrames;
+    if (
+      !Number.isSafeInteger(detectorTimeoutMs) ||
+      detectorTimeoutMs < 1 ||
+      detectorTimeoutMs > 30000
+    ) {
+      throw new RangeError("detectorTimeoutMs must be an integer between 1 and 30000");
+    }
+    this.detectorTimeoutMs = detectorTimeoutMs;
     this.inFlightCount = 0;
     this.isBotSpeaking = isBotSpeaking;
     this.onSpeechStart = onSpeechStart;
@@ -212,6 +228,7 @@ export class PerSpeakerVad {
     this.onBargeIn = onBargeIn;
     this.onNoiseDrop = onNoiseDrop;
     this.speakers = new Map();
+    this.quarantinedUsers = new Map();
   }
 
   /** Replace the ignored-user set and drop any newly muted speaker's state. */
@@ -234,6 +251,13 @@ export class PerSpeakerVad {
 
     this.#validateFrame(pcm16kMono);
     this.#pruneIdle(timestampMs);
+
+    if (this.quarantinedUsers.has(userId)) {
+      return { ignored: true, dropped: "detector_quarantined" };
+    }
+    if (this.inFlightCount + this.quarantinedUsers.size >= this.maxInFlightFrames) {
+      return { ignored: true, dropped: "global_backpressure" };
+    }
 
     let state = this.speakers.get(userId);
     if (!state) {
@@ -261,12 +285,17 @@ export class PerSpeakerVad {
       () => undefined,
     );
 
+    let outcome;
     try {
-      return await task;
+      outcome = await task;
     } finally {
       state.pendingCount -= 1;
       this.inFlightCount -= 1;
     }
+    // Release the ingress slot before external callbacks so slow STT or LLM
+    // work downstream can never starve the VAD.
+    if (typeof outcome?.post === "function") await outcome.post();
+    return outcome?.result;
   }
 
   #validateFrame(frame) {
@@ -301,17 +330,18 @@ export class PerSpeakerVad {
       epoch: 0,
       queue: Promise.resolve(),
       pendingCount: 0,
+      inFlightDetector: null,
     };
   }
 
   #admitSpeaker(state, timestampMs) {
-    if (this.speakers.size < this.maxSpeakers) {
+    if (this.speakers.size + this.quarantinedUsers.size < this.maxSpeakers) {
       this.speakers.set(state.userId, state);
       return true;
     }
 
     this.#pruneIdle(timestampMs);
-    if (this.speakers.size < this.maxSpeakers) {
+    if (this.speakers.size + this.quarantinedUsers.size < this.maxSpeakers) {
       this.speakers.set(state.userId, state);
       return true;
     }
@@ -349,9 +379,15 @@ export class PerSpeakerVad {
   #dropSpeaker(userId) {
     const state = this.speakers.get(userId);
     if (!state) return;
+    // Keep tracking any still-running detector work before the entry vanishes.
+    if (state.inFlightDetector) {
+      this.quarantinedUsers.set(userId, state.inFlightDetector);
+    }
+    // Delete before reset so a detector reset that calls back into the VAD
+    // cannot recurse through this speaker entry.
+    this.speakers.delete(userId);
     state.epoch += 1;
     state.detector?.reset?.();
-    this.speakers.delete(userId);
   }
 
   #isCurrent(userId, state, epoch) {
@@ -363,6 +399,55 @@ export class PerSpeakerVad {
     );
   }
 
+  async #runDetector(state, task) {
+    const pending = Promise.resolve().then(task);
+    state.inFlightDetector = pending;
+    pending
+      .finally(() => {
+        if (state.inFlightDetector === pending) state.inFlightDetector = null;
+        if (this.quarantinedUsers.get(state.userId) === pending) {
+          this.quarantinedUsers.delete(state.userId);
+        }
+      })
+      .catch(() => {});
+    let timer;
+    const timeout = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(Object.assign(new Error("VAD detector timed out"), { code: "DETECTOR_TIMEOUT" }));
+      }, this.detectorTimeoutMs);
+    });
+    try {
+      return await Promise.race([pending, timeout]);
+    } catch (error) {
+      if (error?.code === "DETECTOR_TIMEOUT") {
+        this.#quarantineDetector(state, pending);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  #quarantineDetector(state, pending) {
+    state.active = false;
+    state.chunks = [];
+    state.bufferedBytes = 0;
+    state.speechMs = 0;
+    state.silenceMs = 0;
+    state.bargeInFired = false;
+    state.startedAt = null;
+    state.detector = null;
+    state.epoch += 1;
+    this.quarantinedUsers.set(state.userId, pending);
+    pending
+      .finally(() => {
+        if (this.quarantinedUsers.get(state.userId) === pending) {
+          this.quarantinedUsers.delete(state.userId);
+        }
+      })
+      .catch(() => {});
+  }
+
   async #processFrame(state, pcm16kMono, timestampMs) {
     const { userId } = state;
     const startEpoch = state.epoch;
@@ -370,28 +455,32 @@ export class PerSpeakerVad {
     // A frame can be queued and then dropped by resetSpeaker, clear, or a mute
     // before its turn comes. Bail out before creating a detector.
     if (!this.#isCurrent(userId, state, startEpoch)) {
-      return { ignored: true, dropped: "reset" };
+      return { result: { ignored: true, dropped: "reset" } };
+    }
+    if (this.quarantinedUsers.has(userId)) {
+      return { result: { ignored: true, dropped: "detector_quarantined" } };
     }
 
     if (!state.detector) {
-      const detector = await this.detectorFactory(userId);
+      const detector = await this.#runDetector(state, () => this.detectorFactory(userId));
       if (!this.#isCurrent(userId, state, startEpoch)) {
-        return { ignored: true, dropped: "reset" };
+        return { result: { ignored: true, dropped: "reset" } };
       }
       state.detector = detector;
     }
 
     if (!this.#isCurrent(userId, state, startEpoch)) {
-      return { ignored: true, dropped: "reset" };
+      return { result: { ignored: true, dropped: "reset" } };
     }
 
     const samples = pcm16MonoToFloat32(pcm16kMono);
-    const probability = await state.detector(samples);
+    const probability = await this.#runDetector(state, () => state.detector(samples));
     if (!this.#isCurrent(userId, state, startEpoch)) {
-      return { ignored: true, dropped: "reset" };
+      return { result: { ignored: true, dropped: "reset" } };
     }
 
     const isSpeech = probability >= this.speechThreshold;
+    let post;
 
     if (isSpeech) {
       state.speechMs += this.frameMs;
@@ -406,22 +495,34 @@ export class PerSpeakerVad {
           displayName: state.displayName,
           timestampMs,
         });
+        if (!this.#isCurrent(userId, state, startEpoch)) {
+          return { result: { ignored: true, dropped: "reset" } };
+        }
       }
 
-      if (!state.bargeInFired && state.speechMs >= this.bargeInMs && this.isBotSpeaking()) {
-        state.bargeInFired = true;
-        this.onBargeIn?.({
-          userId,
-          displayName: state.displayName,
-          timestampMs,
-        });
+      if (!state.bargeInFired && state.speechMs >= this.bargeInMs) {
+        const botSpeaking = this.isBotSpeaking();
+        if (!this.#isCurrent(userId, state, startEpoch)) {
+          return { result: { ignored: true, dropped: "reset" } };
+        }
+        if (botSpeaking) {
+          state.bargeInFired = true;
+          this.onBargeIn?.({
+            userId,
+            displayName: state.displayName,
+            timestampMs,
+          });
+          if (!this.#isCurrent(userId, state, startEpoch)) {
+            return { result: { ignored: true, dropped: "reset" } };
+          }
+        }
       }
 
       if (
         state.bufferedBytes >= this.maxUtteranceBytes ||
         state.speechMs >= this.maxUtteranceMs
       ) {
-        await this.#finish(state, timestampMs);
+        post = this.#finish(state, timestampMs);
       }
     } else if (state.active) {
       state.silenceMs += this.frameMs;
@@ -429,11 +530,14 @@ export class PerSpeakerVad {
         this.#appendChunk(state, pcm16kMono);
       }
       if (state.silenceMs >= this.hangoverMs || state.bufferedBytes >= this.maxUtteranceBytes) {
-        await this.#finish(state, timestampMs);
+        post = this.#finish(state, timestampMs);
       }
     }
 
-    return { ignored: false, speech: isSpeech, probability };
+    return {
+      result: { ignored: false, speech: isSpeech, probability },
+      post,
+    };
   }
 
   #appendChunk(state, frame) {
@@ -441,10 +545,11 @@ export class PerSpeakerVad {
     state.bufferedBytes += frame.byteLength;
   }
 
-  async #finish(state, timestampMs) {
+  #finish(state, timestampMs) {
     const chunks = state.chunks;
     const speechMs = state.speechMs;
     const { userId, displayName } = state;
+    const epoch = state.epoch;
 
     state.active = false;
     state.speechMs = 0;
@@ -456,17 +561,22 @@ export class PerSpeakerVad {
     state.detector?.reset?.();
 
     if (speechMs < this.minSpeechMs) {
-      this.onNoiseDrop?.({ userId, displayName, speechMs });
-      return;
+      return async () => {
+        if (!this.#isCurrent(userId, state, epoch)) return;
+        this.onNoiseDrop?.({ userId, displayName, speechMs });
+      };
     }
 
-    await this.onSpeechEnd?.({
-      userId,
-      displayName,
-      pcm16kMono: Buffer.concat(chunks),
-      durationMs: speechMs,
-      endedAt: timestampMs,
-    });
+    return async () => {
+      if (!this.#isCurrent(userId, state, epoch)) return;
+      await this.onSpeechEnd?.({
+        userId,
+        displayName,
+        pcm16kMono: Buffer.concat(chunks),
+        durationMs: speechMs,
+        endedAt: timestampMs,
+      });
+    };
   }
 
   /** Drop one speaker's buffered utterance and detector state. */
@@ -477,6 +587,9 @@ export class PerSpeakerVad {
   /** Drop every speaker's buffered utterance and detector state. */
   clear() {
     for (const state of this.speakers.values()) {
+      if (state.inFlightDetector) {
+        this.quarantinedUsers.set(state.userId, state.inFlightDetector);
+      }
       state.epoch += 1;
       state.detector?.reset?.();
     }
