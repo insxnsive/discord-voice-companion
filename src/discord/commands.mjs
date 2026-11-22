@@ -179,6 +179,9 @@ export function createCommandHandler({ orchestrator } = {}) {
           if (!hasModeratorPermission(interaction)) {
             return await reply(interaction, "You need permission to change modes.");
           }
+          if (!status?.active || status?.guildId !== guildId) {
+            return await reply(interaction, "No active voice session in this server.");
+          }
           const chime = optionValue(interaction, "chime");
           const filler = optionValue(interaction, "filler");
           if (chime === undefined && filler === undefined) {
@@ -204,6 +207,9 @@ export function createCommandHandler({ orchestrator } = {}) {
         case "mute-user": {
           if (!hasModeratorPermission(interaction)) {
             return await reply(interaction, "You need permission to mute users.");
+          }
+          if (!status?.active || status?.guildId !== guildId) {
+            return await reply(interaction, "No active voice session in this server.");
           }
           const userId = optionValue(interaction, "user");
           if (typeof userId !== "string" || userId.length === 0) {

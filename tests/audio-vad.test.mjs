@@ -997,3 +997,147 @@ test("resetSpeaker while a detector is unsettled quarantines the speaker", async
   assert.notEqual(recovered.dropped, "detector_quarantined");
   assert.equal(calls, 2);
 });
+
+test("opusscript encode receives the 960 sample count and createDecoder is independent", async () => {
+  const calls = [];
+  class MockOpusScript {
+    static Application = { AUDIO: 2049 };
+
+    constructor(rate, channels, application) {
+      this.args = [rate, channels, application];
+    }
+
+    encode(frame, samples) {
+      calls.push(samples);
+      return Buffer.from([1]);
+    }
+
+    decode() {
+      return Buffer.alloc(2);
+    }
+  }
+
+  const transcoder = await createOpusTranscoder({
+    loadNative: async () => {
+      throw new Error("no native");
+    },
+    loadJs: async () => ({ default: MockOpusScript }),
+  });
+
+  assert.equal(transcoder.backend, "opusscript");
+  transcoder.encode(Buffer.alloc(DISCORD_FRAME_BYTES));
+  assert.deepEqual(calls, [960]);
+
+  const decoder = transcoder.createDecoder();
+  assert.equal(typeof decoder.decode, "function");
+  assert.equal(decoder.decode(Buffer.from([1])).length, 2);
+});
+
+test("flushSpeaker finalizes the active utterance", async () => {
+  const ends = [];
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 20,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  const result = await vad.flushSpeaker("u1", 100);
+
+  assert.equal(result.flushed, true);
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0].durationMs, 20);
+  assert.equal(ends[0].endedAt, 100);
+});
+
+test("VAD frame duration follows the actual sample count", async () => {
+  const ends = [];
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => (samples) => (computeRms(samples) > 0 ? 0.9 : 0),
+    minSpeechMs: 10,
+    hangoverMs: 40,
+    frameMs: 20,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000, 160), timestampMs: 10 });
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000, 160), timestampMs: 20 });
+  for (let i = 0; i < 4; i += 1) {
+    await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(0, 160), timestampMs: 30 + i * 10 });
+  }
+
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0].durationMs, 20);
+});
+
+test("maxSpeakers counts quarantined identities and clear preserves them", async () => {
+  let calls = 0;
+  let rejectHung;
+  const hung = new Promise((resolve, reject) => {
+    rejectHung = reject;
+  });
+
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      calls += 1;
+      return calls === 1 ? () => hung : () => 0.9;
+    },
+    detectorTimeoutMs: 20,
+    maxSpeakers: 1,
+    maxInFlightFrames: 4,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "a", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+  assert.equal(vad.quarantinedUsers.has("a"), true);
+
+  const blocked = await vad.pushFrame({ userId: "b", pcm16kMono: monoFrame(9000), timestampMs: 10 });
+  assert.equal(blocked.dropped, "max_speakers");
+
+  vad.clear();
+  assert.equal(vad.quarantinedUsers.has("a"), true);
+
+  rejectHung(new Error("late"));
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("createDecoder close deletes the real backend decoder exactly once", async () => {
+  let deletes = 0;
+
+  class MockOpusScript {
+    static Application = { AUDIO: 2049 };
+
+    encode() {
+      return Buffer.from([1]);
+    }
+
+    decode() {
+      return Buffer.alloc(2);
+    }
+
+    delete() {
+      deletes += 1;
+    }
+  }
+
+  const transcoder = await createOpusTranscoder({
+    loadNative: async () => {
+      throw new Error("no native");
+    },
+    loadJs: async () => ({ default: MockOpusScript }),
+  });
+
+  const first = transcoder.createDecoder();
+  const second = transcoder.createDecoder();
+  assert.notEqual(first, second);
+  assert.equal(first.decode(Buffer.from([1])).length, 2);
+  assert.equal(second.decode(Buffer.from([1])).length, 2);
+
+  first.close();
+  first.close();
+  assert.equal(deletes, 1);
+  second.close();
+  assert.equal(deletes, 2);
+});

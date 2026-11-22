@@ -195,16 +195,56 @@ function assertOpusPacket(packet) {
   }
 }
 
-function wrapEncoder(backend, encoder) {
+function wrapEncoder(backend, encoder, decoderFactory) {
   return {
     backend,
     encode(pcm48StereoFrame) {
       assertPcmFrame(pcm48StereoFrame);
+      if (backend === "opusscript") {
+        return encoder.encode(pcm48StereoFrame, DISCORD_FRAME_SAMPLES);
+      }
       return encoder.encode(pcm48StereoFrame);
     },
     decode(opusPacket) {
       assertOpusPacket(opusPacket);
       return encoder.decode(opusPacket);
+    },
+    createDecoder() {
+      if (typeof decoderFactory === "function") {
+        const decoder = decoderFactory();
+        if (decoder && typeof decoder.decode === "function") {
+          let closed = false;
+          return {
+            decode(opusPacket) {
+              assertOpusPacket(opusPacket);
+              return decoder.decode(opusPacket);
+            },
+            close() {
+              if (closed) return;
+              closed = true;
+              try {
+                decoder.delete?.();
+              } catch {
+                // Teardown is best effort.
+              }
+              try {
+                decoder.close?.();
+              } catch {
+                // Teardown is best effort.
+              }
+            },
+          };
+        }
+      }
+      return {
+        decode(opusPacket) {
+          assertOpusPacket(opusPacket);
+          return encoder.decode(opusPacket);
+        },
+        close() {
+          // The shared encoder must never be deleted.
+        },
+      };
     },
   };
 }
@@ -226,7 +266,7 @@ export async function createOpusTranscoder({ loadNative, loadJs } = {}) {
       throw new TypeError("@discordjs/opus did not expose an OpusEncoder constructor");
     }
     const encoder = new OpusEncoder(DISCORD_SAMPLE_RATE, DISCORD_CHANNELS);
-    return wrapEncoder("native", encoder);
+    return wrapEncoder("native", encoder, () => new OpusEncoder(DISCORD_SAMPLE_RATE, DISCORD_CHANNELS));
   } catch (error) {
     nativeFailure = error;
   }
@@ -240,7 +280,11 @@ export async function createOpusTranscoder({ loadNative, loadJs } = {}) {
     }
     const application = (OpusScript.Application ?? module?.Application ?? { AUDIO: 2049 }).AUDIO ?? 2049;
     const encoder = new OpusScript(DISCORD_SAMPLE_RATE, DISCORD_CHANNELS, application);
-    return wrapEncoder("opusscript", encoder);
+    return wrapEncoder(
+      "opusscript",
+      encoder,
+      () => new OpusScript(DISCORD_SAMPLE_RATE, DISCORD_CHANNELS, application),
+    );
   } catch (error) {
     jsFailure = error;
   }

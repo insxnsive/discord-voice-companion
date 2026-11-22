@@ -184,6 +184,7 @@ export class PerSpeakerVad {
     maxPendingFrames = 8,
     maxInFlightFrames = 64,
     detectorTimeoutMs = 5000,
+    now = () => performance.now(),
     isBotSpeaking = () => false,
     onSpeechStart,
     onSpeechEnd,
@@ -199,6 +200,7 @@ export class PerSpeakerVad {
     this.bargeInMs = bargeInMs;
     this.maxUtteranceMs = maxUtteranceMs;
     this.frameMs = frameMs;
+    this.now = now;
     this.expectedFrameBytes = expectedFrameBytes;
     this.maxFrameBytes = maxFrameBytes;
     this.maxUtteranceBytes = maxUtteranceBytes;
@@ -243,7 +245,7 @@ export class PerSpeakerVad {
     userId,
     displayName = "Unknown",
     pcm16kMono,
-    timestampMs = Date.now(),
+    timestampMs = this.now(),
   } = {}) {
     if (!userId || userId === this.botUserId || this.ignoredUserIds.has(userId)) {
       return { ignored: true };
@@ -331,17 +333,22 @@ export class PerSpeakerVad {
       queue: Promise.resolve(),
       pendingCount: 0,
       inFlightDetector: null,
+      flushPending: false,
     };
   }
 
+  #unionSize() {
+    return new Set([...this.speakers.keys(), ...this.quarantinedUsers.keys()]).size;
+  }
+
   #admitSpeaker(state, timestampMs) {
-    if (this.speakers.size + this.quarantinedUsers.size < this.maxSpeakers) {
+    if (this.#unionSize() < this.maxSpeakers) {
       this.speakers.set(state.userId, state);
       return true;
     }
 
     this.#pruneIdle(timestampMs);
-    if (this.speakers.size + this.quarantinedUsers.size < this.maxSpeakers) {
+    if (this.#unionSize() < this.maxSpeakers) {
       this.speakers.set(state.userId, state);
       return true;
     }
@@ -351,6 +358,7 @@ export class PerSpeakerVad {
     for (const [userId, candidate] of this.speakers) {
       // Busy speakers have in-flight detector work whose result would be
       // wasted if their state vanished mid-await.
+      if (this.quarantinedUsers.has(userId)) continue;
       if (candidate.active || candidate.pendingCount > 0) continue;
       if (candidate.lastSeenAt < oldestSeen) {
         oldestSeen = candidate.lastSeenAt;
@@ -360,6 +368,7 @@ export class PerSpeakerVad {
     if (oldestId === null) return false;
 
     this.#dropSpeaker(oldestId);
+    if (this.#unionSize() >= this.maxSpeakers) return false;
     this.speakers.set(state.userId, state);
     return true;
   }
@@ -479,11 +488,15 @@ export class PerSpeakerVad {
       return { result: { ignored: true, dropped: "reset" } };
     }
 
+    const frameDurationMs = Math.max(
+      1,
+      Math.round(((pcm16kMono.byteLength / 2) / VAD_SAMPLE_RATE) * 1000),
+    );
     const isSpeech = probability >= this.speechThreshold;
     let post;
 
     if (isSpeech) {
-      state.speechMs += this.frameMs;
+      state.speechMs += frameDurationMs;
       state.silenceMs = 0;
       this.#appendChunk(state, pcm16kMono);
 
@@ -525,7 +538,7 @@ export class PerSpeakerVad {
         post = this.#finish(state, timestampMs);
       }
     } else if (state.active) {
-      state.silenceMs += this.frameMs;
+      state.silenceMs += frameDurationMs;
       if (state.silenceMs <= this.hangoverMs) {
         this.#appendChunk(state, pcm16kMono);
       }
@@ -577,6 +590,48 @@ export class PerSpeakerVad {
         endedAt: timestampMs,
       });
     };
+  }
+
+  /** Finalize a speaker's current utterance at stream EOF. */
+  async flushSpeaker(userId, timestampMs = this.now()) {
+    if (!userId || this.quarantinedUsers.has(userId)) {
+      return { ignored: true, dropped: "inactive" };
+    }
+    const state = this.speakers.get(userId);
+    if (!state) return { ignored: true, dropped: "inactive" };
+    if (state.flushPending) return { ignored: true, dropped: "flush_pending" };
+    if (this.inFlightCount + this.quarantinedUsers.size >= this.maxInFlightFrames) {
+      return { ignored: true, dropped: "global_backpressure" };
+    }
+
+    const startEpoch = state.epoch;
+    state.flushPending = true;
+    state.pendingCount += 1;
+    this.inFlightCount += 1;
+    const task = state.queue.then(() => {
+      if (!this.#isCurrent(userId, state, startEpoch) || !state.active) {
+        return { flushed: false };
+      }
+      return { flushed: true, post: this.#finish(state, timestampMs) };
+    });
+    state.queue = task.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    let outcome;
+    try {
+      outcome = await task;
+    } finally {
+      state.pendingCount -= 1;
+      this.inFlightCount -= 1;
+      state.flushPending = false;
+    }
+    if (outcome?.post) {
+      await outcome.post();
+      return { flushed: true };
+    }
+    return { flushed: false };
   }
 
   /** Drop one speaker's buffered utterance and detector state. */
