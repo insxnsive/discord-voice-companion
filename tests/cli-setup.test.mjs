@@ -903,3 +903,198 @@ test("runSetupWizard does not unlink an unowned pre-existing .tmp- file on EEXIS
   assert.equal(unlinkedTargets.length, 0);
   assert.equal(mockFs.files.get(envTarget), "DISCORD_BOT_TOKEN=keep-original\n");
 });
+
+test("writePrivateFile rejects short 0-byte writes without calling renameSync, preserves existing .env, uses fchmodSync, and clears stageCreated after rename", async () => {
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "short-write-root");
+  mockFs.dirs.add(root);
+  const envTarget = path.join(root, ".env");
+  mockFs.files.set(envTarget, "DISCORD_BOT_TOKEN=original-preserved\n");
+
+  let writeCalls = 0;
+  let renameCalls = 0;
+  const unlinkedTmpPaths = [];
+  const origUnlink = mockFs.unlinkSync.bind(mockFs);
+  const origRename = mockFs.renameSync.bind(mockFs);
+
+  mockFs.openSync = (target) => {
+    mockFs.files.set(path.resolve(target), Buffer.alloc(0));
+    return 77;
+  };
+  mockFs.writeSync = () => {
+    writeCalls += 1;
+    return writeCalls === 1 ? 3 : 0;
+  };
+  mockFs.closeSync = () => {};
+  mockFs.renameSync = (...args) => {
+    renameCalls += 1;
+    return origRename(...args);
+  };
+  mockFs.unlinkSync = (target) => {
+    unlinkedTmpPaths.push(path.resolve(target));
+    return origUnlink(target);
+  };
+
+  await assert.rejects(
+    () =>
+      runSetupWizard({
+        answers: {
+          discordToken: "new-token",
+          discordAppId: "app-3",
+          llmProvider: "deepseek",
+          sttProvider: "deepgram",
+          ttsProvider: "elevenlabs",
+        },
+        skipPregenerate: true,
+        fsImpl: mockFs,
+        envPath: ".env",
+        trustedRootDir: root,
+      }),
+    /Short write|Incomplete write/i,
+  );
+
+  assert.equal(renameCalls, 0);
+  assert.equal(unlinkedTmpPaths.length, 1);
+  assert.ok(path.basename(unlinkedTmpPaths[0]).startsWith(".env.tmp-"));
+  assert.equal(mockFs.files.get(envTarget), "DISCORD_BOT_TOKEN=original-preserved\n");
+
+  // Full write calls fchmodSync before closeSync and clears stageCreated after renameSync
+  const callOrder = [];
+  const postRenameUnlinks = [];
+  const fullFs = createMockSetupFs();
+  fullFs.dirs.add(root);
+  fullFs.files.set(envTarget, "DISCORD_BOT_TOKEN=original-preserved\n");
+  fullFs.openSync = (target) => {
+    fullFs.files.set(path.resolve(target), Buffer.alloc(0));
+    callOrder.push("openSync");
+    return 88;
+  };
+  fullFs.writeSync = (fd, buf, off, len) => {
+    assert.equal(fd, 88);
+    callOrder.push("writeSync");
+    return len;
+  };
+  fullFs.fchmodSync = (fd, mode) => {
+    assert.equal(fd, 88);
+    assert.equal(mode, 0o600);
+    callOrder.push("fchmodSync");
+  };
+  fullFs.closeSync = () => {
+    callOrder.push("closeSync");
+  };
+  const baseRename = fullFs.renameSync.bind(fullFs);
+  fullFs.renameSync = (from, to) => {
+    callOrder.push("renameSync");
+    return baseRename(from, to);
+  };
+  fullFs.chmodSync = (target) => {
+    if (path.resolve(target) === envTarget) {
+      throw new Error("post-rename chmod failure");
+    }
+  };
+  fullFs.unlinkSync = (target) => {
+    postRenameUnlinks.push(path.resolve(target));
+  };
+
+  await assert.rejects(
+    () =>
+      runSetupWizard({
+        answers: {
+          discordToken: "ok-token",
+          discordAppId: "app-4",
+          llmProvider: "deepseek",
+          sttProvider: "deepgram",
+          ttsProvider: "elevenlabs",
+        },
+        skipPregenerate: true,
+        fsImpl: fullFs,
+        envPath: ".env",
+        trustedRootDir: root,
+      }),
+    /post-rename chmod failure/,
+  );
+
+  assert.equal(postRenameUnlinks.length, 0);
+  assert.ok(callOrder.indexOf("fchmodSync") < callOrder.indexOf("closeSync"));
+});
+
+test("createCompanionApp.start registers A3-shaped slashCommands normalized with numeric option types and { name, value } choices", async () => {
+  const { EventEmitter } = await import("node:events");
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "app-a3-normalize-root");
+  mockFs.dirs.add(root);
+  mockFs.files.set(
+    path.join(root, ".env"),
+    [
+      "DISCORD_BOT_TOKEN=bot-token-norm",
+      "DISCORD_APP_ID=app-1",
+      "LLM_PROVIDER=deepseek",
+      "LLM_API_KEY=llm-k",
+      "STT_PROVIDER=deepgram",
+      "DEEPGRAM_API_KEY=dg-k",
+      "TTS_PROVIDER=elevenlabs",
+      "ELEVENLABS_API_KEY=el-k",
+      "ELEVENLABS_VOICE_ID=v-1",
+    ].join("\n"),
+  );
+
+  let setPayload = null;
+  const fakeClient = new EventEmitter();
+  fakeClient.login = async () => {};
+  fakeClient.destroy = () => {};
+  fakeClient.application = {
+    commands: {
+      async set(cmds) {
+        setPayload = cmds;
+      },
+    },
+  };
+
+  const a3Commands = [
+    {
+      name: "mode",
+      description: "Configure companion behavior",
+      options: [
+        {
+          name: "chime",
+          description: "Chime mode",
+          type: "STRING",
+          choices: ["smart", "always", "mention"],
+        },
+        {
+          name: "expressive",
+          description: "Expressive tags",
+          type: "BOOLEAN",
+        },
+      ],
+    },
+  ];
+
+  const app = await createCompanionApp({
+    env: {},
+    envPath: path.join(root, ".env"),
+    configPath: path.join(root, "config.json"),
+    soulPath: path.join(root, "SOUL.md"),
+    trustedRootDir: root,
+    fsImpl: mockFs,
+    client: fakeClient,
+    slashCommands: a3Commands,
+    createOpusTranscoderImpl: async () => ({ backend: "mock-opus", encode: () => Buffer.alloc(4), decode: () => Buffer.alloc(4) }),
+    createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
+    createTtsAdapterImpl: () => ({ name: () => "el", async warmup() {}, async synthesizeClause() {}, close() {} }),
+    createSttAdapterImpl: () => ({ name: () => "dg", async transcribe() {}, close() {} }),
+    createVoiceOrchestratorImpl: () => ({ async start() {}, close() {} }),
+    createCommandHandlerImpl: () => ({ commands: a3Commands, async handleInteraction() {} }),
+  });
+
+  await app.start();
+  assert.equal(setPayload.length, 1);
+  assert.equal(setPayload[0].options[0].type, 3);
+  assert.equal(setPayload[0].options[1].type, 5);
+  assert.deepEqual(setPayload[0].options[0].choices, [
+    { name: "smart", value: "smart" },
+    { name: "always", value: "always" },
+    { name: "mention", value: "mention" },
+  ]);
+  await app.stop();
+});

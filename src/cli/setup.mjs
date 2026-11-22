@@ -111,8 +111,16 @@ function writePrivateFile(targetPath, data, { encoding, fsImpl }) {
         let offset = 0;
         while (offset < payload.length) {
           const written = fsImpl.writeSync(fd, payload, offset, payload.length - offset, offset);
-          if (written <= 0) break;
+          if (!(Number.isInteger(written) && written > 0)) {
+            throw new Error("Short write while staging private file");
+          }
           offset += written;
+        }
+        if (offset !== payload.length) {
+          throw new Error("Incomplete write while staging private file");
+        }
+        if (typeof fsImpl.fchmodSync === "function") {
+          fsImpl.fchmodSync(fd, 0o600);
         }
         fsImpl.closeSync(fd);
         fd = null;
@@ -125,6 +133,7 @@ function writePrivateFile(targetPath, data, { encoding, fsImpl }) {
       fsImpl.chmodSync?.(tmpPath, 0o600);
       assertTargetNotSymlink(targetPath, fsImpl);
       fsImpl.renameSync(tmpPath, targetPath);
+      stageCreated = false;
       fsImpl.chmodSync?.(targetPath, 0o600);
     } catch (error) {
       if (fd !== null) {
