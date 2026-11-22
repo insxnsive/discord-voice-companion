@@ -2,9 +2,70 @@ import { validateEndpointUrl } from "../config/config.mjs";
 import { assertAdapterContract } from "../types.mjs";
 
 const DEFAULT_MAX_AUDIO_BYTES = 4 * 1024 * 1024;
+const MAX_AUDIO_BYTES_LIMIT = 16 * 1024 * 1024;
+const MAX_WS_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const DEFAULT_TTS_TIMEOUT_MS = 15000;
 const SAFE_IDENTIFIER_PATTERN = /^[a-zA-Z0-9._-]{1,128}$/;
-const MAX_WAV_SCAN_BYTES = 4096;
+const MAX_WAV_SCAN_BYTES = 512;
+
+function assertValidMaxAudioBytes(maxAudioBytes) {
+  if (
+    !Number.isSafeInteger(maxAudioBytes) ||
+    maxAudioBytes <= 0 ||
+    maxAudioBytes > MAX_AUDIO_BYTES_LIMIT
+  ) {
+    throw new RangeError(`maxAudioBytes must be a positive integer <= ${MAX_AUDIO_BYTES_LIMIT}`);
+  }
+  return maxAudioBytes;
+}
+
+function getRawByteLength(raw) {
+  if (typeof raw === "string") return Buffer.byteLength(raw, "utf8");
+  if (Buffer.isBuffer(raw)) return raw.length;
+  if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) return raw.byteLength;
+  return -1;
+}
+
+function createPcmEvenEmitter(onPcmChunk) {
+  let carry = null;
+  let emittedBytes = 0;
+
+  return {
+    push(raw) {
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      if (buf.length === 0) return 0;
+
+      let data = buf;
+      if (carry !== null) {
+        data = Buffer.allocUnsafe(1 + buf.length);
+        data[0] = carry;
+        buf.copy(data, 1);
+        carry = null;
+      }
+
+      const evenLen = data.length - (data.length % 2);
+      if (data.length % 2 === 1) {
+        carry = data[data.length - 1];
+      }
+      if (evenLen >= 2) {
+        const slice = evenLen === data.length ? data : data.subarray(0, evenLen);
+        emittedBytes += slice.length;
+        if (typeof onPcmChunk === "function") onPcmChunk(slice);
+        return slice.length;
+      }
+      return 0;
+    },
+    flush() {
+      if (carry !== null) {
+        throw new Error("TTS PCM stream ended with incomplete sample frame");
+      }
+      return emittedBytes;
+    },
+    get emittedBytes() {
+      return emittedBytes;
+    },
+  };
+}
 
 function assertSafeIdentifier(value, label) {
   if (typeof value !== "string" || !SAFE_IDENTIFIER_PATTERN.test(value)) {
@@ -83,11 +144,11 @@ async function readBoundedAudioStream(response, { maxAudioBytes, signal, now, on
       const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
       if (buf.length === 0) continue;
 
-      byteLength += buf.length;
-      if (byteLength > maxAudioBytes) {
+      if (byteLength + buf.length > maxAudioBytes) {
         await reader.cancel().catch(() => {});
         throw new Error("TTS audio exceeded size limit");
       }
+      byteLength += buf.length;
 
       if (firstByteAt === null) firstByteAt = now();
       onChunk(buf);
@@ -103,31 +164,46 @@ async function readBoundedAudioStream(response, { maxAudioBytes, signal, now, on
 }
 
 /**
- * Strip a RIFF/WAVE header (44-byte or extended) and return the raw PCM slice.
+ * Validate and strip a RIFF/WAVE header (44-byte or extended) and return the raw PCM slice.
  */
 export function stripWavHeaderIfPresent(buf) {
   const buffer = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-  if (
-    buffer.length < 12 ||
-    buffer.toString("ascii", 0, 4) !== "RIFF" ||
-    buffer.toString("ascii", 8, 12) !== "WAVE"
-  ) {
+  if (buffer.length < 4 || buffer.toString("ascii", 0, 4) !== "RIFF") {
     return buffer;
+  }
+  if (buffer.length < 12 || buffer.toString("ascii", 8, 12) !== "WAVE") {
+    throw new Error("Invalid WAV header");
   }
 
   const scanLimit = Math.min(buffer.length, MAX_WAV_SCAN_BYTES);
   let offset = 12;
+  let sawFmt = false;
   while (offset + 8 <= scanLimit) {
     const chunkId = buffer.toString("ascii", offset, offset + 4);
     const chunkSize = buffer.readUInt32LE(offset + 4);
-    if (chunkId === "data") {
+    const step = 8 + chunkSize + (chunkSize % 2);
+    if (chunkSize > MAX_WAV_SCAN_BYTES || step < 8) {
+      throw new Error("Invalid WAV chunk size");
+    }
+    if (chunkId === "fmt ") {
+      if (chunkSize < 16 || offset + 8 + chunkSize > scanLimit) {
+        throw new Error("Invalid or truncated WAV fmt chunk");
+      }
+      const audioFormat = buffer.readUInt16LE(offset + 8);
+      const bitsPerSample = buffer.readUInt16LE(offset + 22);
+      if (audioFormat !== 1 || bitsPerSample !== 16) {
+        throw new Error("Unsupported non-PCM WAV format");
+      }
+      sawFmt = true;
+    } else if (chunkId === "data") {
+      if (!sawFmt) {
+        throw new Error("WAV header missing fmt chunk before data");
+      }
       return buffer.subarray(offset + 8);
     }
-    const step = 8 + chunkSize + (chunkSize % 2);
-    if (step < 8) break;
     offset += step;
   }
-  return buffer;
+  throw new Error("Truncated or unsupported WAV header");
 }
 
 function attachSocketListeners(ws, handlers) {
@@ -174,6 +250,12 @@ export function createElevenLabsWsAdapter({
   WebSocketImpl,
   now = () => performance.now(),
 } = {}) {
+  const safeMaxAudioBytes = assertValidMaxAudioBytes(maxAudioBytes);
+  const maxPayload = Math.min(safeMaxAudioBytes, MAX_WS_PAYLOAD_BYTES);
+  const maxWsMessageBytes = Math.min(
+    MAX_WS_PAYLOAD_BYTES,
+    Math.ceil((safeMaxAudioBytes * 4) / 3) + 65536,
+  );
   const safeVoiceId = assertSafeIdentifier(voiceId, "tts.voiceId");
   const safeModelId = assertSafeIdentifier(modelId, "tts.model");
   const wsUrl =
@@ -182,6 +264,32 @@ export function createElevenLabsWsAdapter({
 
   let idleSocket = null;
   let activeSocket = null;
+  let activeAbortController = null;
+
+  function attachErrorTrap(ws) {
+    const onErrorTrap = () => {};
+    let cleanupClose = () => {};
+    const onCloseTrap = () => {
+      cleanupClose();
+      if (typeof ws.removeListener === "function") ws.removeListener("error", onErrorTrap);
+      else if (typeof ws.off === "function") ws.off("error", onErrorTrap);
+    };
+    if (typeof ws.on === "function") {
+      ws.on("error", onErrorTrap);
+      ws.on("close", onCloseTrap);
+      cleanupClose = () => {
+        if (typeof ws.removeListener === "function") ws.removeListener("close", onCloseTrap);
+        else if (typeof ws.off === "function") ws.off("close", onCloseTrap);
+      };
+    } else if (typeof ws.addEventListener === "function") {
+      ws.addEventListener("error", onErrorTrap);
+      ws.addEventListener("close", onCloseTrap);
+      cleanupClose = () => {
+        ws.removeEventListener("close", onCloseTrap);
+        ws.removeEventListener("error", onErrorTrap);
+      };
+    }
+  }
 
   async function openSocket(signal) {
     if (signal?.aborted) throw createAbortError(signal);
@@ -190,7 +298,9 @@ export function createElevenLabsWsAdapter({
 
     const ws = new WsClass(wsUrl, {
       headers: { "xi-api-key": apiKey },
+      maxPayload,
     });
+    attachErrorTrap(ws);
 
     if (ws.readyState === 1) return ws;
 
@@ -207,11 +317,11 @@ export function createElevenLabsWsAdapter({
           detach();
           resolve();
         },
-        error(err) {
+        error() {
           signal?.removeEventListener("abort", onAbort);
           detach();
           closeSocket(ws);
-          reject(err instanceof Error ? err : new Error("TTS WebSocket connection failed"));
+          reject(new Error("TTS WebSocket connection failed"));
         },
         close() {
           signal?.removeEventListener("abort", onAbort);
@@ -246,7 +356,9 @@ export function createElevenLabsWsAdapter({
     if (signal?.aborted) throw createAbortError(signal);
 
     const deadline = createTimeoutController(timeoutMs, "TTS WebSocket");
-    const combinedSignal = combineSignals(signal, deadline.signal);
+    const closeController = new AbortController();
+    activeAbortController = closeController;
+    const combinedSignal = combineSignals(combineSignals(signal, deadline.signal), closeController.signal);
     let ws = null;
 
     try {
@@ -262,6 +374,7 @@ export function createElevenLabsWsAdapter({
       }
 
       activeSocket = ws;
+      const emitter = createPcmEvenEmitter(onPcmChunk);
 
       return await new Promise((resolve, reject) => {
         let settled = false;
@@ -286,15 +399,20 @@ export function createElevenLabsWsAdapter({
 
         detach = attachSocketListeners(ws, {
           message(raw) {
+            const rawBytes = getRawByteLength(raw);
+            if (rawBytes < 0) return;
+            if (rawBytes > maxWsMessageBytes) {
+              finish(new Error("TTS WebSocket payload exceeded size limit"));
+              return;
+            }
+
             let textPayload;
             if (typeof raw === "string") {
               textPayload = raw;
             } else if (Buffer.isBuffer(raw)) {
               textPayload = raw.toString("utf8");
-            } else if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
-              textPayload = Buffer.from(raw.buffer ?? raw).toString("utf8");
             } else {
-              return;
+              textPayload = Buffer.from(raw.buffer ?? raw, raw.byteOffset ?? 0, raw.byteLength).toString("utf8");
             }
 
             let msg;
@@ -305,37 +423,44 @@ export function createElevenLabsWsAdapter({
             }
 
             if (msg?.error) {
-              finish(new Error(`ElevenLabs WS error: ${String(msg.error).slice(0, 120)}`));
+              finish(new Error("TTS WebSocket upstream error"));
               return;
             }
 
             if (typeof msg?.audio === "string" && msg.audio.length > 0) {
+              const remainingBytes = safeMaxAudioBytes - byteLength;
+              const maxBase64Len = Math.ceil((Math.max(0, remainingBytes) * 4) / 3) + 4;
+              if (msg.audio.length > maxBase64Len) {
+                finish(new Error("TTS audio exceeded size limit"));
+                return;
+              }
               const pcm = Buffer.from(msg.audio, "base64");
               if (pcm.length > 0) {
-                byteLength += pcm.length;
-                if (byteLength > maxAudioBytes) {
+                if (byteLength + pcm.length > safeMaxAudioBytes) {
                   finish(new Error("TTS audio exceeded size limit"));
                   return;
                 }
+                byteLength += pcm.length;
                 if (firstByteAt === null) firstByteAt = now();
-                if (typeof onPcmChunk === "function") onPcmChunk(pcm);
+                emitter.push(pcm);
               }
             }
 
             if (msg?.isFinal === true) {
-              finish(null, { firstByteAt, byteLength });
+              try {
+                emitter.flush();
+              } catch (frameErr) {
+                finish(frameErr);
+                return;
+              }
+              finish(null, { firstByteAt, byteLength: emitter.emittedBytes });
             }
           },
-          error(err) {
-            finish(err instanceof Error ? err : new Error("TTS WebSocket stream error"));
+          error() {
+            finish(new Error("TTS WebSocket stream error"));
           },
-          close(code) {
-            if (settled) return;
-            if (code === 1000 && byteLength > 0) {
-              finish(null, { firstByteAt, byteLength });
-            } else {
-              finish(new Error("TTS WebSocket closed before completion"));
-            }
+          close() {
+            finish(new Error("TTS WebSocket closed before completion"));
           },
         });
 
@@ -361,11 +486,16 @@ export function createElevenLabsWsAdapter({
       });
     } finally {
       deadline.clear();
+      if (activeAbortController === closeController) activeAbortController = null;
       if (activeSocket === ws) activeSocket = null;
     }
   }
 
   function close() {
+    if (activeAbortController) {
+      activeAbortController.abort(new Error("TTS WebSocket closed"));
+      activeAbortController = null;
+    }
     closeSocket(idleSocket);
     idleSocket = null;
     closeSocket(activeSocket);
@@ -394,6 +524,7 @@ export function createElevenLabsHttpStreamAdapter({
   fetchImpl = fetch,
   now = () => performance.now(),
 } = {}) {
+  const safeMaxAudioBytes = assertValidMaxAudioBytes(maxAudioBytes);
   const safeVoiceId = assertSafeIdentifier(voiceId, "tts.voiceId");
   const safeModelId = assertSafeIdentifier(modelId, "tts.model");
   const url =
@@ -440,14 +571,17 @@ export function createElevenLabsHttpStreamAdapter({
         await throwHttpError(response);
       }
 
-      return await readBoundedAudioStream(response, {
-        maxAudioBytes,
+      const emitter = createPcmEvenEmitter(onPcmChunk);
+      const result = await readBoundedAudioStream(response, {
+        maxAudioBytes: safeMaxAudioBytes,
         signal: combinedSignal,
         now,
         onChunk: (buf) => {
-          if (typeof onPcmChunk === "function") onPcmChunk(buf);
+          emitter.push(buf);
         },
       });
+      emitter.flush();
+      return result;
     } finally {
       deadline.clear();
       if (activeController === requestController) activeController = null;
@@ -482,6 +616,7 @@ export function createOpenAiTtsAdapter({
   fetchImpl = fetch,
   now = () => performance.now(),
 } = {}) {
+  const safeMaxAudioBytes = assertValidMaxAudioBytes(maxAudioBytes);
   const validatedBaseUrl = validateEndpointUrl(baseUrl, "tts.baseUrl");
   if (!validatedBaseUrl) {
     throw new RangeError("tts.baseUrl is required");
@@ -526,25 +661,102 @@ export function createOpenAiTtsAdapter({
         await throwHttpError(response);
       }
 
-      let isFirstChunk = true;
-      let emittedBytes = 0;
+      let headerResolved = false;
+      let headerBuf = Buffer.alloc(0);
       let firstByteAt = null;
+      const emitter = createPcmEvenEmitter((chunk) => {
+        if (firstByteAt === null) firstByteAt = now();
+        if (typeof onPcmChunk === "function") onPcmChunk(chunk);
+      });
+
+      const tryResolveHeader = () => {
+        const prefixLen = Math.min(4, headerBuf.length);
+        const expectedPrefix = "RIFF".slice(0, prefixLen);
+        if (headerBuf.toString("ascii", 0, prefixLen) !== expectedPrefix) {
+          headerResolved = true;
+          const raw = headerBuf;
+          headerBuf = null;
+          emitter.push(raw);
+          return;
+        }
+        if (headerBuf.length < 12) return;
+        if (headerBuf.toString("ascii", 8, 12) !== "WAVE") {
+          throw new Error("Invalid WAV header");
+        }
+
+        let offset = 12;
+        let sawFmt = false;
+        while (offset + 8 <= headerBuf.length) {
+          const chunkId = headerBuf.toString("ascii", offset, offset + 4);
+          const chunkSize = headerBuf.readUInt32LE(offset + 4);
+          const step = 8 + chunkSize + (chunkSize % 2);
+          if (chunkSize > MAX_WAV_SCAN_BYTES || step < 8) {
+            throw new Error("Invalid WAV chunk size");
+          }
+          if (chunkId === "fmt ") {
+            if (chunkSize < 16) {
+              throw new Error("Invalid WAV fmt chunk");
+            }
+            if (offset + step > headerBuf.length) {
+              if (headerBuf.length > MAX_WAV_SCAN_BYTES) {
+                throw new Error("Truncated WAV fmt chunk");
+              }
+              return;
+            }
+            const audioFormat = headerBuf.readUInt16LE(offset + 8);
+            const bitsPerSample = headerBuf.readUInt16LE(offset + 22);
+            if (audioFormat !== 1 || bitsPerSample !== 16) {
+              throw new Error("Unsupported non-PCM WAV format");
+            }
+            sawFmt = true;
+          } else if (chunkId === "data") {
+            if (!sawFmt) {
+              throw new Error("WAV header missing fmt chunk before data");
+            }
+            headerResolved = true;
+            const pcmStart = headerBuf.subarray(offset + 8);
+            headerBuf = null;
+            if (pcmStart.length > 0) emitter.push(pcmStart);
+            return;
+          } else if (offset + step > headerBuf.length) {
+            if (headerBuf.length > MAX_WAV_SCAN_BYTES) {
+              throw new Error("WAV header exceeded maximum scan size");
+            }
+            return;
+          }
+          offset += step;
+        }
+
+        if (headerBuf.length > MAX_WAV_SCAN_BYTES) {
+          throw new Error("WAV header exceeded maximum scan size");
+        }
+      };
 
       await readBoundedAudioStream(response, {
-        maxAudioBytes,
+        maxAudioBytes: safeMaxAudioBytes,
         signal: combinedSignal,
         now,
         onChunk: (buf) => {
-          const payload = isFirstChunk ? stripWavHeaderIfPresent(buf) : buf;
-          isFirstChunk = false;
-          if (payload.length === 0) return;
-          if (firstByteAt === null) firstByteAt = now();
-          emittedBytes += payload.length;
-          if (typeof onPcmChunk === "function") onPcmChunk(payload);
+          if (headerResolved) {
+            emitter.push(buf);
+            return;
+          }
+          headerBuf = headerBuf.length === 0 ? buf : Buffer.concat([headerBuf, buf]);
+          tryResolveHeader();
         },
       });
 
-      return { firstByteAt, byteLength: emittedBytes };
+      if (!headerResolved && headerBuf !== null && headerBuf.length > 0) {
+        const prefixLen = Math.min(4, headerBuf.length);
+        if (headerBuf.toString("ascii", 0, prefixLen) === "RIFF".slice(0, prefixLen)) {
+          throw new Error("Truncated WAV header");
+        }
+        emitter.push(headerBuf);
+        headerBuf = null;
+      }
+      emitter.flush();
+
+      return { firstByteAt, byteLength: emitter.emittedBytes };
     } finally {
       deadline.clear();
       if (activeController === requestController) activeController = null;

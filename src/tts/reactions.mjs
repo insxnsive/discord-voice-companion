@@ -47,17 +47,40 @@ export function classifyTranscriptMood(transcript) {
   return "subtle_breath";
 }
 
+const DEFAULT_MAX_CLIP_BYTES = 512 * 1024;
+const DEFAULT_MAX_POOL_BYTES = 8 * 1024 * 1024;
+
+function computeClipBytes({ frames48kOpus = [], pcm24k = null }) {
+  let total = pcm24k ? (pcm24k.byteLength ?? pcm24k.length ?? 0) : 0;
+  if (Array.isArray(frames48kOpus)) {
+    for (const frame of frames48kOpus) {
+      if (frame) total += frame.byteLength ?? frame.length ?? 0;
+    }
+  }
+  return total;
+}
+
 /**
  * Mood-bucketed reaction audio pool with an LRU cooldown window so short
  * reaction cues do not repeat back-to-back across long voice sessions.
  */
 export class ReactionPool {
-  constructor({ cooldownTurns = 10, maxClips = 64 } = {}) {
+  constructor({
+    cooldownTurns = 10,
+    maxClips = 64,
+    maxFileBytes = DEFAULT_MAX_CLIP_BYTES,
+    maxTotalBytes = DEFAULT_MAX_POOL_BYTES,
+  } = {}) {
     this.cooldownTurns =
       Number.isInteger(cooldownTurns) && cooldownTurns > 0 ? cooldownTurns : 10;
     this.maxClips = Number.isInteger(maxClips) && maxClips > 0 ? maxClips : 64;
+    this.maxFileBytes =
+      Number.isInteger(maxFileBytes) && maxFileBytes > 0 ? maxFileBytes : DEFAULT_MAX_CLIP_BYTES;
+    this.maxTotalBytes =
+      Number.isInteger(maxTotalBytes) && maxTotalBytes > 0 ? maxTotalBytes : DEFAULT_MAX_POOL_BYTES;
     this.clips = new Map();
     this.recentIds = [];
+    this.totalBytes = 0;
   }
 
   get size() {
@@ -71,10 +94,20 @@ export class ReactionPool {
     if (!REACTION_MOODS.includes(mood)) {
       throw new RangeError(`Invalid reaction mood: ${mood}`);
     }
+    const clipBytes = computeClipBytes({ frames48kOpus, pcm24k });
+    if (clipBytes > this.maxFileBytes) {
+      throw new RangeError("Reaction clip exceeds maximum file byte limit");
+    }
     if (this.clips.size >= this.maxClips && !this.clips.has(id)) {
       return false;
     }
+    const prevBytes = this.clips.has(id) ? computeClipBytes(this.clips.get(id)) : 0;
+    const nextTotalBytes = this.totalBytes - prevBytes + clipBytes;
+    if (nextTotalBytes > this.maxTotalBytes) {
+      throw new RangeError("ReactionPool exceeded 8 MiB aggregate byte limit");
+    }
     this.clips.set(id, { id, mood, frames48kOpus, pcm24k });
+    this.totalBytes = nextTotalBytes;
     return true;
   }
 
@@ -100,9 +133,10 @@ export class ReactionPool {
       candidates = allClips.filter((clip) => !recentSet.has(clip.id));
     }
     if (candidates.length === 0) {
-      const poolToRank = bucket.length > 0 ? bucket : allClips;
-      candidates = [...poolToRank].sort((a, b) => this.recentIds.indexOf(a.id) - this.recentIds.indexOf(b.id));
-      candidates = [candidates[0]];
+      const globalLru = [...allClips].sort(
+        (a, b) => this.recentIds.indexOf(a.id) - this.recentIds.indexOf(b.id),
+      );
+      candidates = [globalLru[0]];
     }
 
     const rawRoll = Number(rng());
@@ -119,11 +153,32 @@ export class ReactionPool {
     return chosen;
   }
 
-  loadFromDirectory(dirPath, { fsImpl = fs, maxFileBytes = 524288 } = {}) {
+  loadFromDirectory(dirPath, { fsImpl = fs, maxFileBytes = this.maxFileBytes } = {}) {
     if (!dirPath) return 0;
     if (typeof fsImpl.existsSync === "function" && !fsImpl.existsSync(dirPath)) {
       return 0;
     }
+
+    if (typeof fsImpl.lstatSync === "function") {
+      let rootStat;
+      try {
+        rootStat = fsImpl.lstatSync(dirPath);
+      } catch (error) {
+        if (error && error.code === "ENOENT") return 0;
+        throw error;
+      }
+      if (rootStat?.isSymbolicLink?.()) {
+        throw new RangeError("Reaction cache directory cannot be a symlink");
+      }
+      if (!rootStat?.isDirectory?.()) {
+        return 0;
+      }
+    }
+
+    const effectiveMaxFileBytes =
+      Number.isInteger(maxFileBytes) && maxFileBytes > 0
+        ? Math.min(this.maxFileBytes, maxFileBytes)
+        : this.maxFileBytes;
 
     let entries;
     try {
@@ -133,6 +188,12 @@ export class ReactionPool {
       throw error;
     }
 
+    const hasDescriptorFs =
+      typeof fsImpl.openSync === "function" &&
+      typeof fsImpl.fstatSync === "function" &&
+      typeof fsImpl.readSync === "function" &&
+      typeof fsImpl.closeSync === "function";
+
     let loaded = 0;
     for (const entry of [...entries].sort()) {
       if (this.size >= this.maxClips) break;
@@ -140,22 +201,78 @@ export class ReactionPool {
       if (!match) continue;
 
       const fullPath = path.join(dirPath, entry);
-      let stat;
-      try {
-        stat = fsImpl.lstatSync(fullPath);
-      } catch {
-        continue;
-      }
-      if (!stat?.isFile() || stat.size <= 0 || stat.size > maxFileBytes) {
-        continue;
+      let buffer = null;
+
+      if (hasDescriptorFs) {
+        const flags =
+          (fsImpl.constants?.O_RDONLY ?? fs.constants.O_RDONLY) |
+          (fsImpl.constants?.O_NOFOLLOW ?? fs.constants.O_NOFOLLOW ?? 0);
+        let fd = null;
+        try {
+          fd = fsImpl.openSync(fullPath, flags);
+          const stat = fsImpl.fstatSync(fd);
+          if (
+            stat?.isSymbolicLink?.() ||
+            !stat?.isFile?.() ||
+            stat.size <= 0 ||
+            stat.size > effectiveMaxFileBytes
+          ) {
+            continue;
+          }
+          const target = Buffer.allocUnsafe(stat.size);
+          let offset = 0;
+          while (offset < stat.size) {
+            const bytesRead = fsImpl.readSync(fd, target, offset, stat.size - offset, offset);
+            if (bytesRead <= 0) break;
+            offset += bytesRead;
+          }
+          if (offset !== stat.size) continue;
+          buffer = target;
+        } catch {
+          continue;
+        } finally {
+          if (fd !== null) {
+            try {
+              fsImpl.closeSync(fd);
+            } catch {
+              // Ignore close errors.
+            }
+          }
+        }
+      } else {
+        let stat;
+        try {
+          stat = fsImpl.lstatSync(fullPath);
+        } catch {
+          continue;
+        }
+        if (
+          stat?.isSymbolicLink?.() ||
+          !stat?.isFile?.() ||
+          stat.size <= 0 ||
+          stat.size > effectiveMaxFileBytes
+        ) {
+          continue;
+        }
+        const raw = fsImpl.readFileSync(fullPath);
+        buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
       }
 
-      const raw = fsImpl.readFileSync(fullPath);
-      const buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
       const mood = match[1].toLowerCase();
       const slug = match[2];
       const ext = match[3].toLowerCase();
-      const pcm24k = ext === "wav" ? stripWavHeaderIfPresent(buffer) : buffer;
+      let pcm24k;
+      try {
+        pcm24k = ext === "wav" ? stripWavHeaderIfPresent(buffer) : buffer;
+      } catch {
+        continue;
+      }
+      if (pcm24k.length < 2 || pcm24k.length % 2 !== 0) {
+        continue;
+      }
+      if (this.totalBytes + pcm24k.length > this.maxTotalBytes) {
+        break;
+      }
 
       if (this.registerClip({ id: `${mood}_${slug}`, mood, pcm24k })) {
         loaded += 1;
