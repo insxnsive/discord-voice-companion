@@ -68,10 +68,12 @@ test("assertAdapterContract names the label and every missing method", () => {
 
 test("assertAdapterContract rejects a null adapter", () => {
   assert.throws(
-    () => assertAdapterContract(null, ["speak"], "stt adapter"),
+    () => assertAdapterContract(null, ["speak", "close"], "voice adapter"),
     (error) => {
       assert.ok(error instanceof TypeError);
-      assert.match(error.message, /stt adapter/);
+      assert.match(error.message, /voice adapter/);
+      assert.match(error.message, /speak/);
+      assert.match(error.message, /close/);
       return true;
     },
   );

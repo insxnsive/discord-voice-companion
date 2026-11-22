@@ -60,7 +60,9 @@ export function assertAdapterContract(adapter, requiredMethods, label = "adapter
     throw new TypeError(`${label} requiredMethods must be an array of method names`);
   }
   if (adapter === null || typeof adapter !== "object") {
-    throw new TypeError(`${label} must be a non-null object`);
+    throw new TypeError(
+      `${label} must be a non-null object (required: ${requiredMethods.join(", ")})`,
+    );
   }
   const missing = requiredMethods.filter((name) => typeof adapter[name] !== "function");
   if (missing.length > 0) {
