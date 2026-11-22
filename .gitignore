@@ -1,0 +1,8 @@
+node_modules/
+.env
+config.json
+assets/reactions/*.ogg
+assets/reactions/*.pcm
+assets/reactions/*.wav
+*.log
+.DS_Store
