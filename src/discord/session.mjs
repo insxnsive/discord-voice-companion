@@ -26,6 +26,9 @@ const MAX_SPEAKER_FETCHES = 64;
 const SPEAKER_NEGATIVE_TTL_MS = 60000;
 const DAVE_MODULES = Object.freeze(["@discordjs/voice", "@snazzah/davey"]);
 const MAX_PCM_CHUNK_BYTES = 245760;
+const MAX_CLAUSES_PER_TURN = 24;
+const MAX_TURN_AUDIO_BYTES = 16 * 1024 * 1024;
+const MAX_QUEUED_OPUS_FRAMES = 1500;
 
 function parseNodeVersion(version) {
   const [major = 0, minor = 0] = String(version)
@@ -103,6 +106,13 @@ export function createVoiceOrchestrator({
     throw new TypeError("opusTranscoder must expose encode() and decode()");
   }
 
+  if (
+    config?.turnDeadlineMs !== undefined &&
+    (!Number.isFinite(config.turnDeadlineMs) || config.turnDeadlineMs <= 0)
+  ) {
+    throw new RangeError("turnDeadlineMs must be a positive finite number");
+  }
+
   let resolvedBotUserId = botUserId || client?.user?.id || "";
   let transcoder = opusTranscoder;
   let transcoderPromise = null;
@@ -113,6 +123,7 @@ export function createVoiceOrchestrator({
 
   const speakerBotCache = new Map();
   const speakerFetchInFlight = new Map();
+  const speakerDecoders = new Map();
 
   const state = {
     active: false,
@@ -125,7 +136,7 @@ export function createVoiceOrchestrator({
       : "adaptive",
     mutedUsers: new Set(),
     isBotSpeaking: false,
-    lastBotReplyAt: 0,
+    lastBotReplyAt: null,
     lastError: null,
     sessionEpoch: 0,
     sessionToken: null,
@@ -256,6 +267,7 @@ export function createVoiceOrchestrator({
         botUserId: resolvedBotUserId,
         detectorFactory: () => createRmsSpeechDetector(),
         isBotSpeaking: () => Boolean(state.isBotSpeaking || sinkIsPlaying()),
+        now,
         ...vadCallbacks,
       });
 
@@ -315,6 +327,7 @@ export function createVoiceOrchestrator({
     if (speakerFetchInFlight.size >= MAX_SPEAKER_FETCHES) return true;
 
     const pending = (async () => {
+      const lookupEpoch = state.sessionEpoch;
       try {
         const guild = guildsCache?.get?.(guildId);
         let fetched = null;
@@ -325,13 +338,17 @@ export function createVoiceOrchestrator({
         }
         if (fetched) {
           const isBot = Boolean(fetched.user?.bot ?? fetched.bot);
-          rememberSpeaker(userId, isBot, Infinity);
+          if (state.sessionEpoch === lookupEpoch && !state.closed) {
+            rememberSpeaker(userId, isBot, Infinity);
+          }
           return isBot;
         }
       } catch {
         // Fall through to the negative cache.
       }
-      rememberSpeaker(userId, true, now() + SPEAKER_NEGATIVE_TTL_MS);
+      if (state.sessionEpoch === lookupEpoch && !state.closed) {
+        rememberSpeaker(userId, true, now() + SPEAKER_NEGATIVE_TTL_MS);
+      }
       return true;
     })();
 
@@ -425,6 +442,7 @@ export function createVoiceOrchestrator({
   }
 
   function resetTurnAndSession() {
+    clearTimeout(currentTurn?.deadline);
     currentTurn?.controller.abort();
     currentTurn?.filler?.cancel();
     finishOutput(currentTurn);
@@ -433,9 +451,16 @@ export function createVoiceOrchestrator({
     stopPlayback();
     vad.clear?.();
     history = [];
-    state.lastBotReplyAt = 0;
+    state.lastBotReplyAt = null;
+    for (const decoder of speakerDecoders.values()) {
+      try {
+        decoder?.close?.();
+      } catch {
+        // Decoder teardown is best effort.
+      }
+    }
+    speakerDecoders.clear();
     speakerBotCache.clear();
-    speakerFetchInFlight.clear();
     state.sessionEpoch += 1;
     state.sessionToken = null;
   }
@@ -450,6 +475,14 @@ export function createVoiceOrchestrator({
       destroyVoice();
       state.guildId = null;
       state.channelId = null;
+      // External disconnect is a guild boundary: drop moderation and modes so
+      // a later join cannot inherit them.
+      state.mutedUsers.clear();
+      vad.setIgnoredUsers?.([]);
+      state.chimeMode = CHIME_MODES.includes(config?.chime?.mode) ? config.chime.mode : "smart";
+      state.fillerMode = FILLER_MODES.includes(config?.reactions?.mode)
+        ? config.reactions.mode
+        : "adaptive";
       return;
     }
     if (!guildId) return;
@@ -481,6 +514,14 @@ export function createVoiceOrchestrator({
         return;
       }
 
+      const codec = await ensureTranscoder();
+      if (!isSnapshotCurrent(snap)) return;
+      let streamDecoder = speakerDecoders.get(userId);
+      if (!streamDecoder) {
+        streamDecoder = codec?.createDecoder ? codec.createDecoder() : codec;
+        speakerDecoders.set(userId, streamDecoder);
+      }
+
       const EndBehaviorType = resolvedVoiceDeps?.EndBehaviorType;
       const stream = voiceConnection?.receiver?.subscribe?.(userId, {
         end: { behavior: EndBehaviorType?.AfterSilence ?? 1, duration: 240 },
@@ -501,10 +542,16 @@ export function createVoiceOrchestrator({
             userId,
             displayName: resolveDisplayName(userId, boundGuildId),
             opusPacket: chunk,
+            decoder: streamDecoder,
           }),
         ).catch(() => {});
       });
-      stream.on?.("end", cleanup);
+      stream.on?.("end", () => {
+        cleanup();
+        if (isSnapshotCurrent(snap) && !state.mutedUsers.has(userId)) {
+          Promise.resolve(vad.flushSpeaker?.(userId, now())).catch(() => {});
+        }
+      });
       stream.on?.("close", cleanup);
       stream.on?.("error", cleanup);
     } catch {
@@ -531,53 +578,65 @@ export function createVoiceOrchestrator({
 
   function playPacket(turn, packet) {
     activePlaybackUserId = turn.userId;
+    turn.queuedOpusFrames += 1;
+    if (turn.queuedOpusFrames > MAX_QUEUED_OPUS_FRAMES) {
+      state.lastError = "turn frame limit exceeded";
+      turn.controller.abort();
+      stopPlayback();
+      return;
+    }
     if (playerSink?.playOpusFrame) {
       playerSink.playOpusFrame(packet);
       return;
     }
     const stream = ensureTurnStream(turn);
-    stream?.write?.(packet);
+    if (stream?.write?.(packet) === false && (stream.readableLength ?? 0) > MAX_QUEUED_OPUS_FRAMES) {
+      state.lastError = "turn frame limit exceeded";
+      turn.controller.abort();
+      stopPlayback();
+    }
   }
 
-  function emitFrame(turn, packet) {
+  function emitFrame(turn, packet, { isFiller = false } = {}) {
     if (turn.controller.signal.aborted) return;
-    if (!turn.firstFrameMarked) {
+    if (!isFiller && !turn.firstFrameMarked) {
       latencyTracker.mark(turn.id, "opusFirstFrameAt", now());
       turn.firstFrameMarked = true;
     }
     playPacket(turn, packet);
   }
 
-  function emitPcm48(turn, pcm48) {
+  function emitPcm48(turn, pcm48, options) {
     const buffer = Buffer.isBuffer(pcm48) ? pcm48 : Buffer.from(pcm48);
     for (let offset = 0; offset < buffer.length; offset += MAX_PCM_CHUNK_BYTES) {
       const slice = buffer.subarray(offset, Math.min(offset + MAX_PCM_CHUNK_BYTES, buffer.length));
       for (const frame of turn.accumulator.push(slice)) {
-        emitFrame(turn, transcoder.encode(frame));
+        emitFrame(turn, transcoder.encode(frame), options);
       }
     }
   }
 
-  function flushFrames(turn) {
+  function flushFrames(turn, options) {
     const tail = turn.accumulator.flushPadded();
-    if (tail) emitFrame(turn, transcoder.encode(tail));
+    if (tail) emitFrame(turn, transcoder.encode(tail), options);
   }
 
   function emitClip(clip, turn) {
     if (!clip || turn.controller.signal.aborted) return;
     if (Array.isArray(clip.frames48kOpus) && clip.frames48kOpus.length > 0) {
-      for (const packet of clip.frames48kOpus) emitFrame(turn, packet);
+      for (const packet of clip.frames48kOpus) emitFrame(turn, packet, { isFiller: true });
       return;
     }
     if (clip.pcm24k) {
-      emitPcm48(turn, turn.upsampler.push(clip.pcm24k));
-      flushFrames(turn);
+      emitPcm48(turn, turn.upsampler.push(clip.pcm24k), { isFiller: true });
+      flushFrames(turn, { isFiller: true });
     }
   }
 
   function abortTurn() {
     const turn = currentTurn;
     state.isBotSpeaking = false;
+    stopPlayback();
     if (!turn) return;
     try {
       latencyTracker.mark(turn.id, "bargeInCancelled", true);
@@ -586,6 +645,7 @@ export function createVoiceOrchestrator({
     }
     turn.controller.abort();
     turn.filler?.cancel();
+    clearTimeout(turn.deadline);
     stopPlayback();
   }
 
@@ -609,6 +669,13 @@ export function createVoiceOrchestrator({
       signal: turn.controller.signal,
       onPcmChunk: (pcm24) => {
         if (!isTurnLive(turn)) return;
+        turn.pcmBytes += Buffer.isBuffer(pcm24) ? pcm24.length : Buffer.byteLength(pcm24);
+        if (turn.pcmBytes > MAX_TURN_AUDIO_BYTES) {
+          state.lastError = "turn audio limit exceeded";
+          turn.controller.abort();
+          stopPlayback();
+          return;
+        }
         if (!turn.ttsMarked) {
           latencyTracker.mark(turn.id, "ttsFirstByteAt", now());
           turn.ttsMarked = true;
@@ -629,6 +696,7 @@ export function createVoiceOrchestrator({
     if (currentTurn) {
       currentTurn.controller.abort();
       currentTurn.filler?.cancel();
+      clearTimeout(currentTurn.deadline);
       finishOutput(currentTurn);
       stopPlayback();
     }
@@ -644,6 +712,8 @@ export function createVoiceOrchestrator({
       accumulator: createFrameAccumulator(),
       firstFrameMarked: false,
       llmMarked: false,
+      pcmBytes: 0,
+      queuedOpusFrames: 0,
       ttsMarked: false,
       outStream: null,
       sessionEpoch: state.sessionEpoch,
@@ -652,6 +722,18 @@ export function createVoiceOrchestrator({
     };
     currentTurn = turn;
     latencyTracker.startTurn(turnId, startedAt);
+
+    const turnDeadlineMs = Number.isFinite(config?.turnDeadlineMs)
+      ? config.turnDeadlineMs
+      : 10000;
+    turn.deadline = setTimeout(() => {
+      if (!turn.controller.signal.aborted) {
+        state.lastError = "turn deadline exceeded";
+        turn.controller.abort();
+        turn.filler?.cancel();
+        stopPlayback();
+      }
+    }, turnDeadlineMs);
 
     const fillerDelay =
       state.fillerMode === "off" ? 0 : (config?.reactions?.fillerDelayMs ?? 165);
@@ -676,7 +758,7 @@ export function createVoiceOrchestrator({
         delayMs: fillerDelay,
         onFire: () => {
           try {
-            if (!isTurnLive(turn)) return;
+            if (!isTurnLive(turn) || turn.gateDenied || turn.ttsMarked) return;
             const clip = reactionPool?.pick(transcript, { mode: state.fillerMode });
             if (!clip) return;
             latencyTracker.mark(turnId, "fillerFiredAt", now());
@@ -703,6 +785,7 @@ export function createVoiceOrchestrator({
       latencyTracker.mark(turnId, "gateDoneAt", now());
       const chimeIn = decision?.chimeIn ?? decision?.shouldReply;
       if (chimeIn !== true) {
+        turn.gateDenied = true;
         turn.filler?.cancel();
         return;
       }
@@ -710,24 +793,46 @@ export function createVoiceOrchestrator({
       history.push({ role: "user", content: transcript });
       boundedHistory(history, maxHistoryTurns);
 
+      let receivedOnClause = false;
+      let enqueuedClauses = 0;
+      let tokenBuffer = "";
       let chain = Promise.resolve();
       const enqueueClause = (clause) => {
+        if (!clause || enqueuedClauses >= MAX_CLAUSES_PER_TURN) return;
+        enqueuedClauses += 1;
         chain = chain
           .then(() => speakClause(clause, turn))
           .catch((error) => {
             ttsError ??= error;
           });
       };
-      const splitter = createClauseSplitterImpl({ onClause: enqueueClause });
+      const splitter = createClauseSplitterImpl({
+        expressiveTags: Boolean(config?.tts?.expressiveTags),
+        now,
+        onClause: enqueueClause,
+      });
 
       const reply = await llmClient.streamReply({
         messages: history.slice(),
         signal: controller.signal,
-        onToken: (delta) => splitter?.push?.(delta),
+        onClause: (clause) => {
+          receivedOnClause = true;
+          enqueueClause(clause);
+        },
+        onToken: (delta) => {
+          if (!receivedOnClause) tokenBuffer += delta;
+        },
       });
       if (!isTurnLive(turn)) return;
 
-      for (const clause of splitter?.flush?.() ?? []) enqueueClause(clause);
+      if (!receivedOnClause && tokenBuffer) {
+        splitter?.push?.(tokenBuffer);
+        const beforeFlush = enqueuedClauses;
+        const tail = splitter?.flush?.() ?? [];
+        if (enqueuedClauses === beforeFlush) {
+          for (const clause of tail) enqueueClause(clause);
+        }
+      }
       await chain;
 
       if (!isTurnLive(turn)) return;
@@ -750,6 +855,7 @@ export function createVoiceOrchestrator({
         state.isBotSpeaking = false;
       }
       turn.filler?.cancel();
+      clearTimeout(turn.deadline);
       finishOutput(turn);
       try {
         latencyTracker.finishTurn(turnId);
@@ -767,6 +873,7 @@ export function createVoiceOrchestrator({
     displayName,
     isBot = false,
     opusPacket,
+    decoder,
     timestamp,
   } = {}) {
     if (
@@ -823,7 +930,7 @@ export function createVoiceOrchestrator({
 
     let pcm48;
     try {
-      const codec = await ensureTranscoder();
+      const codec = decoder ?? (await ensureTranscoder());
       pcm48 = await codec.decode(opusPacket);
     } catch {
       return { ignored: true, dropped: "decode" };
@@ -908,15 +1015,24 @@ export function createVoiceOrchestrator({
       state.sessionToken = Symbol("voice-session");
 
       if (resolvedVoiceDeps?.joinVoiceChannel) {
-        voiceConnection = resolvedVoiceDeps.joinVoiceChannel({
-          guildId,
-          channelId,
-          adapterCreator,
-          selfDeaf: false,
-          selfMute: false,
-        });
+        try {
+          voiceConnection = resolvedVoiceDeps.joinVoiceChannel({
+            guildId,
+            channelId,
+            adapterCreator,
+            selfDeaf: false,
+            selfMute: false,
+          });
 
-        bindReceiver(guildId, channelId, state.sessionToken);
+          bindReceiver(guildId, channelId, state.sessionToken);
+        } catch (error) {
+          destroyVoice();
+          state.guildId = null;
+          state.channelId = null;
+          state.active = false;
+          state.sessionToken = null;
+          throw error;
+        }
 
         connectionErrorListener = () => {
           state.lastError = "voice connection error";
@@ -965,18 +1081,27 @@ export function createVoiceOrchestrator({
           typeof resolvedVoiceDeps.createAudioPlayer === "function" &&
           typeof voiceConnection?.subscribe === "function"
         ) {
-          voicePlayer = resolvedVoiceDeps.createAudioPlayer();
-          voiceConnection.subscribe(voicePlayer);
+          try {
+            voicePlayer = resolvedVoiceDeps.createAudioPlayer();
+            voiceConnection.subscribe(voicePlayer);
 
-          playerErrorListener = () => {
-            state.lastError = "voice player error";
-          };
-          voicePlayer?.on?.("error", playerErrorListener);
+            playerErrorListener = () => {
+              state.lastError = "voice player error";
+            };
+            voicePlayer?.on?.("error", playerErrorListener);
 
-          playerStateListener = (_oldState, nextState) => {
-            if (nextState?.status === "idle") activePlaybackUserId = null;
-          };
-          voicePlayer?.on?.("stateChange", playerStateListener);
+            playerStateListener = (_oldState, nextState) => {
+              if (nextState?.status === "idle") activePlaybackUserId = null;
+            };
+            voicePlayer?.on?.("stateChange", playerStateListener);
+          } catch (error) {
+            destroyVoice();
+            state.guildId = null;
+            state.channelId = null;
+            state.active = false;
+            state.sessionToken = null;
+            throw error;
+          }
         }
       }
 
@@ -1000,6 +1125,13 @@ export function createVoiceOrchestrator({
     destroyVoice();
     state.guildId = null;
     state.channelId = null;
+    // Guild boundary: mutes and per-guild modes revert to configured defaults.
+    state.mutedUsers.clear();
+    vad.setIgnoredUsers?.([]);
+    state.chimeMode = CHIME_MODES.includes(config?.chime?.mode) ? config.chime.mode : "smart";
+    state.fillerMode = FILLER_MODES.includes(config?.reactions?.mode)
+      ? config.reactions.mode
+      : "adaptive";
     return getStatus();
   }
 
@@ -1060,6 +1192,12 @@ export function createVoiceOrchestrator({
     destroyVoice();
     state.guildId = null;
     state.channelId = null;
+    state.mutedUsers.clear();
+    vad.setIgnoredUsers?.([]);
+    state.chimeMode = CHIME_MODES.includes(config?.chime?.mode) ? config.chime.mode : "smart";
+    state.fillerMode = FILLER_MODES.includes(config?.reactions?.mode)
+      ? config.reactions.mode
+      : "adaptive";
   }
 
   return {

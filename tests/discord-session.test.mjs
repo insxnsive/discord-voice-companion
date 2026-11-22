@@ -17,6 +17,7 @@ import {
 } from "../src/discord/commands.mjs";
 
 import { LatencyTracker } from "../src/types.mjs";
+import { createClauseSplitter } from "../src/llm/client.mjs";
 
 const PCM16K = Buffer.alloc(640, 4);
 const PCM24K = Buffer.alloc(960, 6);
@@ -70,7 +71,17 @@ function makeLlm({
     async shouldChimeIn(args) {
       state.gateCalls += 1;
       state.gateArgs.push(args);
-      if (blockGate) return await gatePromise;
+      if (blockGate) {
+        const gateSignal = args?.signal;
+        return await new Promise((resolve, reject) => {
+          if (gateSignal?.aborted) {
+            reject(abortError());
+            return;
+          }
+          gateSignal?.addEventListener("abort", () => reject(abortError()), { once: true });
+          gatePromise.then(resolve);
+        });
+      }
       return gate;
     },
     async streamReply({ messages, onToken, signal }) {
@@ -857,7 +868,7 @@ test("chime gate receives mode, speaker, timings, and lastBotReplyAt", async () 
 
   assert.equal(llm.state.gateArgs[0].chimeMode, "always");
   assert.equal(llm.state.gateArgs[0].speakerName, "Ana");
-  assert.equal(llm.state.gateArgs[0].lastBotReplyAt, 0);
+  assert.equal(llm.state.gateArgs[0].lastBotReplyAt, null);
   assert.ok(llm.state.gateArgs[1].lastBotReplyAt > 0);
   assert.ok("followUpWindowMs" in llm.state.gateArgs[0]);
   assert.ok("gateTimeoutMs" in llm.state.gateArgs[0]);
@@ -1641,4 +1652,471 @@ test("a speaker lookup that outlives a rejoin cannot subscribe or push", async (
   const result = await pendingPacket;
   assert.deepEqual(result, { ignored: true, dropped: "inactive_session" });
   assert.equal(vad.pushes.length, 0);
+});
+
+test("barge-in stops draining playback after the turn completes", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  const before = shapes.player.stops;
+  vad.captured.callbacks.onBargeIn({ userId: "u1", timestampMs: 100 });
+  assert.ok(shapes.player.stops > before);
+});
+
+test("stream EOF flushes the speaker utterance", async () => {
+  const shapes = makeRealVoiceDeps();
+  const flushCalls = [];
+  const vadFactory = () => ({
+    speakers: new Map(),
+    async pushFrame() {
+      return { ignored: false };
+    },
+    clear() {},
+    setIgnoredUsers() {},
+    flushSpeaker(userId) {
+      flushCalls.push(userId);
+    },
+  });
+
+  const { orchestrator } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    vadFactory,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  shapes.speaking.emit("start", "u1");
+  await tick(5);
+  assert.equal(shapes.subscriptions.length, 1);
+  shapes.subscriptions[0].stream.emit("end");
+  await tick(5);
+
+  assert.deepEqual(flushCalls, ["u1"]);
+});
+
+test("filler audio never counts as the first live reply frame", async () => {
+  const llm = makeLlm({ blockGate: true });
+  const { orchestrator, vad, filler, playerSink } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await tick(5);
+  filler.state.onFire();
+  assert.ok(playerSink.frames.length >= 1);
+
+  llm.releaseGate({ shouldReply: false });
+  await turn;
+
+  const metrics = orchestrator.getStatus().latencyLast;
+  assert.equal(metrics.totalLiveMs, null);
+});
+
+test("a stalled turn is aborted by the turn deadline", { timeout: 3000 }, async () => {
+  const llm = makeLlm({ blockGate: true });
+  const { orchestrator, vad, filler, playerSink } = buildOrchestrator({
+    llmClient: llm,
+    config: {
+      reactions: { mode: "adaptive", fillerDelayMs: 165 },
+      chime: { mode: "smart" },
+      turnDeadlineMs: 30,
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(orchestrator.getStatus().lastError, "turn deadline exceeded");
+  assert.equal(llm.state.gateArgs[0].signal.aborted, true);
+  assert.equal(filler.state.cancelled, true);
+  assert.ok(playerSink.stopped >= 1);
+
+  await turn;
+});
+
+test("a failed voice join rolls the session back", async () => {
+  const deps = {
+    EndBehaviorType: { AfterSilence: 2 },
+    StreamType: { Opus: "opus" },
+    joinVoiceChannel() {
+      throw new Error("join failed");
+    },
+  };
+  const { orchestrator } = buildOrchestrator({ voiceDeps: deps, playerSink: null });
+  await orchestrator.start();
+
+  await assert.rejects(
+    () => orchestrator.joinChannel({ guildId: "g1", channelId: "c1" }),
+    /join failed/,
+  );
+  const status = orchestrator.getStatus();
+  assert.equal(status.guildId, null);
+  assert.equal(status.channelId, null);
+  assert.equal(status.active, false);
+});
+
+test("mode and mute-user require an active session in this guild", async () => {
+  const calls = [];
+  const replies = [];
+  const handler = createCommandHandler({
+    orchestrator: {
+      getStatus: () => ({ guildId: "g1", active: false }),
+      setChimeMode: () => calls.push("chime"),
+      setFillerMode: () => calls.push("filler"),
+      muteUser: () => calls.push("mute"),
+    },
+  });
+
+  const interaction = (commandName, options = {}) => ({
+    commandName,
+    guildId: "g1",
+    memberPermissions: { has: () => true },
+    member: { voice: { channelId: "c1" } },
+    options: {
+      get: (name) => (options[name] === undefined ? undefined : { value: options[name] }),
+    },
+    async reply(payload) {
+      replies.push(payload);
+      return payload;
+    },
+  });
+
+  await handler.handleInteraction(interaction("mode", { chime: "always" }));
+  assert.match(replies.at(-1).content, /no active voice session/i);
+  assert.equal(calls.includes("chime"), false);
+
+  await handler.handleInteraction(interaction("mute-user", { user: "u1", muted: true }));
+  assert.match(replies.at(-1).content, /no active voice session/i);
+  assert.equal(calls.includes("mute"), false);
+});
+
+test("a turn exceeding the audio byte cap aborts and stops playback", async () => {
+  const tts = makeTts();
+  tts.synthesizeClause = async ({ onPcmChunk }) => {
+    onPcmChunk(Buffer.alloc(16 * 1024 * 1024 + 2));
+  };
+  const { orchestrator, vad, playerSink } = buildOrchestrator({ ttsAdapter: tts });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(orchestrator.getStatus().lastError, "turn audio limit exceeded");
+  assert.ok(playerSink.stopped >= 1);
+});
+
+test("a turn exceeding the queued frame cap aborts and stops playback", async () => {
+  const tts = makeTts();
+  tts.synthesizeClause = async ({ onPcmChunk }) => {
+    for (let i = 0; i < 7; i += 1) onPcmChunk(Buffer.alloc(240000, 1));
+  };
+  const { orchestrator, vad, playerSink } = buildOrchestrator({ ttsAdapter: tts });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(orchestrator.getStatus().lastError, "turn frame limit exceeded");
+  assert.ok(playerSink.stopped >= 1);
+});
+
+test("one clause producer speaks each clause once and forwards expressive tags", async () => {
+  const tts = makeTts();
+  const splitterOptions = [];
+  const llm = {
+    state: { gateCalls: 0, streamCalls: 0 },
+    async shouldChimeIn() {
+      this.state.gateCalls += 1;
+      return { shouldReply: true };
+    },
+    async streamReply({ onClause, onToken }) {
+      this.state.streamCalls += 1;
+      onToken?.("[laughs] hello");
+      onClause?.("[laughs] hello");
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    ttsAdapter: tts,
+    llmClient: llm,
+    createClauseSplitterImpl: (options) => {
+      splitterOptions.push(options);
+      let buffer = "";
+      return {
+        push(delta) {
+          buffer += delta;
+          return [];
+        },
+        flush() {
+          const tail = buffer.trim() ? [buffer.trim()] : [];
+          buffer = "";
+          return tail;
+        },
+      };
+    },
+    config: {
+      reactions: { mode: "adaptive", fillerDelayMs: 165 },
+      chime: { mode: "smart" },
+      tts: { expressiveTags: true },
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(tts.state.calls.length, 1);
+  assert.equal(tts.state.calls[0], "[laughs] hello");
+  assert.equal(splitterOptions[0].expressiveTags, true);
+});
+
+test("per-speaker decoders are reused across streams and closed on teardown", async () => {
+  const shapes = makeRealVoiceDeps();
+  let created = 0;
+  let deleted = 0;
+  const codec = {
+    encode: () => Buffer.alloc(2),
+    decode: () => Buffer.alloc(3840),
+    createDecoder() {
+      created += 1;
+      return {
+        decode: () => Buffer.alloc(3840),
+        close() {
+          deleted += 1;
+        },
+      };
+    },
+  };
+  const vadFactory = () => ({
+    speakers: new Map(),
+    async pushFrame() {
+      return { ignored: false };
+    },
+    clear() {},
+    setIgnoredUsers() {},
+    flushSpeaker() {},
+  });
+
+  const { orchestrator } = buildOrchestrator({
+    opusTranscoder: codec,
+    vadFactory,
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  for (let i = 0; i < 3; i += 1) {
+    shapes.speaking.emit("start", "u1");
+    await tick(5);
+    shapes.subscriptions[i].stream.emit("end");
+    await tick(5);
+  }
+
+  assert.equal(created, 1);
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  assert.equal(deleted, 1);
+});
+
+test("the filler never plays after a denied gate or after TTS starts", async () => {
+  const llm = makeLlm({ gate: { shouldReply: false } });
+  const built = buildOrchestrator({ llmClient: llm });
+  await built.orchestrator.start();
+  await built.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = built.vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await turn;
+  built.filler.state.onFire();
+  assert.equal(built.playerSink.frames.length, 0);
+});
+
+test("a late filler never plays once reply audio has started", async () => {
+  const llm = makeLlm({ blockGate: true });
+  const built = buildOrchestrator({ llmClient: llm });
+  await built.orchestrator.start();
+  await built.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = built.vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await tick(5);
+  llm.releaseGate({ shouldReply: true });
+  await turn;
+
+  built.filler.state.onFire();
+  const framesAfter = built.playerSink.frames.length;
+  assert.ok(framesAfter >= 1);
+  built.filler.state.onFire();
+  assert.equal(built.playerSink.frames.length, framesAfter);
+});
+
+test("a failed player setup rolls back and destroys the connection", async () => {
+  const destroyed = [];
+  const speaking = new EventEmitter();
+  const deps = {
+    EndBehaviorType: { AfterSilence: 2 },
+    StreamType: { Opus: "opus" },
+    joinVoiceChannel() {
+      return {
+        receiver: { speaking, subscribe: () => new PassThrough() },
+        subscribe() {},
+        on() {},
+        off() {},
+        destroy() {
+          destroyed.push(true);
+        },
+        joinConfig: { channelId: "c1" },
+      };
+    },
+    createAudioPlayer() {
+      throw new Error("player failed");
+    },
+  };
+  const { orchestrator } = buildOrchestrator({ voiceDeps: deps, playerSink: null });
+  await orchestrator.start();
+
+  await assert.rejects(
+    () => orchestrator.joinChannel({ guildId: "g1", channelId: "c1" }),
+    /player failed/,
+  );
+  assert.ok(destroyed.length >= 1);
+  assert.equal(orchestrator.getStatus().guildId, null);
+});
+
+test("a receiver binding failure rolls back and destroys the connection", async () => {
+  const destroyed = [];
+  const speaking = new EventEmitter();
+  speaking.on = () => {
+    throw new Error("receiver failed");
+  };
+  const deps = {
+    EndBehaviorType: { AfterSilence: 2 },
+    StreamType: { Opus: "opus" },
+    joinVoiceChannel() {
+      return {
+        receiver: { speaking },
+        subscribe() {},
+        on() {},
+        off() {},
+        destroy() {
+          destroyed.push(true);
+        },
+        joinConfig: { channelId: "c1" },
+      };
+    },
+  };
+  const { orchestrator } = buildOrchestrator({ voiceDeps: deps, playerSink: null });
+  await orchestrator.start();
+
+  await assert.rejects(
+    () => orchestrator.joinChannel({ guildId: "g1", channelId: "c1" }),
+    /receiver failed/,
+  );
+  assert.ok(destroyed.length >= 1);
+  assert.equal(orchestrator.getStatus().guildId, null);
+});
+
+test("mutes persist across channel moves and clear at the guild boundary", async () => {
+  const { orchestrator } = buildOrchestrator();
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  orchestrator.muteUser("u1", true);
+  assert.deepEqual(orchestrator.getStatus().mutedUsers, ["u1"]);
+
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+  assert.deepEqual(orchestrator.getStatus().mutedUsers, ["u1"]);
+
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  assert.deepEqual(orchestrator.getStatus().mutedUsers, []);
+});
+
+test("the real client call order speaks each clause exactly once", async () => {
+  const tts = makeTts();
+  const llm = {
+    state: { gateCalls: 0 },
+    async shouldChimeIn() {
+      this.state.gateCalls += 1;
+      return { shouldReply: true };
+    },
+    async streamReply({ onToken, onClause }) {
+      const splitter = createClauseSplitter({ onClause });
+      for (const delta of ["Hello ", "there. ", "How are ", "you today?"]) {
+        onToken(delta);
+        splitter.push(delta);
+      }
+      for (const clause of splitter.flush()) onClause(clause);
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    ttsAdapter: tts,
+    llmClient: llm,
+    createClauseSplitterImpl: createClauseSplitter,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.deepEqual(tts.state.calls, ["Hello there.", "How are you today?"]);
 });
