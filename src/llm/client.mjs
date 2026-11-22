@@ -1,5 +1,12 @@
+import { validateEndpointUrl } from "../config/config.mjs";
+
 const AUDIO_TAG_BEFORE_PUNCT = /\s*\[[a-z][a-z0-9 _-]{1,32}\](?=\s*[.,!?;:])/gi;
 const AUDIO_TAG_INLINE = /\s*\[[a-z][a-z0-9 _-]{1,32}\]\s*/gi;
+
+const DEFAULT_REPLY_TIMEOUT_MS = 15000;
+const DEFAULT_MAX_STREAM_BYTES = 262144;
+const DEFAULT_MAX_LINE_CHARS = 16384;
+const DEFAULT_MAX_REPLY_CHARS = 8192;
 
 /**
  * Remove bracketed performance tags like [laughs] or [whispers] while keeping
@@ -14,12 +21,6 @@ export function stripAudioTags(text) {
     .trim();
 }
 
-function hasUnclosedBracket(text) {
-  const openIndex = text.lastIndexOf("[");
-  const closeIndex = text.lastIndexOf("]");
-  return openIndex !== -1 && openIndex > closeIndex;
-}
-
 function countWords(text) {
   const speakable = stripAudioTags(text);
   return speakable ? speakable.split(/\s+/).length : 0;
@@ -29,9 +30,64 @@ function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function findPunctuationSplit(text) {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "[") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "]") {
+      if (depth > 0) depth -= 1;
+      continue;
+    }
+    if (depth !== 0) continue;
+
+    if (ch === "." || ch === "!" || ch === "?" || ch === "\n") {
+      let end = i + 1;
+      while (end < text.length && (text[end] === "." || text[end] === "!" || text[end] === "?" || text[end] === "\n")) {
+        end += 1;
+      }
+      return end;
+    }
+
+    if (ch === "," || ch === ";") {
+      let end = i + 1;
+      while (end < text.length && (text[end] === "," || text[end] === ";")) {
+        end += 1;
+      }
+      if (countWords(text.slice(0, end)) >= 3) {
+        return end;
+      }
+    }
+  }
+  return -1;
+}
+
+function analyzeBracketDepth(text) {
+  let depth = 0;
+  let lastDepth0Ws = -1;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "[") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "]") {
+      if (depth > 0) depth -= 1;
+      continue;
+    }
+    if (depth === 0 && /\s/.test(ch)) {
+      lastDepth0Ws = i;
+    }
+  }
+  return { depth, lastDepth0Ws };
+}
+
 /**
  * Buffer streamed LLM text deltas into speakable clauses without splitting
- * inside pending audio tags like [laughs].
+ * inside pending audio tags like [soft laugh].
  */
 export function createClauseSplitter({
   minWords = 5,
@@ -53,48 +109,35 @@ export function createClauseSplitter({
 
   function extractReady(emitted) {
     while (buffer.length > 0) {
-      if (hasUnclosedBracket(buffer)) break;
-
-      const sentenceMatch = buffer.match(/[.!?\n]+/);
-      if (sentenceMatch) {
-        const end = sentenceMatch.index + sentenceMatch[0].length;
-        const head = buffer.slice(0, end);
-        buffer = buffer.slice(end).replace(/^[ \t]+/, "");
+      const punctEnd = findPunctuationSplit(buffer);
+      if (punctEnd > 0) {
+        const head = buffer.slice(0, punctEnd);
+        buffer = buffer.slice(punctEnd).replace(/^[ \t]+/, "");
         emitClause(head, emitted);
         clauseStartAt = buffer.length > 0 ? now() : null;
         continue;
       }
 
-      const pauseMatch = buffer.match(/[,;]+/);
-      if (pauseMatch) {
-        const end = pauseMatch.index + pauseMatch[0].length;
-        const head = buffer.slice(0, end);
-        if (countWords(head) >= 3) {
-          buffer = buffer.slice(end).replace(/^[ \t]+/, "");
-          emitClause(head, emitted);
-          clauseStartAt = buffer.length > 0 ? now() : null;
-          continue;
-        }
-      }
-
       const elapsed = clauseStartAt === null ? 0 : now() - clauseStartAt;
       if (elapsed >= maxHoldMs) {
-        if (/\s$/.test(buffer) && countWords(buffer) >= minWords) {
-          const head = buffer;
-          buffer = "";
-          emitClause(head, emitted);
-          clauseStartAt = null;
-          continue;
-        }
-
-        const wsMatch = buffer.match(/\s+(?=\S*$)/);
-        if (wsMatch) {
-          const head = buffer.slice(0, wsMatch.index);
-          if (countWords(head) >= minWords) {
-            buffer = buffer.slice(wsMatch.index + wsMatch[0].length);
+        const { depth, lastDepth0Ws } = analyzeBracketDepth(buffer);
+        if (depth === 0) {
+          if ((/\s$/.test(buffer) || /\]$/.test(buffer)) && countWords(buffer) >= minWords) {
+            const head = buffer;
+            buffer = "";
             emitClause(head, emitted);
-            clauseStartAt = buffer.length > 0 ? now() : null;
+            clauseStartAt = null;
             continue;
+          }
+
+          if (lastDepth0Ws > 0) {
+            const head = buffer.slice(0, lastDepth0Ws);
+            if (countWords(head) >= minWords) {
+              buffer = buffer.slice(lastDepth0Ws + 1).replace(/^[ \t]+/, "");
+              emitClause(head, emitted);
+              clauseStartAt = buffer.length > 0 ? now() : null;
+              continue;
+            }
           }
         }
       }
@@ -148,6 +191,19 @@ function isAliasAddressed(transcript, botAliases) {
   });
 }
 
+function createTimeoutController(timeoutMs, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    const err = new Error(`${label} timed out after ${timeoutMs}ms`);
+    err.name = "TimeoutError";
+    controller.abort(err);
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    clear: () => clearTimeout(timer),
+  };
+}
+
 /**
  * Create an OpenAI-compatible streaming reply and 1-token turn-gate client.
  */
@@ -155,6 +211,9 @@ export function createLlmClient({
   config,
   fetchImpl = fetch,
   now = () => performance.now(),
+  maxStreamBytes = DEFAULT_MAX_STREAM_BYTES,
+  maxLineChars = DEFAULT_MAX_LINE_CHARS,
+  maxReplyChars = DEFAULT_MAX_REPLY_CHARS,
 } = {}) {
   const llm = config?.llm;
   if (!llm?.baseUrl) {
@@ -164,9 +223,11 @@ export function createLlmClient({
     throw new Error("LLM client requires config.llm.replyModel");
   }
 
-  const endpoint = `${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const validatedBaseUrl = validateEndpointUrl(llm.baseUrl, "llm.baseUrl");
+  const endpoint = `${validatedBaseUrl}/chat/completions`;
   const expressiveTags = Boolean(config?.tts?.expressiveTags);
   const defaultChime = config?.chime ?? {};
+  const replyTimeoutMs = llm.replyTimeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS;
 
   function buildRequestInit({ model, messages, stream, maxTokens, temperature, signal }) {
     const headers = {
@@ -192,27 +253,39 @@ export function createLlmClient({
       method: "POST",
       headers,
       body: JSON.stringify(payload),
+      redirect: "error",
       signal,
     };
   }
 
   async function streamReply({ messages, signal, onClause, onToken } = {}) {
-    const response = await fetchImpl(
-      endpoint,
-      buildRequestInit({
-        model: llm.replyModel,
-        messages,
-        stream: true,
-        maxTokens: llm.maxTokens ?? 140,
-        signal,
-      }),
-    );
+    const deadline = createTimeoutController(replyTimeoutMs, "LLM stream");
+    const streamSignal = combineSignals(signal, deadline.signal);
+
+    let response;
+    try {
+      response = await fetchImpl(
+        endpoint,
+        buildRequestInit({
+          model: llm.replyModel,
+          messages,
+          stream: true,
+          maxTokens: llm.maxTokens ?? 140,
+          signal: streamSignal,
+        }),
+      );
+    } catch (error) {
+      deadline.clear();
+      throw error;
+    }
 
     if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      throw new Error(`LLM stream failed (${response.status}): ${detail.slice(0, 200)}`);
+      deadline.clear();
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`LLM stream failed (HTTP ${response.status})`);
     }
     if (!response.body) {
+      deadline.clear();
       throw new Error("LLM stream response missing body");
     }
 
@@ -232,22 +305,44 @@ export function createLlmClient({
     const decoder = new TextDecoder("utf-8");
     let carry = "";
     let fullText = "";
+    let totalBytes = 0;
     let done = false;
+
+    const appendDelta = (delta) => {
+      if (typeof delta !== "string" || delta.length === 0) return;
+      if (fullText.length + delta.length > maxReplyChars) {
+        throw new Error("LLM stream exceeded size limit");
+      }
+      fullText += delta;
+      if (typeof onToken === "function") onToken(delta);
+      splitter.push(delta);
+    };
 
     try {
       while (!done) {
-        if (signal?.aborted) {
-          throw signal.reason ?? Object.assign(new Error("Aborted"), { name: "AbortError" });
+        if (streamSignal?.aborted) {
+          throw streamSignal.reason ?? Object.assign(new Error("Aborted"), { name: "AbortError" });
         }
 
         const { value, done: streamDone } = await reader.read();
         if (streamDone) break;
 
+        totalBytes += value.byteLength;
+        if (totalBytes > maxStreamBytes) {
+          throw new Error("LLM stream exceeded size limit");
+        }
+
         carry += decoder.decode(value, { stream: true });
         const lines = carry.split(/\r?\n/);
         carry = lines.pop() ?? "";
+        if (carry.length > maxLineChars) {
+          throw new Error("LLM stream exceeded size limit");
+        }
 
         for (const rawLine of lines) {
+          if (rawLine.length > maxLineChars) {
+            throw new Error("LLM stream exceeded size limit");
+          }
           const line = rawLine.trim();
           if (!line || line.startsWith(":")) continue;
           if (!line.startsWith("data:")) continue;
@@ -255,6 +350,7 @@ export function createLlmClient({
           const data = line.slice(5).trim();
           if (data === "[DONE]") {
             done = true;
+            await reader.cancel().catch(() => {});
             break;
           }
 
@@ -265,26 +361,19 @@ export function createLlmClient({
             continue;
           }
 
-          const delta = chunk?.choices?.[0]?.delta?.content;
-          if (typeof delta === "string" && delta.length > 0) {
-            fullText += delta;
-            if (typeof onToken === "function") onToken(delta);
-            splitter.push(delta);
-          }
+          appendDelta(chunk?.choices?.[0]?.delta?.content);
         }
       }
 
       if (!done && carry.trim().startsWith("data:")) {
+        if (carry.length > maxLineChars) {
+          throw new Error("LLM stream exceeded size limit");
+        }
         const tailData = carry.trim().slice(5).trim();
         if (tailData && tailData !== "[DONE]") {
           try {
             const chunk = JSON.parse(tailData);
-            const delta = chunk?.choices?.[0]?.delta?.content;
-            if (typeof delta === "string" && delta.length > 0) {
-              fullText += delta;
-              if (typeof onToken === "function") onToken(delta);
-              splitter.push(delta);
-            }
+            appendDelta(chunk?.choices?.[0]?.delta?.content);
           } catch {
             // Ignore incomplete trailing JSON fragment at stream EOF.
           }
@@ -294,6 +383,7 @@ export function createLlmClient({
       await reader.cancel().catch(() => {});
       throw error;
     } finally {
+      deadline.clear();
       reader.releaseLock();
     }
 
@@ -334,15 +424,11 @@ export function createLlmClient({
       return { shouldReply: true, reason: "followup_window", usedGateModel: false };
     }
 
-    const timeoutAc = new AbortController();
-    const timer = setTimeout(() => {
-      const err = new Error(`Gate request timed out after ${gateTimeoutMs}ms`);
-      err.name = "TimeoutError";
-      timeoutAc.abort(err);
-    }, gateTimeoutMs);
-    const gateSignal = combineSignals(signal, timeoutAc.signal);
+    const timeout = createTimeoutController(gateTimeoutMs, "Gate request");
+    const gateSignal = combineSignals(signal, timeout.signal);
+    let response;
     try {
-      const response = await fetchImpl(
+      response = await fetchImpl(
         endpoint,
         buildRequestInit({
           model: llm.gateModel || llm.replyModel,
@@ -365,20 +451,22 @@ export function createLlmClient({
       );
 
       if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
         return { shouldReply: false, reason: "gate_http_error", usedGateModel: true };
       }
 
       const payload = await response.json();
       const answer = payload?.choices?.[0]?.message?.content?.trim() ?? "";
-      if (/^YES\b/i.test(answer)) {
+      if (/^yes$/i.test(answer)) {
         return { shouldReply: true, reason: "gate_yes", usedGateModel: true };
       }
       return { shouldReply: false, reason: "gate_no", usedGateModel: true };
     } catch {
-      // Fail closed so network errors or timeouts never trigger unwanted chatter.
+      // Fail closed so network errors, parse issues, or timeouts never trigger unwanted chatter.
+      await response?.body?.cancel().catch(() => {});
       return { shouldReply: false, reason: "gate_error", usedGateModel: true };
     } finally {
-      clearTimeout(timer);
+      timeout.clear();
     }
   }
 

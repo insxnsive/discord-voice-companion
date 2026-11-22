@@ -341,3 +341,149 @@ test("shouldChimeIn fast-paths aliases and followup window, parses gate YES/NO, 
   assert.equal(gateFailClosed.shouldReply, false);
   assert.equal(gateFailClosed.usedGateModel, true);
 });
+
+test("createClauseSplitter never splits inside [soft laugh] on maxHoldMs and scans commas left-to-right", () => {
+  let t = 0;
+  const stripped = createClauseSplitter({
+    minWords: 5,
+    maxHoldMs: 120,
+    expressiveTags: false,
+    now: () => t,
+  });
+  assert.deepEqual(stripped.push("One two three four five [soft"), []);
+  t = 121;
+  assert.deepEqual(stripped.push(" laugh]"), ["One two three four five"]);
+  assert.deepEqual(stripped.flush(), []);
+
+  t = 0;
+  const expressive = createClauseSplitter({
+    minWords: 5,
+    maxHoldMs: 120,
+    expressiveTags: true,
+    now: () => t,
+  });
+  assert.deepEqual(expressive.push("One two three four five [soft"), []);
+  t = 121;
+  assert.deepEqual(expressive.push(" laugh]"), ["One two three four five [soft laugh]"]);
+  assert.deepEqual(expressive.flush(), []);
+
+  const commaBeforePeriod = createClauseSplitter({ expressiveTags: true });
+  assert.deepEqual(commaBeforePeriod.push("Wait a minute, I am here."), [
+    "Wait a minute,",
+    "I am here.",
+  ]);
+
+  const skipShortComma = createClauseSplitter({ expressiveTags: true });
+  assert.deepEqual(skipShortComma.push("Well, I am here, waiting"), ["Well, I am here,"]);
+  assert.deepEqual(skipShortComma.flush(), ["waiting"]);
+});
+
+test("loadConfig and redactConfig enforce HTTPS on non-loopback, allowlist headers, and block __proto__", () => {
+  assert.throws(
+    () => loadConfig({ env: { LLM_BASE_URL: "http://api.example.com/v1" }, fsImpl: makeMemoryFs() }),
+    RangeError,
+  );
+  assert.throws(
+    () => loadConfig({ env: { LLM_BASE_URL: "https://user:pass@api.example.com/v1" }, fsImpl: makeMemoryFs() }),
+    RangeError,
+  );
+  assert.throws(
+    () => loadConfig({ env: { LLM_BASE_URL: "https://api.example.com/v1?foo=bar" }, fsImpl: makeMemoryFs() }),
+    RangeError,
+  );
+  assert.throws(
+    () => loadConfig({ env: { LLM_BASE_URL: "https://api.example.com/v1#frag" }, fsImpl: makeMemoryFs() }),
+    RangeError,
+  );
+
+  const localOk = loadConfig({
+    env: { LLM_PROVIDER: "ollama", LLM_BASE_URL: "http://127.0.0.1:11434/v1" },
+    fsImpl: makeMemoryFs(),
+  });
+  assert.equal(localOk.llm.baseUrl, "http://127.0.0.1:11434/v1");
+
+  const maliciousJson = '{"llm":{"headers":{"x-opencode-client":"discord-voice-companion","x-custom-secret":"hide-me"}},"__proto__":{"polluted":true}}';
+  const cfg = loadConfig({
+    env: { LLM_PROVIDER: "opencode" },
+    configPath: "config.json",
+    fsImpl: makeMemoryFs({ "config.json": maliciousJson }),
+  });
+  const redacted = redactConfig(cfg);
+  assert.equal(redacted.llm.headers["x-opencode-client"], "discord-voice-companion");
+  assert.equal(redacted.llm.headers["x-custom-secret"], "[REDACTED]");
+  assert.equal(({}).polluted, undefined);
+});
+
+test("createLlmClient sets redirect error, sanitizes HTTP errors, bounds SSE size, and requires exact YES", async () => {
+  const cfg = loadConfig({
+    env: { LLM_PROVIDER: "opencode", LLM_API_KEY: "oc-key" },
+    fsImpl: makeMemoryFs(),
+  });
+
+  let seenRedirect = null;
+  let cancelled500 = false;
+  const errClient = createLlmClient({
+    config: cfg,
+    fetchImpl: async (_url, init) => {
+      seenRedirect = init.redirect;
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode("secret=abc"));
+        },
+        cancel() {
+          cancelled500 = true;
+        },
+      });
+      return new Response(body, { status: 500 });
+    },
+  });
+
+  await assert.rejects(
+    () => errClient.streamReply({ messages: [{ role: "user", content: "hi" }] }),
+    (error) => {
+      assert.equal(error.message, "LLM stream failed (HTTP 500)");
+      assert.doesNotMatch(error.message, /secret=abc/);
+      return true;
+    },
+  );
+  assert.equal(seenRedirect, "error");
+  assert.equal(cancelled500, true);
+
+  let cancelledOversize = false;
+  const bigClient = createLlmClient({
+    config: cfg,
+    fetchImpl: async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          const huge = "x".repeat(150000);
+          controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"content":"${huge}"}}]}\n`));
+        },
+        cancel() {
+          cancelledOversize = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    },
+  });
+
+  await assert.rejects(
+    () => bigClient.streamReply({ messages: [{ role: "user", content: "big" }] }),
+    /size limit/i,
+  );
+  assert.equal(cancelledOversize, true);
+
+  const gateClient = createLlmClient({
+    config: cfg,
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({ choices: [{ message: { content: "YES maybe later" } }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+  });
+  const fuzzyGate = await gateClient.shouldChimeIn({
+    transcript: "Anyone want pizza?",
+    speakerName: "Nate",
+  });
+  assert.equal(fuzzyGate.shouldReply, false);
+  assert.equal(fuzzyGate.usedGateModel, true);
+});

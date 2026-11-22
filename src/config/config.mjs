@@ -4,6 +4,11 @@ import { CHIME_MODES, FILLER_MODES, PROVIDERS } from "../types.mjs";
 const DEFAULT_PERSONA_PROMPT =
   "You are a concise, natural voice companion in a Discord call. Reply in 1 to 2 short spoken sentences with no markdown or lists.";
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const SAFE_HEADER_NAMES = new Set(["x-opencode-client", "content-type", "accept", "user-agent"]);
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f]/;
+
 function deepFreeze(value) {
   if (value === null || typeof value !== "object") return value;
   for (const key of Object.keys(value)) {
@@ -125,16 +130,32 @@ function pickNonEmpty(...candidates) {
   return "";
 }
 
-function validateHttpUrl(rawUrl, label) {
+/**
+ * Validate an HTTP(S) endpoint URL, disallowing control chars, credentials,
+ * query strings, fragments, and plaintext HTTP on non-loopback hosts.
+ */
+export function validateEndpointUrl(rawUrl, label = "url") {
   if (!rawUrl) return "";
+  if (CONTROL_CHAR_PATTERN.test(rawUrl)) {
+    throw new RangeError(`${label} contains invalid control characters`);
+  }
   let parsed;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new RangeError(`${label} must be a valid URL: ${rawUrl}`);
+    throw new RangeError(`${label} must be a valid URL`);
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new RangeError(`${label} must use http: or https: (got ${parsed.protocol})`);
+    throw new RangeError(`${label} must use http: or https:`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new RangeError(`${label} must not contain credentials`);
+  }
+  if (parsed.search || parsed.hash) {
+    throw new RangeError(`${label} must not contain query parameters or fragments`);
+  }
+  if (parsed.protocol === "http:" && !LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
+    throw new RangeError(`${label} must use https: for non-loopback hosts`);
   }
   return rawUrl.replace(/\/+$/, "");
 }
@@ -196,8 +217,9 @@ function clonePlain(value) {
   if (Array.isArray(value)) return value.map(clonePlain);
   if (value !== null && typeof value === "object") {
     const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = clonePlain(v);
+    for (const key of Object.keys(value)) {
+      if (FORBIDDEN_KEYS.has(key)) continue;
+      out[key] = clonePlain(value[key]);
     }
     return out;
   }
@@ -224,9 +246,9 @@ export function loadConfig({
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error("root value must be a JSON object");
       }
-      configJson = parsed;
-    } catch (error) {
-      throw new SyntaxError(`Invalid JSON in config file (${configPath}): ${error.message}`);
+      configJson = clonePlain(parsed);
+    } catch {
+      throw new SyntaxError(`Invalid JSON in config file (${configPath})`);
     }
   }
 
@@ -296,7 +318,7 @@ export function loadConfig({
     },
     llm: {
       provider: llmProvider,
-      baseUrl: validateHttpUrl(
+      baseUrl: validateEndpointUrl(
         pickNonEmpty(getEnv("LLM_BASE_URL"), configJson.llm?.baseUrl, preset.baseUrl),
         "llm.baseUrl",
       ),
@@ -338,7 +360,7 @@ export function loadConfig({
       ),
       openaiApiKey: pickNonEmpty(getEnv("OPENAI_API_KEY"), configJson.stt?.openaiApiKey),
       groqApiKey: pickNonEmpty(getEnv("GROQ_API_KEY"), configJson.stt?.groqApiKey),
-      localUrl: validateHttpUrl(
+      localUrl: validateEndpointUrl(
         pickNonEmpty(getEnv("LOCAL_STT_URL"), configJson.stt?.localUrl, "http://127.0.0.1:4373"),
         "stt.localUrl",
       ),
@@ -346,7 +368,7 @@ export function loadConfig({
     tts: {
       provider: ttsProvider,
       apiKey: pickNonEmpty(getEnv("TTS_API_KEY"), ttsFallbackKey, configJson.tts?.apiKey),
-      baseUrl: validateHttpUrl(
+      baseUrl: validateEndpointUrl(
         pickNonEmpty(getEnv("TTS_BASE_URL"), configJson.tts?.baseUrl),
         "tts.baseUrl",
       ),
@@ -412,7 +434,11 @@ export function loadConfig({
 }
 
 const SECRET_KEY_PATTERN = /^(token|apiKey|.*ApiKey|secret|password)$/i;
-const SECRET_HEADER_PATTERN = /^(authorization|x-api-key|xi-api-key)$/i;
+
+function isNonEmptySecret(value) {
+  if (typeof value === "string") return value.length > 0;
+  return value !== null && value !== undefined && value !== "";
+}
 
 function redactNode(value, inHeaders = false) {
   if (Array.isArray(value)) {
@@ -423,9 +449,15 @@ function redactNode(value, inHeaders = false) {
   }
 
   const copy = {};
-  for (const [key, entry] of Object.entries(value)) {
-    const isSecretKey = inHeaders ? SECRET_HEADER_PATTERN.test(key) : SECRET_KEY_PATTERN.test(key);
-    if (isSecretKey && typeof entry === "string" && entry.length > 0) {
+  for (const key of Object.keys(value)) {
+    if (FORBIDDEN_KEYS.has(key)) continue;
+    const entry = value[key];
+    if (inHeaders) {
+      copy[key] =
+        SAFE_HEADER_NAMES.has(key.toLowerCase()) || !isNonEmptySecret(entry)
+          ? redactNode(entry, false)
+          : "[REDACTED]";
+    } else if (SECRET_KEY_PATTERN.test(key) && isNonEmptySecret(entry)) {
       copy[key] = "[REDACTED]";
     } else {
       copy[key] = redactNode(entry, key === "headers");
