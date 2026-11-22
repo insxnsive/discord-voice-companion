@@ -1,8 +1,11 @@
 node_modules/
 .env
+.env.*
+!.env.example
 config.json
 assets/reactions/*.ogg
 assets/reactions/*.pcm
 assets/reactions/*.wav
 *.log
 .DS_Store
+*.tmp-*

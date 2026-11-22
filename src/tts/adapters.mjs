@@ -163,10 +163,27 @@ async function readBoundedAudioStream(response, { maxAudioBytes, signal, now, on
   return { firstByteAt, byteLength };
 }
 
+function assertValidPcmWavFmt(buffer, offset, expectedSampleRate = 24000) {
+  const audioFormat = buffer.readUInt16LE(offset + 8);
+  const numChannels = buffer.readUInt16LE(offset + 10);
+  const wavSampleRate = buffer.readUInt32LE(offset + 12);
+  const blockAlign = buffer.readUInt16LE(offset + 20);
+  const bitsPerSample = buffer.readUInt16LE(offset + 22);
+  if (
+    audioFormat !== 1 ||
+    numChannels !== 1 ||
+    wavSampleRate !== expectedSampleRate ||
+    blockAlign !== 2 ||
+    bitsPerSample !== 16
+  ) {
+    throw new Error(`Unsupported non-PCM or non-${expectedSampleRate}Hz-mono WAV format`);
+  }
+}
+
 /**
  * Validate and strip a RIFF/WAVE header (44-byte or extended) and return the raw PCM slice.
  */
-export function stripWavHeaderIfPresent(buf) {
+export function stripWavHeaderIfPresent(buf, { sampleRate = 24000 } = {}) {
   const buffer = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
   if (buffer.length < 4 || buffer.toString("ascii", 0, 4) !== "RIFF") {
     return buffer;
@@ -202,11 +219,7 @@ export function stripWavHeaderIfPresent(buf) {
       if (chunkSize < 16 || offset + 8 + chunkSize > scanLimit) {
         throw new Error("Invalid or truncated WAV fmt chunk");
       }
-      const audioFormat = buffer.readUInt16LE(offset + 8);
-      const bitsPerSample = buffer.readUInt16LE(offset + 22);
-      if (audioFormat !== 1 || bitsPerSample !== 16) {
-        throw new Error("Unsupported non-PCM WAV format");
-      }
+      assertValidPcmWavFmt(buffer, offset, sampleRate);
       sawFmt = true;
     }
     offset += step;
@@ -273,6 +286,9 @@ export function createElevenLabsWsAdapter({
   let idleSocket = null;
   let activeSocket = null;
   let activeAbortController = null;
+  let warmupControllers = new Set();
+  let warmupPromise = null;
+  let closed = false;
 
   function attachErrorTrap(ws) {
     const onErrorTrap = () => {};
@@ -344,11 +360,37 @@ export function createElevenLabsWsAdapter({
     return ws;
   }
 
-  async function warmup() {
-    if (idleSocket && idleSocket.readyState === 1) return;
+  function warmup() {
+    if (closed) {
+      return Promise.reject(new Error("TTS WebSocket adapter is closed"));
+    }
+    if (idleSocket && idleSocket.readyState === 1) return Promise.resolve();
+    if (warmupPromise) return warmupPromise;
+    warmupPromise = runWarmup().finally(() => {
+      warmupPromise = null;
+    });
+    return warmupPromise;
+  }
+
+  async function runWarmup() {
     const deadline = createTimeoutController(timeoutMs, "TTS WebSocket warmup");
+    const warmupCloseController = new AbortController();
+    warmupControllers.add(warmupCloseController);
+    const warmupSignal = combineSignals(deadline.signal, warmupCloseController.signal);
     try {
-      const ws = await openSocket(deadline.signal);
+      const ws = await openSocket(warmupSignal);
+      if (closed) {
+        closeSocket(ws);
+        throw new Error("TTS WebSocket adapter is closed");
+      }
+      if (idleSocket && idleSocket !== ws) {
+        if (idleSocket.readyState === 1) {
+          closeSocket(ws);
+          return;
+        }
+        closeSocket(idleSocket);
+        idleSocket = null;
+      }
       idleSocket = ws;
       const clearIdle = attachSocketListeners(ws, {
         close() {
@@ -361,11 +403,15 @@ export function createElevenLabsWsAdapter({
         },
       });
     } finally {
+      warmupControllers.delete(warmupCloseController);
       deadline.clear();
     }
   }
 
   async function synthesizeClause({ text, signal, onPcmChunk } = {}) {
+    if (closed) {
+      throw new Error("TTS WebSocket adapter is closed");
+    }
     if (signal?.aborted) throw createAbortError(signal);
 
     const deadline = createTimeoutController(timeoutMs, "TTS WebSocket");
@@ -384,6 +430,10 @@ export function createElevenLabsWsAdapter({
           idleSocket = null;
         }
         ws = await openSocket(combinedSignal);
+        if (closed) {
+          closeSocket(ws);
+          throw new Error("TTS WebSocket adapter is closed");
+        }
       }
 
       activeSocket = ws;
@@ -514,6 +564,11 @@ export function createElevenLabsWsAdapter({
   }
 
   function close() {
+    closed = true;
+    for (const controller of warmupControllers) {
+      controller.abort(new Error("TTS WebSocket closed"));
+    }
+    warmupControllers.clear();
     if (activeAbortController) {
       activeAbortController.abort(new Error("TTS WebSocket closed"));
       activeAbortController = null;
@@ -718,9 +773,10 @@ export function createOpenAiTtsAdapter({
           throw new Error("Invalid WAV header");
         }
 
+        const scanLimit = Math.min(headerBuf.length, MAX_WAV_SCAN_BYTES);
         let offset = 12;
         let sawFmt = false;
-        while (offset + 8 <= headerBuf.length) {
+        while (offset + 8 <= scanLimit) {
           const chunkId = headerBuf.toString("ascii", offset, offset + 4);
           const chunkSize = headerBuf.readUInt32LE(offset + 4);
           if (chunkId === "data") {
@@ -742,19 +798,15 @@ export function createOpenAiTtsAdapter({
             if (chunkSize < 16) {
               throw new Error("Invalid WAV fmt chunk");
             }
-            if (offset + step > headerBuf.length) {
+            if (offset + step > scanLimit) {
               if (headerBuf.length > MAX_WAV_SCAN_BYTES) {
                 throw new Error("Truncated WAV fmt chunk");
               }
               return;
             }
-            const audioFormat = headerBuf.readUInt16LE(offset + 8);
-            const bitsPerSample = headerBuf.readUInt16LE(offset + 22);
-            if (audioFormat !== 1 || bitsPerSample !== 16) {
-              throw new Error("Unsupported non-PCM WAV format");
-            }
+            assertValidPcmWavFmt(headerBuf, offset, 24000);
             sawFmt = true;
-          } else if (offset + step > headerBuf.length) {
+          } else if (offset + step > scanLimit) {
             if (headerBuf.length > MAX_WAV_SCAN_BYTES) {
               throw new Error("WAV header exceeded maximum scan size");
             }

@@ -50,12 +50,23 @@ export function classifyTranscriptMood(transcript) {
 const DEFAULT_MAX_CLIP_BYTES = 512 * 1024;
 const DEFAULT_MAX_POOL_BYTES = 8 * 1024 * 1024;
 
+function assertAudioBytes(value, label) {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
+    throw new TypeError(`${label} must be a Buffer or Uint8Array`);
+  }
+  return value;
+}
+
 function computeClipBytes({ frames48kOpus = [], pcm24k = null }) {
-  let total = pcm24k ? (pcm24k.byteLength ?? pcm24k.length ?? 0) : 0;
-  if (Array.isArray(frames48kOpus)) {
-    for (const frame of frames48kOpus) {
-      if (frame) total += frame.byteLength ?? frame.length ?? 0;
-    }
+  let total = 0;
+  if (pcm24k !== null && pcm24k !== undefined) {
+    total += assertAudioBytes(pcm24k, "pcm24k").byteLength;
+  }
+  if (!Array.isArray(frames48kOpus)) {
+    throw new TypeError("frames48kOpus must be an array of Buffer or Uint8Array values");
+  }
+  for (const frame of frames48kOpus) {
+    total += assertAudioBytes(frame, "frames48kOpus entry").byteLength;
   }
   return total;
 }
@@ -94,11 +105,7 @@ export class ReactionPool {
     if (!REACTION_MOODS.includes(mood)) {
       throw new RangeError(`Invalid reaction mood: ${mood}`);
     }
-    const clonedPcm = pcm24k ? Buffer.from(pcm24k) : null;
-    const clonedFrames = Object.freeze(
-      Array.isArray(frames48kOpus) ? frames48kOpus.map((frame) => Buffer.from(frame)) : [],
-    );
-    const clipBytes = computeClipBytes({ frames48kOpus: clonedFrames, pcm24k: clonedPcm });
+    const clipBytes = computeClipBytes({ frames48kOpus, pcm24k });
     if (clipBytes > this.maxFileBytes) {
       throw new RangeError("Reaction clip exceeds maximum file byte limit");
     }
@@ -110,6 +117,10 @@ export class ReactionPool {
     if (nextTotalBytes > this.maxTotalBytes) {
       throw new RangeError("ReactionPool exceeded 8 MiB aggregate byte limit");
     }
+    const clonedPcm = pcm24k ? Buffer.from(pcm24k) : null;
+    const clonedFrames = Object.freeze(
+      Array.isArray(frames48kOpus) ? frames48kOpus.map((frame) => Buffer.from(frame)) : [],
+    );
     this.clips.set(
       id,
       Object.freeze({ id, mood, frames48kOpus: clonedFrames, pcm24k: clonedPcm }),

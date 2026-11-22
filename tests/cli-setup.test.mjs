@@ -11,7 +11,7 @@ import {
 } from "../src/cli/setup.mjs";
 import * as entryMod from "../src/index.mjs";
 import { createCompanionApp } from "../src/index.mjs";
-import { loadConfig } from "../src/config/config.mjs";
+import { loadConfig, redactConfig } from "../src/config/config.mjs";
 import { createLlmClient } from "../src/llm/client.mjs";
 import { REACTION_CLIP_PROMPTS } from "../src/tts/reactions.mjs";
 
@@ -286,6 +286,8 @@ test("createCompanionApp loads clips inside trustedRootDir, absorbs warmup failu
   let orchestratorClosed = 0;
   let ttsClosed = 0;
   let sttClosed = 0;
+  let discordLoginCalls = 0;
+  let discordDestroyCalls = 0;
 
   const app = await createCompanionApp({
     env: {},
@@ -294,6 +296,15 @@ test("createCompanionApp loads clips inside trustedRootDir, absorbs warmup failu
     soulPath: path.join(root, "SOUL.md"),
     trustedRootDir: root,
     fsImpl: mockFs,
+    createDiscordClientImpl: () => ({
+      login: async () => {
+        discordLoginCalls += 1;
+        return "mock-token";
+      },
+      destroy: () => {
+        discordDestroyCalls += 1;
+      },
+    }),
     createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
     createTtsAdapterImpl: () => ({
       name: () => "elevenlabs-ws",
@@ -338,6 +349,8 @@ test("createCompanionApp loads clips inside trustedRootDir, absorbs warmup failu
 
   await app.stop();
   await app.stop();
+  assert.equal(discordLoginCalls, 1);
+  assert.equal(discordDestroyCalls, 1);
   assert.equal(orchestratorClosed, 1);
   assert.equal(ttsClosed, 1);
   assert.equal(sttClosed, 1);
@@ -369,6 +382,8 @@ test("SOUL.md and README.md pass the prose gate with required content and zero A
   assert.match(readmeText, /\/mute-user/);
   assert.match(readmeText, /faster-whisper/);
   assert.match(readmeText, /eleven_flash_v2_5/);
+  assert.doesNotMatch(readmeText, /recent turn latency averages/);
+  assert.match(readmeText, /\/status[^\n]*session state[^\n]*DAVE E2EE/i);
 });
 
 test("interactive custom LLM setup prompts for reply/gate models, marks secrets, enforces 0600/0700 chmods, and blocks symlinks", async () => {
@@ -1097,4 +1112,34 @@ test("createCompanionApp.start registers A3-shaped slashCommands normalized with
     { name: "mention", value: "mention" },
   ]);
   await app.stop();
+});
+
+test("redactConfig strips credentials, query strings, and fragments from endpoint URLs", () => {
+  const redacted = redactConfig({
+    discord: { token: "bot-secret" },
+    llm: {
+      provider: "openai",
+      apiKey: "llm-secret",
+      baseUrl: "https://user:pass@api.openai.com/v1?api_key=leak#frag",
+    },
+    stt: {
+      provider: "faster-whisper",
+      localUrl: "http://admin:pw@127.0.0.1:8080/v1?token=leak#hash",
+    },
+    tts: {
+      provider: "openai",
+      apiKey: "tts-secret",
+      baseUrl: "https://tts.example.com/v1/",
+    },
+    extraBroken: {
+      baseUrl: "not a valid url",
+    },
+  });
+
+  assert.equal(redacted.discord.token, "[REDACTED]");
+  assert.equal(redacted.llm.apiKey, "[REDACTED]");
+  assert.equal(redacted.llm.baseUrl, "https://api.openai.com/v1");
+  assert.equal(redacted.stt.localUrl, "http://127.0.0.1:8080/v1");
+  assert.equal(redacted.tts.baseUrl, "https://tts.example.com/v1");
+  assert.equal(redacted.extraBroken.baseUrl, "[REDACTED]");
 });
