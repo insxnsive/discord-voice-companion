@@ -1155,3 +1155,79 @@ test("OpenAI TTS clips streamed WAV at declared data chunk extent and rejects tr
     /Truncated WAV/i,
   );
 });
+
+test("ReactionPool.loadFromDirectory enforces trustedRootDir containment, realpath entry bounds, and dev/ino match", () => {
+  const escapedPool = new ReactionPool();
+  assert.throws(
+    () =>
+      escapedPool.loadFromDirectory("/untrusted/cache", {
+        trustedRootDir: "/trusted/root",
+        fsImpl: {
+          existsSync: () => true,
+          lstatSync: () => ({
+            isSymbolicLink: () => false,
+            isDirectory: () => true,
+            isFile: () => false,
+          }),
+          realpathSync: (p) => path.posix.resolve(p),
+          readdirSync: () => [],
+        },
+      }),
+    RangeError,
+  );
+
+  // Entry whose realpathSync resolves outside resolvedDir must be skipped cleanly
+  const entryEscapePool = new ReactionPool();
+  const loadedEscapedEntry = entryEscapePool.loadFromDirectory("/trusted/root/cache", {
+    trustedRootDir: "/trusted/root",
+    fsImpl: {
+      constants: { O_RDONLY: 0 },
+      existsSync: () => true,
+      lstatSync: (p) => {
+        if (p.endsWith("cache")) {
+          return { isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false, dev: 1, ino: 10 };
+        }
+        return { isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true, dev: 1, ino: 20 };
+      },
+      realpathSync: (p) => {
+        if (p.includes("curious_hmm_escape")) return "/elsewhere/curious_hmm_escape.pcm";
+        return p;
+      },
+      readdirSync: () => ["subtle_breath_ok.pcm", "curious_hmm_escape.pcm"],
+      openSync: () => 5,
+      fstatSync: () => ({ isSymbolicLink: () => false, isFile: () => true, size: 4, dev: 1, ino: 20 }),
+      readSync: (_fd, target) => {
+        Buffer.from([1, 2, 3, 4]).copy(target);
+        return 4;
+      },
+      closeSync: () => {},
+    },
+  });
+  assert.equal(loadedEscapedEntry, 1);
+
+  // Entry whose entryLstat dev/ino disagrees with fstatSync(fd) dev/ino must be skipped cleanly
+  const devMismatchPool = new ReactionPool();
+  const loadedMismatched = devMismatchPool.loadFromDirectory("/trusted/root/cache", {
+    trustedRootDir: "/trusted/root",
+    fsImpl: {
+      constants: { O_RDONLY: 0 },
+      existsSync: () => true,
+      lstatSync: (p) => {
+        if (p.endsWith("cache")) {
+          return { isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false, dev: 1, ino: 10 };
+        }
+        return { isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true, dev: 1, ino: 20 };
+      },
+      realpathSync: (p) => p,
+      readdirSync: () => ["subtle_breath_swapped.pcm"],
+      openSync: () => 6,
+      fstatSync: () => ({ isSymbolicLink: () => false, isFile: () => true, size: 4, dev: 2, ino: 20 }),
+      readSync: (_fd, target) => {
+        Buffer.from([1, 2, 3, 4]).copy(target);
+        return 4;
+      },
+      closeSync: () => {},
+    },
+  });
+  assert.equal(loadedMismatched, 0);
+});

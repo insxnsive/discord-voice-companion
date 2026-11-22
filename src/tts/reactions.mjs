@@ -160,7 +160,10 @@ export class ReactionPool {
     return chosen;
   }
 
-  loadFromDirectory(dirPath, { fsImpl = fs, maxFileBytes = this.maxFileBytes } = {}) {
+  loadFromDirectory(
+    dirPath,
+    { fsImpl = fs, maxFileBytes = this.maxFileBytes, trustedRootDir } = {},
+  ) {
     if (!dirPath) return 0;
     if (typeof fsImpl.existsSync === "function" && !fsImpl.existsSync(dirPath)) {
       return 0;
@@ -182,6 +185,27 @@ export class ReactionPool {
       }
     }
 
+    let resolvedDir = dirPath;
+    if (typeof fsImpl.realpathSync === "function") {
+      try {
+        resolvedDir = path.normalize(fsImpl.realpathSync(dirPath));
+      } catch (error) {
+        if (error && error.code === "ENOENT") return 0;
+        throw error;
+      }
+      if (typeof trustedRootDir === "string" && trustedRootDir.trim().length > 0) {
+        const resolvedRoot = path.normalize(fsImpl.realpathSync(trustedRootDir));
+        const rootPrefix = resolvedRoot.endsWith(path.sep)
+          ? resolvedRoot
+          : `${resolvedRoot}${path.sep}`;
+        if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(rootPrefix)) {
+          throw new RangeError("Reaction cache directory is outside trusted root");
+        }
+      }
+    }
+
+    const dirPrefix = resolvedDir.endsWith(path.sep) ? resolvedDir : `${resolvedDir}${path.sep}`;
+
     const effectiveMaxFileBytes =
       Number.isInteger(maxFileBytes) && maxFileBytes > 0
         ? Math.min(this.maxFileBytes, maxFileBytes)
@@ -189,7 +213,7 @@ export class ReactionPool {
 
     let entries;
     try {
-      entries = fsImpl.readdirSync(dirPath);
+      entries = fsImpl.readdirSync(resolvedDir);
     } catch (error) {
       if (error && error.code === "ENOENT") return 0;
       throw error;
@@ -207,7 +231,19 @@ export class ReactionPool {
       const match = CLIP_FILENAME_PATTERN.exec(entry);
       if (!match) continue;
 
-      const fullPath = path.join(dirPath, entry);
+      const fullPath = path.join(resolvedDir, entry);
+      if (typeof fsImpl.realpathSync === "function") {
+        let resolvedEntry;
+        try {
+          resolvedEntry = path.normalize(fsImpl.realpathSync(fullPath));
+        } catch {
+          continue;
+        }
+        if (!resolvedEntry.startsWith(dirPrefix)) {
+          continue;
+        }
+      }
+
       let entryLstat = null;
       if (typeof fsImpl.lstatSync === "function") {
         try {
@@ -240,6 +276,18 @@ export class ReactionPool {
             !stat?.isFile?.() ||
             stat.size <= 0 ||
             stat.size > effectiveMaxFileBytes
+          ) {
+            continue;
+          }
+          if (
+            entryLstat &&
+            Number.isFinite(entryLstat.dev) &&
+            Number.isFinite(stat?.dev) &&
+            typeof entryLstat.ino === "number" &&
+            entryLstat.ino > 0 &&
+            typeof stat?.ino === "number" &&
+            stat.ino > 0 &&
+            (entryLstat.ino !== stat.ino || entryLstat.dev !== stat.dev)
           ) {
             continue;
           }
