@@ -279,6 +279,9 @@ function buildOrchestrator(overrides = {}) {
     scheduleReactionFillerImpl: filler.impl,
     playerSink,
     now: () => (clock += 10),
+    loadVoiceDeps: async () => {
+      throw new Error("voice deps disabled in tests");
+    },
     verifyDaveImpl: async () => ({
       nodeVersion: "22.12.0",
       daveReady: true,
@@ -1177,6 +1180,7 @@ test("real-shaped voiceDeps wire speaking ingress and resource egress", async ()
   assert.equal(shapes.deps.joined.adapterCreator, "creator");
 
   shapes.speaking.emit("start", "user-1");
+  await tick(5);
   assert.equal(shapes.subscriptions.length, 1);
   assert.equal(shapes.subscriptions[0].options.end.behavior, 2);
   assert.equal(shapes.subscriptions[0].options.end.duration, 240);
@@ -1208,5 +1212,179 @@ test("real-shaped voiceDeps wire speaking ingress and resource egress", async ()
   assert.equal(shapes.subscriptions[0].stream.destroyed, true);
 
   shapes.speaking.emit("start", "user-2");
+  await tick(5);
   assert.equal(shapes.subscriptions.length, 1);
+});
+
+test("join fails when voice deps cannot load and no player sink exists", async () => {
+  const { orchestrator } = buildOrchestrator({ playerSink: null });
+  await orchestrator.start();
+
+  await assert.rejects(
+    () => orchestrator.joinChannel({ guildId: "g1", channelId: "c1" }),
+    /voice deps disabled/,
+  );
+});
+
+test("join resolves voice deps lazily when none are injected", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator } = buildOrchestrator({
+    playerSink: null,
+    loadVoiceDeps: async () => shapes.deps,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  assert.equal(shapes.deps.joined.channelId, "c1");
+});
+
+test("a join awaiting voice deps aborts when the session closes", async () => {
+  let releaseLoad;
+  const { orchestrator } = buildOrchestrator({
+    playerSink: null,
+    loadVoiceDeps: () =>
+      new Promise((resolve) => {
+        releaseLoad = resolve;
+      }),
+  });
+  await orchestrator.start();
+
+  const pending = orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await tick(5);
+  await orchestrator.close();
+  releaseLoad(makeRealVoiceDeps().deps);
+
+  await assert.rejects(() => pending, /aborted/i);
+});
+
+test("stream cleanup re-subscribes and leave detaches the speaking listener", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  shapes.speaking.emit("start", "u1");
+  await tick(5);
+  assert.equal(shapes.subscriptions.length, 1);
+
+  shapes.subscriptions[0].stream.emit("end");
+  shapes.speaking.emit("start", "u1");
+  await tick(5);
+  assert.equal(shapes.subscriptions.length, 2);
+
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  shapes.speaking.emit("start", "u2");
+  await tick(5);
+  assert.equal(shapes.subscriptions.length, 2);
+});
+
+test("voice playback streams end when the turn finishes", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(shapes.played.length, 1);
+  assert.equal(shapes.played[0].stream.writableEnded, true);
+});
+
+test("uncached speakers resolve through members.fetch once", async () => {
+  const fetched = [];
+  const client = {
+    user: { id: "bot-9" },
+    users: { cache: new Map() },
+    guilds: {
+      cache: new Map([
+        [
+          "g1",
+          {
+            members: {
+              cache: new Map(),
+              async fetch(userId) {
+                fetched.push(userId);
+                return { user: { bot: false } };
+              },
+            },
+          },
+        ],
+      ]),
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ client, botUserId: "bot-9" });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "late-human",
+    opusPacket: Buffer.alloc(8),
+  });
+  assert.equal(fetched.includes("late-human"), true);
+  assert.equal(vad.pushes.length, 1);
+
+  await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "late-human",
+    opusPacket: Buffer.alloc(8),
+  });
+  assert.equal(fetched.filter((id) => id === "late-human").length, 1);
+  assert.equal(vad.pushes.length, 2);
+});
+
+test("non-moderators cannot move or disconnect the bot from another channel", async () => {
+  const calls = [];
+  const handler = createCommandHandler({
+    orchestrator: {
+      getStatus: () => ({
+        guildId: "g1",
+        active: true,
+        channelId: "c1",
+        latencySummary: "No turns recorded yet.",
+      }),
+      joinChannel: async () => calls.push("join"),
+      leaveChannel: async () => calls.push("leave"),
+      setChimeMode: () => {},
+      setFillerMode: () => {},
+      muteUser: () => {},
+    },
+  });
+  const replies = [];
+  const base = {
+    guildId: "g1",
+    commandName: "join",
+    member: { voice: { channelId: "c2" } },
+    options: { get: () => undefined },
+    async reply(payload) {
+      replies.push(payload);
+      return payload;
+    },
+  };
+
+  await handler.handleInteraction({ ...base, commandName: "join" });
+  assert.match(replies.at(-1).content, /active voice channel|moderator/i);
+  assert.equal(calls.includes("join"), false);
+
+  await handler.handleInteraction({ ...base, commandName: "leave" });
+  assert.match(replies.at(-1).content, /active voice channel|moderator/i);
+  assert.equal(calls.includes("leave"), false);
+
+  await handler.handleInteraction({
+    ...base,
+    commandName: "join",
+    memberPermissions: { has: (name) => name === "ManageGuild" },
+  });
+  assert.equal(calls.includes("join"), true);
 });

@@ -228,6 +228,7 @@ export class PerSpeakerVad {
     this.onBargeIn = onBargeIn;
     this.onNoiseDrop = onNoiseDrop;
     this.speakers = new Map();
+    this.quarantinedUsers = new Map();
   }
 
   /** Replace the ignored-user set and drop any newly muted speaker's state. */
@@ -322,7 +323,6 @@ export class PerSpeakerVad {
       epoch: 0,
       queue: Promise.resolve(),
       pendingCount: 0,
-      quarantinedPromise: null,
     };
   }
 
@@ -371,9 +371,11 @@ export class PerSpeakerVad {
   #dropSpeaker(userId) {
     const state = this.speakers.get(userId);
     if (!state) return;
+    // Delete before reset so a detector reset that calls back into the VAD
+    // cannot recurse through this speaker entry.
+    this.speakers.delete(userId);
     state.epoch += 1;
     state.detector?.reset?.();
-    this.speakers.delete(userId);
   }
 
   #isCurrent(userId, state, epoch) {
@@ -415,10 +417,12 @@ export class PerSpeakerVad {
     state.startedAt = null;
     state.detector = null;
     state.epoch += 1;
-    state.quarantinedPromise = pending;
+    this.quarantinedUsers.set(state.userId, pending);
     pending
       .finally(() => {
-        if (state.quarantinedPromise === pending) state.quarantinedPromise = null;
+        if (this.quarantinedUsers.get(state.userId) === pending) {
+          this.quarantinedUsers.delete(state.userId);
+        }
       })
       .catch(() => {});
   }
@@ -432,7 +436,7 @@ export class PerSpeakerVad {
     if (!this.#isCurrent(userId, state, startEpoch)) {
       return { result: { ignored: true, dropped: "reset" } };
     }
-    if (state.quarantinedPromise) {
+    if (this.quarantinedUsers.has(userId)) {
       return { result: { ignored: true, dropped: "detector_quarantined" } };
     }
 

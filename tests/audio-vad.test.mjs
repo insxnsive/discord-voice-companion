@@ -921,6 +921,15 @@ test("a timed-out detector is quarantined until it settles", async () => {
   assert.equal(quarantined.dropped, "detector_quarantined");
   assert.equal(calls, 1);
 
+  vad.resetSpeaker("u7");
+  const afterReset = await vad.pushFrame({
+    userId: "u7",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 30,
+  });
+  assert.equal(afterReset.dropped, "detector_quarantined");
+  assert.equal(calls, 1);
+
   rejectHung(new Error("late detector rejection"));
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -931,4 +940,24 @@ test("a timed-out detector is quarantined until it settles", async () => {
   });
   assert.notEqual(recovered.dropped, "detector_quarantined");
   assert.equal(calls, 2);
+});
+
+test("a detector reset that drops the speaker suppresses onSpeechEnd", async () => {
+  const ends = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      const detect = () => 0.9;
+      detect.reset = () => vad.resetSpeaker("u8");
+      return detect;
+    },
+    minSpeechMs: 10,
+    maxUtteranceBytes: VAD_FRAME_BYTES,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u8", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(ends.length, 0);
 });

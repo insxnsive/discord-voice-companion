@@ -142,6 +142,17 @@ export function createCommandHandler({ orchestrator } = {}) {
         case "join": {
           const channelId = interaction?.member?.voice?.channelId;
           if (!channelId) return await reply(interaction, "Join a voice channel first.");
+          if (
+            status?.active &&
+            status?.channelId &&
+            status.channelId !== channelId &&
+            !hasModeratorPermission(interaction)
+          ) {
+            return await reply(
+              interaction,
+              "Join the active voice channel or use a moderator role to move the bot.",
+            );
+          }
           const adapterCreator =
             interaction?.guild?.voiceAdapterCreator ??
             interaction?.member?.guild?.voiceAdapterCreator;
@@ -149,6 +160,18 @@ export function createCommandHandler({ orchestrator } = {}) {
           return await reply(interaction, "Joined your voice channel.");
         }
         case "leave": {
+          const memberChannelId = interaction?.member?.voice?.channelId;
+          if (
+            status?.active &&
+            status?.channelId &&
+            memberChannelId !== status.channelId &&
+            !hasModeratorPermission(interaction)
+          ) {
+            return await reply(
+              interaction,
+              "You must be in the active voice channel or have moderator permission to disconnect the bot.",
+            );
+          }
           await orchestrator.leaveChannel({ guildId });
           return await reply(interaction, "Left the voice channel.");
         }
