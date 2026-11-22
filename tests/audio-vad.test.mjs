@@ -867,3 +867,68 @@ test("a stalled detector times out and frees the in-flight slot", { timeout: 300
   assert.equal(vad.inFlightCount, 0);
   assert.equal(vad.speakers.get("u4").pendingCount, 0);
 });
+
+test("a reset queued on the final frame suppresses onSpeechEnd", async () => {
+  const ends = [];
+  let vad;
+  let resetQueued = false;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => {
+      if (!resetQueued) {
+        resetQueued = true;
+        queueMicrotask(() => vad.resetSpeaker("u6"));
+      }
+      return 0.9;
+    },
+    minSpeechMs: 10,
+    maxUtteranceBytes: VAD_FRAME_BYTES,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u6", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(ends.length, 0);
+});
+
+test("a timed-out detector is quarantined until it settles", async () => {
+  let calls = 0;
+  let rejectHung;
+  const hung = new Promise((resolve, reject) => {
+    rejectHung = reject;
+  });
+
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      calls += 1;
+      if (calls === 1) return () => hung;
+      return () => 0.9;
+    },
+    detectorTimeoutMs: 20,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "u7", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+  assert.equal(calls, 1);
+
+  const quarantined = await vad.pushFrame({
+    userId: "u7",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 20,
+  });
+  assert.equal(quarantined.dropped, "detector_quarantined");
+  assert.equal(calls, 1);
+
+  rejectHung(new Error("late detector rejection"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const recovered = await vad.pushFrame({
+    userId: "u7",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 40,
+  });
+  assert.notEqual(recovered.dropped, "detector_quarantined");
+  assert.equal(calls, 2);
+});

@@ -322,6 +322,7 @@ export class PerSpeakerVad {
       epoch: 0,
       queue: Promise.resolve(),
       pendingCount: 0,
+      quarantinedPromise: null,
     };
   }
 
@@ -384,16 +385,42 @@ export class PerSpeakerVad {
     );
   }
 
-  async #withDetectorTimeout(task) {
+  async #runDetector(state, task) {
+    const pending = Promise.resolve().then(task);
     let timer;
     const timeout = new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error("VAD detector timed out")), this.detectorTimeoutMs);
+      timer = setTimeout(() => {
+        reject(Object.assign(new Error("VAD detector timed out"), { code: "DETECTOR_TIMEOUT" }));
+      }, this.detectorTimeoutMs);
     });
     try {
-      return await Promise.race([Promise.resolve().then(task), timeout]);
+      return await Promise.race([pending, timeout]);
+    } catch (error) {
+      if (error?.code === "DETECTOR_TIMEOUT") {
+        this.#quarantineDetector(state, pending);
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  #quarantineDetector(state, pending) {
+    state.active = false;
+    state.chunks = [];
+    state.bufferedBytes = 0;
+    state.speechMs = 0;
+    state.silenceMs = 0;
+    state.bargeInFired = false;
+    state.startedAt = null;
+    state.detector = null;
+    state.epoch += 1;
+    state.quarantinedPromise = pending;
+    pending
+      .finally(() => {
+        if (state.quarantinedPromise === pending) state.quarantinedPromise = null;
+      })
+      .catch(() => {});
   }
 
   async #processFrame(state, pcm16kMono, timestampMs) {
@@ -403,11 +430,14 @@ export class PerSpeakerVad {
     // A frame can be queued and then dropped by resetSpeaker, clear, or a mute
     // before its turn comes. Bail out before creating a detector.
     if (!this.#isCurrent(userId, state, startEpoch)) {
-      return { ignored: true, dropped: "reset" };
+      return { result: { ignored: true, dropped: "reset" } };
+    }
+    if (state.quarantinedPromise) {
+      return { result: { ignored: true, dropped: "detector_quarantined" } };
     }
 
     if (!state.detector) {
-      const detector = await this.#withDetectorTimeout(() => this.detectorFactory(userId));
+      const detector = await this.#runDetector(state, () => this.detectorFactory(userId));
       if (!this.#isCurrent(userId, state, startEpoch)) {
         return { result: { ignored: true, dropped: "reset" } };
       }
@@ -419,7 +449,7 @@ export class PerSpeakerVad {
     }
 
     const samples = pcm16MonoToFloat32(pcm16kMono);
-    const probability = await this.#withDetectorTimeout(() => state.detector(samples));
+    const probability = await this.#runDetector(state, () => state.detector(samples));
     if (!this.#isCurrent(userId, state, startEpoch)) {
       return { result: { ignored: true, dropped: "reset" } };
     }

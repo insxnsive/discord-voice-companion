@@ -1,6 +1,8 @@
 // Discord voice session pipeline: DAVE prerequisite verification, Opus ingress
 // and egress, barge-in cancellation, and the STT -> filler -> gate -> LLM -> TTS
-// turn. Discord gateway wiring is injected so the unit suite needs no network.
+// turn. Discord gateway wiring is injected or lazily loaded.
+
+import { PassThrough } from "node:stream";
 
 import { CHIME_MODES, FILLER_MODES, LatencyTracker, assertAdapterContract } from "../types.mjs";
 import {
@@ -20,6 +22,7 @@ export const REQUIRED_VOICE_PERMISSIONS = Object.freeze(["Connect", "Speak"]);
 
 const MIN_NODE = "22.12.0";
 const DAVE_MODULES = Object.freeze(["@discordjs/voice", "@snazzah/davey"]);
+const MAX_PCM_CHUNK_BYTES = 245760;
 
 function parseNodeVersion(version) {
   const [major = 0, minor = 0] = String(version)
@@ -66,15 +69,12 @@ function boundedHistory(history, maxHistoryTurns) {
   while (history.length > maxMessages) history.shift();
 }
 
-/**
- * Build the voice orchestrator. All I/O (STT, LLM, TTS, Opus, player, VAD) is
- * injected, so the pipeline can be driven frame by frame in tests.
- */
 export function createVoiceOrchestrator({
   config = {},
   botUserId = "",
   client = null,
   voiceDeps = null,
+  loadVoiceDeps = async () => import("@discordjs/voice"),
   sttAdapter,
   llmClient,
   ttsAdapter,
@@ -107,6 +107,7 @@ export function createVoiceOrchestrator({
   let resolvedBotUserId = botUserId || client?.user?.id || "";
   let transcoder = opusTranscoder;
   let transcoderPromise = null;
+  let resolvedVoiceDeps = voiceDeps ?? null;
 
   const state = {
     active: false,
@@ -120,6 +121,9 @@ export function createVoiceOrchestrator({
     mutedUsers: new Set(),
     isBotSpeaking: false,
     lastBotReplyAt: 0,
+    lastError: null,
+    sessionEpoch: 0,
+    sessionToken: null,
     closed: false,
     client,
   };
@@ -129,17 +133,28 @@ export function createVoiceOrchestrator({
   let turnCounter = 0;
   let voiceConnection = null;
   let voicePlayer = null;
-  let voiceReceiver = null;
+  let speakingListener = null;
+  const userStreams = new Map();
 
-  function playPacket(packet) {
-    if (playerSink?.playOpusFrame) {
-      playerSink.playOpusFrame(packet);
-      return;
+  async function ensureTranscoder() {
+    if (transcoder) return transcoder;
+    if (!transcoderPromise) transcoderPromise = createOpusTranscoderImpl();
+    transcoder = await transcoderPromise;
+    return transcoder;
+  }
+
+  function finishOutput(turn) {
+    if (!turn?.outStream) return;
+    try {
+      turn.outStream.end?.();
+    } catch {
+      // The output stream may already be closed.
     }
-    voicePlayer?.play?.(packet);
+    turn.outStream = null;
   }
 
   function stopPlayback() {
+    finishOutput(currentTurn);
     try {
       playerSink?.stop?.();
       playerSink?.clear?.();
@@ -157,6 +172,20 @@ export function createVoiceOrchestrator({
     return Boolean(playerSink?.isPlaying?.() || voicePlayer?.state?.status === "playing");
   }
 
+  function isTurnLive(turn) {
+    return Boolean(
+      turn &&
+        !state.closed &&
+        state.active &&
+        state.sessionEpoch === turn.sessionEpoch &&
+        state.guildId === turn.guildId &&
+        state.channelId === turn.channelId &&
+        currentTurn === turn &&
+        !turn.controller.signal.aborted &&
+        !state.mutedUsers.has(turn.userId),
+    );
+  }
+
   const vadCallbacks = {
     onSpeechStart: () => {},
     onSpeechEnd: (event) => handleSpeechEnd(event),
@@ -172,19 +201,51 @@ export function createVoiceOrchestrator({
         ...vadCallbacks,
       });
 
-  async function ensureTranscoder() {
-    if (transcoder) return transcoder;
-    if (!transcoderPromise) transcoderPromise = createOpusTranscoderImpl();
-    transcoder = await transcoderPromise;
-    return transcoder;
+  function resolveDisplayName(userId, guildId) {
+    const member = state.client?.guilds?.cache?.get?.(guildId)?.members?.cache?.get?.(userId);
+    return (
+      member?.displayName ??
+      member?.user?.username ??
+      state.client?.users?.cache?.get?.(userId)?.username ??
+      "Unknown"
+    );
+  }
+
+  function resolveIsBot(userId, guildId) {
+    const usersCache = state.client?.users?.cache;
+    const guildsCache = state.client?.guilds?.cache;
+
+    if (usersCache && typeof usersCache.get === "function") {
+      const user = usersCache.get(userId);
+      if (user && typeof user.bot === "boolean") return user.bot;
+    }
+    if (guildsCache && typeof guildsCache.get === "function") {
+      const member = guildsCache.get(guildId)?.members?.cache?.get?.(userId);
+      if (member?.user && typeof member.user.bot === "boolean") return member.user.bot;
+    }
+    // With a client cache attached, an unknown speaker is treated as non-human.
+    if (usersCache || guildsCache) return true;
+    return false;
   }
 
   function destroyVoice() {
-    try {
-      voiceReceiver?.destroy?.();
-    } catch {
-      // Receiver teardown is best effort.
+    const speaking = voiceConnection?.receiver?.speaking;
+    if (speaking && speakingListener) {
+      speaking.off?.("start", speakingListener);
+      speaking.removeListener?.("start", speakingListener);
     }
+    speakingListener = null;
+
+    for (const stream of userStreams.values()) {
+      try {
+        stream.destroy?.();
+      } catch {
+        // Stream teardown is best effort.
+      }
+    }
+    userStreams.clear();
+
+    finishOutput(currentTurn);
     try {
       voicePlayer?.stop?.(true);
     } catch {
@@ -195,7 +256,6 @@ export function createVoiceOrchestrator({
     } catch {
       // Connection teardown is best effort.
     }
-    voiceReceiver = null;
     voicePlayer = null;
     voiceConnection = null;
   }
@@ -203,12 +263,80 @@ export function createVoiceOrchestrator({
   function resetTurnAndSession() {
     currentTurn?.controller.abort();
     currentTurn?.filler?.cancel();
+    finishOutput(currentTurn);
     currentTurn = null;
     state.isBotSpeaking = false;
     stopPlayback();
     vad.clear?.();
     history = [];
     state.lastBotReplyAt = 0;
+    state.sessionEpoch += 1;
+    state.sessionToken = null;
+  }
+
+  function onSpeakingStart(userId, boundGuildId, boundChannelId, boundToken) {
+    try {
+      if (!userId || userId === resolvedBotUserId) return;
+      if (state.closed || state.sessionToken !== boundToken) return;
+      if (state.guildId !== boundGuildId || state.channelId !== boundChannelId) return;
+      if (state.mutedUsers.has(userId)) return;
+      if (resolveIsBot(userId, boundGuildId)) return;
+      if (userStreams.has(userId)) return;
+
+      const EndBehaviorType = resolvedVoiceDeps?.EndBehaviorType;
+      const stream = voiceConnection?.receiver?.subscribe?.(userId, {
+        end: { behavior: EndBehaviorType?.AfterSilence ?? 1, duration: 240 },
+      });
+      if (!stream) return;
+
+      userStreams.set(userId, stream);
+      const cleanup = () => {
+        if (userStreams.get(userId) === stream) userStreams.delete(userId);
+      };
+
+      stream.on?.("data", (chunk) => {
+        Promise.resolve(
+          handleOpusPacket({
+            sessionToken: boundToken,
+            guildId: boundGuildId,
+            channelId: boundChannelId,
+            userId,
+            displayName: resolveDisplayName(userId, boundGuildId),
+            opusPacket: chunk,
+          }),
+        ).catch(() => {});
+      });
+      stream.on?.("end", cleanup);
+      stream.on?.("close", cleanup);
+      stream.on?.("error", cleanup);
+    } catch {
+      state.lastError = "voice receiver failed";
+    }
+  }
+
+  function ensureTurnStream(turn) {
+    if (playerSink?.playOpusFrame) return null;
+    if (!voicePlayer) return null;
+    if (turn.outStream) return turn.outStream;
+
+    const stream = new PassThrough({ objectMode: true });
+    const resource = resolvedVoiceDeps?.createAudioResource
+      ? resolvedVoiceDeps.createAudioResource(stream, {
+          inputType: resolvedVoiceDeps?.StreamType?.Opus ?? "opus",
+        })
+      : stream;
+    turn.outStream = stream;
+    voicePlayer.play?.(resource);
+    return stream;
+  }
+
+  function playPacket(turn, packet) {
+    if (playerSink?.playOpusFrame) {
+      playerSink.playOpusFrame(packet);
+      return;
+    }
+    const stream = ensureTurnStream(turn);
+    stream?.write?.(packet);
   }
 
   function emitFrame(turn, packet) {
@@ -217,12 +345,16 @@ export function createVoiceOrchestrator({
       latencyTracker.mark(turn.id, "opusFirstFrameAt", now());
       turn.firstFrameMarked = true;
     }
-    playPacket(packet);
+    playPacket(turn, packet);
   }
 
   function emitPcm48(turn, pcm48) {
-    for (const frame of turn.accumulator.push(pcm48)) {
-      emitFrame(turn, transcoder.encode(frame));
+    const buffer = Buffer.isBuffer(pcm48) ? pcm48 : Buffer.from(pcm48);
+    for (let offset = 0; offset < buffer.length; offset += MAX_PCM_CHUNK_BYTES) {
+      const slice = buffer.subarray(offset, Math.min(offset + MAX_PCM_CHUNK_BYTES, buffer.length));
+      for (const frame of turn.accumulator.push(slice)) {
+        emitFrame(turn, transcoder.encode(frame));
+      }
     }
   }
 
@@ -262,7 +394,7 @@ export function createVoiceOrchestrator({
   }
 
   async function speakClause(clause, turn) {
-    if (!clause || turn.controller.signal.aborted) return;
+    if (!clause || !isTurnLive(turn)) return;
     if (!turn.fillerCancelled) {
       turn.filler?.cancel();
       turn.fillerCancelled = true;
@@ -276,7 +408,7 @@ export function createVoiceOrchestrator({
       text: clause,
       signal: turn.controller.signal,
       onPcmChunk: (pcm24) => {
-        if (turn.controller.signal.aborted) return;
+        if (!isTurnLive(turn)) return;
         if (!turn.ttsMarked) {
           latencyTracker.mark(turn.id, "ttsFirstByteAt", now());
           turn.ttsMarked = true;
@@ -286,14 +418,7 @@ export function createVoiceOrchestrator({
       },
     });
 
-    if (!turn.controller.signal.aborted) flushFrames(turn);
-  }
-
-  function resolveIsBot(userId, guildId) {
-    const direct = state.client?.users?.cache?.get?.(userId)?.bot;
-    if (typeof direct === "boolean") return direct;
-    const member = state.client?.guilds?.cache?.get?.(guildId)?.members?.cache?.get?.(userId);
-    return member?.user?.bot === true;
+    if (isTurnLive(turn)) flushFrames(turn);
   }
 
   async function handleSpeechEnd({ userId, displayName, pcm16kMono, endedAt } = {}) {
@@ -304,6 +429,7 @@ export function createVoiceOrchestrator({
     if (currentTurn) {
       currentTurn.controller.abort();
       currentTurn.filler?.cancel();
+      finishOutput(currentTurn);
       stopPlayback();
     }
 
@@ -319,6 +445,10 @@ export function createVoiceOrchestrator({
       firstFrameMarked: false,
       llmMarked: false,
       ttsMarked: false,
+      outStream: null,
+      sessionEpoch: state.sessionEpoch,
+      guildId: state.guildId,
+      channelId: state.channelId,
     };
     currentTurn = turn;
     latencyTracker.startTurn(turnId, startedAt);
@@ -329,7 +459,10 @@ export function createVoiceOrchestrator({
 
     try {
       await ensureTranscoder();
+      if (!isTurnLive(turn)) return;
+
       const transcript = await sttAdapter.transcribe(pcm16kMono, { signal: controller.signal });
+      if (!isTurnLive(turn)) return;
       latencyTracker.mark(turnId, "sttDoneAt", now());
       if (
         typeof transcript !== "string" ||
@@ -342,12 +475,16 @@ export function createVoiceOrchestrator({
       turn.filler = scheduleReactionFillerImpl({
         delayMs: fillerDelay,
         onFire: () => {
-          if (controller.signal.aborted) return;
-          const clip = reactionPool?.pick(transcript, { mode: state.fillerMode });
-          if (!clip) return;
-          latencyTracker.mark(turnId, "fillerFiredAt", now());
-          state.isBotSpeaking = true;
-          emitClip(clip, turn);
+          try {
+            if (!isTurnLive(turn)) return;
+            const clip = reactionPool?.pick(transcript, { mode: state.fillerMode });
+            if (!clip) return;
+            latencyTracker.mark(turnId, "fillerFiredAt", now());
+            state.isBotSpeaking = true;
+            emitClip(clip, turn);
+          } catch {
+            state.lastError = "reaction filler failed";
+          }
         },
       });
 
@@ -362,6 +499,7 @@ export function createVoiceOrchestrator({
         signal: controller.signal,
         now,
       });
+      if (!isTurnLive(turn)) return;
       latencyTracker.mark(turnId, "gateDoneAt", now());
       const chimeIn = decision?.chimeIn ?? decision?.shouldReply;
       if (chimeIn !== true) {
@@ -387,25 +525,32 @@ export function createVoiceOrchestrator({
         signal: controller.signal,
         onToken: (delta) => splitter?.push?.(delta),
       });
+      if (!isTurnLive(turn)) return;
 
       for (const clause of splitter?.flush?.() ?? []) enqueueClause(clause);
       await chain;
+
+      if (!isTurnLive(turn)) return;
+      if (ttsError && !controller.signal.aborted) {
+        state.lastError = "voice turn failed";
+      }
 
       if (typeof reply?.fullText === "string" && reply.fullText.trim().length > 0) {
         history.push({ role: "assistant", content: reply.fullText });
         boundedHistory(history, maxHistoryTurns);
       }
       state.lastBotReplyAt = now();
-      void ttsError;
     } catch (error) {
-      // A barge-in or a failed provider ends this turn only.
       if (!controller.signal.aborted && error?.name !== "AbortError") {
         state.lastError = "voice turn failed";
       }
     } finally {
-      if (currentTurn === turn) currentTurn = null;
-      state.isBotSpeaking = false;
+      if (currentTurn === turn) {
+        currentTurn = null;
+        state.isBotSpeaking = false;
+      }
       turn.filler?.cancel();
+      finishOutput(turn);
       try {
         latencyTracker.finishTurn(turnId);
       } catch {
@@ -415,6 +560,7 @@ export function createVoiceOrchestrator({
   }
 
   async function handleOpusPacket({
+    sessionToken,
     guildId,
     channelId,
     userId,
@@ -423,15 +569,38 @@ export function createVoiceOrchestrator({
     opusPacket,
     timestamp,
   } = {}) {
-    if (!state.active || !state.daveReady || !state.guildId || !state.channelId) {
+    if (
+      !state.active ||
+      state.closed ||
+      !state.daveReady ||
+      !state.guildId ||
+      !state.channelId ||
+      !state.sessionToken
+    ) {
       return { ignored: true, dropped: "inactive_session" };
     }
-    if (guildId !== undefined && guildId !== state.guildId) {
+
+    const tokenMatches = sessionToken !== undefined && sessionToken === state.sessionToken;
+    const idsMatch =
+      typeof guildId === "string" &&
+      guildId.length > 0 &&
+      guildId === state.guildId &&
+      typeof channelId === "string" &&
+      channelId.length > 0 &&
+      channelId === state.channelId;
+
+    if (!tokenMatches && !idsMatch) {
       return { ignored: true, dropped: "wrong_guild" };
     }
-    if (channelId !== undefined && channelId !== state.channelId) {
-      return { ignored: true, dropped: "wrong_guild" };
+    if (tokenMatches) {
+      if (guildId !== undefined && guildId !== state.guildId) {
+        return { ignored: true, dropped: "wrong_guild" };
+      }
+      if (channelId !== undefined && channelId !== state.channelId) {
+        return { ignored: true, dropped: "wrong_guild" };
+      }
     }
+
     if (
       !userId ||
       userId === resolvedBotUserId ||
@@ -445,12 +614,31 @@ export function createVoiceOrchestrator({
       return { ignored: true, dropped: "invalid" };
     }
 
+    const packetEpoch = state.sessionEpoch;
+    const packetToken = state.sessionToken;
     let pcm48;
     try {
       const codec = await ensureTranscoder();
       pcm48 = await codec.decode(opusPacket);
     } catch {
       return { ignored: true, dropped: "decode" };
+    }
+
+    if (
+      !state.active ||
+      state.closed ||
+      !state.daveReady ||
+      state.sessionEpoch !== packetEpoch ||
+      state.sessionToken !== packetToken
+    ) {
+      return { ignored: true, dropped: "inactive_session" };
+    }
+    if (
+      state.mutedUsers.has(userId) ||
+      userId === resolvedBotUserId ||
+      resolveIsBot(userId, state.guildId)
+    ) {
+      return { ignored: true };
     }
 
     const frame = {
@@ -466,9 +654,7 @@ export function createVoiceOrchestrator({
     if (state.closed) throw new Error("Voice orchestrator is closed");
     if (startClient) {
       state.client = startClient;
-      if (!resolvedBotUserId) {
-        resolvedBotUserId = startClient?.user?.id || "";
-      }
+      if (!resolvedBotUserId) resolvedBotUserId = startClient?.user?.id || "";
     }
     const verification = await verifyDaveImpl();
     state.daveReady = verification?.daveReady === true;
@@ -488,29 +674,45 @@ export function createVoiceOrchestrator({
     }
 
     await ensureTranscoder();
+
+    if (!resolvedVoiceDeps) {
+      try {
+        resolvedVoiceDeps = await loadVoiceDeps();
+      } catch (error) {
+        if (!playerSink) throw error;
+        resolvedVoiceDeps = null;
+      }
+    }
+
     resetTurnAndSession();
     destroyVoice();
 
     state.guildId = guildId;
     state.channelId = channelId;
     state.active = true;
+    state.sessionToken = Symbol("voice-session");
 
-    if (voiceDeps?.joinVoiceChannel) {
-      voiceConnection = voiceDeps.joinVoiceChannel({
+    if (resolvedVoiceDeps?.joinVoiceChannel) {
+      voiceConnection = resolvedVoiceDeps.joinVoiceChannel({
         guildId,
         channelId,
         adapterCreator,
         selfDeaf: false,
         selfMute: false,
       });
-      if (typeof voiceConnection?.receiver?.subscribe === "function") {
-        voiceReceiver = voiceConnection.receiver.subscribe(resolvedBotUserId || "bot");
+
+      const speaking = voiceConnection?.receiver?.speaking;
+      if (speaking && typeof speaking.on === "function") {
+        const boundToken = state.sessionToken;
+        speakingListener = (userId) => onSpeakingStart(userId, guildId, channelId, boundToken);
+        speaking.on("start", speakingListener);
       }
+
       if (
-        typeof voiceDeps.createAudioPlayer === "function" &&
+        typeof resolvedVoiceDeps.createAudioPlayer === "function" &&
         typeof voiceConnection?.subscribe === "function"
       ) {
-        voicePlayer = voiceDeps.createAudioPlayer();
+        voicePlayer = resolvedVoiceDeps.createAudioPlayer();
         voiceConnection.subscribe(voicePlayer);
       }
     }
@@ -568,6 +770,7 @@ export function createVoiceOrchestrator({
       config: redactConfig(config ?? {}),
       latencySummary: latencyTracker.formatSummary(),
       latencyLast: latencyTracker.getLast(),
+      lastError: state.lastError,
     };
   }
 

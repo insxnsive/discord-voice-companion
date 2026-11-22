@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 
 import {
   REQUIRED_GATEWAY_INTENTS,
@@ -175,6 +177,50 @@ function makeReactionPool(clip = { id: "clip-1", mood: "curious_hmm", frames48kO
   };
 }
 
+function makeRealVoiceDeps() {
+  const speaking = new EventEmitter();
+  const subscriptions = [];
+  const played = [];
+  const connection = {
+    destroyed: false,
+    receiver: {
+      speaking,
+      subscribe(userId, options) {
+        const stream = new PassThrough();
+        subscriptions.push({ userId, options, stream });
+        return stream;
+      },
+    },
+    subscribe() {},
+    destroy() {
+      connection.destroyed = true;
+    },
+  };
+  const player = {
+    play(resource) {
+      played.push(resource);
+      return resource;
+    },
+    stop() {},
+  };
+  const deps = {
+    EndBehaviorType: { AfterSilence: 2 },
+    StreamType: { Opus: "opus" },
+    joined: null,
+    joinVoiceChannel(options) {
+      deps.joined = options;
+      return connection;
+    },
+    createAudioPlayer() {
+      return player;
+    },
+    createAudioResource(stream, options) {
+      return { stream, opts: options };
+    },
+  };
+  return { deps, speaking, subscriptions, played, connection, player };
+}
+
 function makeFillerScheduler() {
   const state = { cancelled: false, fired: false, onFire: null, delayMs: null };
   const impl = ({ delayMs, onFire }) => {
@@ -211,8 +257,8 @@ function buildOrchestrator(overrides = {}) {
   const tts = overrides.ttsAdapter ?? makeTts();
   const vad = makeVad();
   const filler = makeFillerScheduler();
-  const playerSink = makePlayerSink();
-  const reactionPool = makeReactionPool();
+  const playerSink = overrides.playerSink === null ? null : (overrides.playerSink ?? makePlayerSink());
+  const reactionPool = overrides.reactionPool ?? makeReactionPool();
   let clock = 0;
 
   const orchestrator = createVoiceOrchestrator({
@@ -288,15 +334,15 @@ test("orchestrator ignores bot and muted users before VAD", async () => {
   await orchestrator.start();
   await orchestrator.joinChannel({ guildId: "guild-1", channelId: "voice-1" });
 
-  await orchestrator.handleOpusPacket({ userId: "bot-1", opusPacket: Buffer.alloc(8) });
-  await orchestrator.handleOpusPacket({ userId: "u1", isBot: true, opusPacket: Buffer.alloc(8) });
+  await orchestrator.handleOpusPacket({ guildId: "guild-1", channelId: "voice-1", userId: "bot-1", opusPacket: Buffer.alloc(8) });
+  await orchestrator.handleOpusPacket({ guildId: "guild-1", channelId: "voice-1", userId: "u1", isBot: true, opusPacket: Buffer.alloc(8) });
   assert.equal(vad.pushes.length, 0);
 
   orchestrator.muteUser("u2", true);
-  await orchestrator.handleOpusPacket({ userId: "u2", opusPacket: Buffer.alloc(8) });
+  await orchestrator.handleOpusPacket({ guildId: "guild-1", channelId: "voice-1", userId: "u2", opusPacket: Buffer.alloc(8) });
   assert.equal(vad.pushes.length, 0);
 
-  await orchestrator.handleOpusPacket({ userId: "u3", opusPacket: Buffer.alloc(8) });
+  await orchestrator.handleOpusPacket({ guildId: "guild-1", channelId: "voice-1", userId: "u3", opusPacket: Buffer.alloc(8) });
   assert.equal(vad.pushes.length, 1);
   assert.equal(vad.pushes[0].userId, "u3");
 });
@@ -690,6 +736,8 @@ test("barge-in stops playback and cancels the filler immediately", async () => {
   const { orchestrator, vad, filler, playerSink } = buildOrchestrator({ llmClient: llm });
   await orchestrator.start();
   await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  playerSink.stopped = 0;
+  playerSink.cleared = 0;
 
   const turn = vad.captured.callbacks.onSpeechEnd({
     userId: "u1",
@@ -701,7 +749,6 @@ test("barge-in stops playback and cancels the filler immediately", async () => {
 
   await tick(10);
   vad.captured.callbacks.onBargeIn({ userId: "u1", timestampMs: 120 });
-
   assert.equal(filler.state.cancelled, true);
   assert.ok(playerSink.stopped >= 1);
   assert.ok(playerSink.cleared >= 1);
@@ -886,6 +933,7 @@ test("a TTS rejection during an active stream does not leak", async () => {
   });
 
   assert.equal(orchestrator.getStatus().active, true);
+  assert.equal(orchestrator.getStatus().lastError, "voice turn failed");
 });
 
 test("commands reject a missing guild and any cross-guild request", async () => {
@@ -947,4 +995,218 @@ test("mute-user denies when memberPermissions are absent or false", async () => 
   await handler.handleInteraction({ ...base, memberPermissions: { has: () => false } });
   assert.match(replies.at(-1).content, /permission/i);
   assert.equal(calls.length, 0);
+});
+
+test("decode failures drop the packet cleanly", async () => {
+  const opusTranscoder = {
+    encode: () => Buffer.alloc(2),
+    decode: () => {
+      throw new Error("bad opus");
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ opusTranscoder });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const result = await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "u1",
+    opusPacket: Buffer.alloc(8),
+  });
+
+  assert.deepEqual(result, { ignored: true, dropped: "decode" });
+  assert.equal(vad.pushes.length, 0);
+});
+
+test("a decode that outlives its session is dropped", async () => {
+  let releaseDecode;
+  const opusTranscoder = {
+    encode: () => Buffer.alloc(2),
+    decode: () =>
+      new Promise((resolve) => {
+        releaseDecode = resolve;
+      }),
+  };
+  const { orchestrator, vad } = buildOrchestrator({ opusTranscoder });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const pending = orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "u1",
+    opusPacket: Buffer.alloc(8),
+  });
+  await tick(5);
+
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+  releaseDecode(Buffer.alloc(3840));
+
+  const result = await pending;
+  assert.deepEqual(result, { ignored: true, dropped: "inactive_session" });
+  assert.equal(vad.pushes.length, 0);
+});
+
+test("a canceled turn cannot mutate history or lastBotReplyAt", async () => {
+  const llm = makeLlm({ blockGate: true });
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const canceled = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await tick(10);
+
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+  llm.releaseGate({ shouldReply: true });
+  await canceled;
+
+  assert.equal(llm.state.streamCalls, 0);
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(llm.state.messagesLog.length, 1);
+  assert.equal(llm.state.messagesLog[0].length, 1);
+});
+
+test("bot identity fails closed for uncached speakers when caches exist", async () => {
+  const client = {
+    user: { id: "bot-9" },
+    users: { cache: new Map([["human-1", { bot: false }]]) },
+    guilds: { cache: new Map() },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ client, botUserId: "bot-9" });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const ghost = await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "ghost",
+    opusPacket: Buffer.alloc(8),
+  });
+  assert.deepEqual(ghost, { ignored: true });
+  assert.equal(vad.pushes.length, 0);
+
+  await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "human-1",
+    opusPacket: Buffer.alloc(8),
+  });
+  assert.equal(vad.pushes.length, 1);
+  assert.equal(vad.pushes[0].userId, "human-1");
+});
+
+test("a large filler clip is chunked instead of tripping the accumulator limit", async () => {
+  const clip = {
+    id: "big",
+    mood: "curious_hmm",
+    frames48kOpus: [],
+    pcm24k: Buffer.alloc(512 * 1024, 1),
+  };
+  const reactionPool = makeReactionPool(clip);
+  const { orchestrator, vad, filler, playerSink } = buildOrchestrator({ reactionPool });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await tick(5);
+
+  filler.state.onFire();
+  assert.ok(playerSink.frames.length > 0);
+  await turn;
+  assert.equal(orchestrator.getStatus().lastError ?? null, null);
+});
+
+test("errors inside the filler timer are contained", async () => {
+  const reactionPool = {
+    pick() {
+      throw new Error("filler boom");
+    },
+  };
+  const llm = makeLlm({ blockGate: true });
+  const { orchestrator, vad, filler } = buildOrchestrator({ reactionPool, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await tick(5);
+
+  assert.doesNotThrow(() => filler.state.onFire());
+  assert.equal(orchestrator.getStatus().lastError, "reaction filler failed");
+
+  llm.releaseGate({ shouldReply: true });
+  await turn;
+});
+
+test("real-shaped voiceDeps wire speaking ingress and resource egress", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad, playerSink } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1", adapterCreator: "creator" });
+
+  assert.equal(shapes.deps.joined.channelId, "c1");
+  assert.equal(shapes.deps.joined.adapterCreator, "creator");
+
+  shapes.speaking.emit("start", "user-1");
+  assert.equal(shapes.subscriptions.length, 1);
+  assert.equal(shapes.subscriptions[0].options.end.behavior, 2);
+  assert.equal(shapes.subscriptions[0].options.end.duration, 240);
+
+  shapes.subscriptions[0].stream.emit("data", Buffer.alloc(8, 1));
+  await tick(5);
+  assert.equal(vad.pushes.length, 1);
+  assert.equal(vad.pushes[0].userId, "user-1");
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "user-1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await turn;
+
+  assert.equal(shapes.played.length, 1);
+  assert.equal(shapes.played[0].opts.inputType, "opus");
+  const packets = [];
+  shapes.played[0].stream.on("data", (packet) => packets.push(packet));
+  await tick(5);
+  assert.ok(packets.length >= 1);
+  assert.equal(playerSink, null);
+
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  assert.equal(shapes.connection.destroyed, true);
+  assert.equal(shapes.subscriptions[0].stream.destroyed, true);
+
+  shapes.speaking.emit("start", "user-2");
+  assert.equal(shapes.subscriptions.length, 1);
 });
