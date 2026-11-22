@@ -4,6 +4,7 @@ import { getEventListeners } from "node:events";
 import path from "node:path";
 
 import { loadConfig } from "../src/config/config.mjs";
+import { createCompanionApp } from "../src/index.mjs";
 import {
   createElevenLabsHttpStreamAdapter,
   createElevenLabsWsAdapter,
@@ -352,7 +353,7 @@ test("ReactionPool enforces 10-turn no-repeat, modes, and safe directory loading
     "../evil_clip.pcm",
     "light_chuckle_huge.pcm",
   ];
-  const wav = Buffer.concat([Buffer.from("RIFF\x2c\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\x04\x00\x00\x00", "latin1"), Buffer.from([9, 8, 7, 6])]);
+  const wav = Buffer.concat([Buffer.from("RIFF\x28\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\x04\x00\x00\x00", "latin1"), Buffer.from([9, 8, 7, 6])]);
   const dirFs = {
     existsSync: (p) => p === fakeDir,
     readdirSync: () => entries,
@@ -844,7 +845,7 @@ test("1-second (48000-byte PCM) 24kHz WAV passes stripWavHeaderIfPresent and cre
   for (let i = 0; i < pcm.length; i += 2) {
     pcm.writeInt16LE((i % 32768) - 16384, i);
   }
-  const trailingJunk = Buffer.from("INFO");
+  const trailingJunk = Buffer.from("LIST\x04\x00\x00\x00INFO", "latin1");
   const header = Buffer.alloc(44);
   header.write("RIFF", 0, "ascii");
   header.writeUInt32LE(36 + pcm.length, 4);
@@ -860,7 +861,9 @@ test("1-second (48000-byte PCM) 24kHz WAV passes stripWavHeaderIfPresent and cre
   header.write("data", 36, "ascii");
   header.writeUInt32LE(pcm.length, 40);
 
-  const wavWithTail = Buffer.concat([header, pcm, trailingJunk]);
+  const tailHeader = Buffer.from(header);
+  tailHeader.writeUInt32LE(36 + pcm.length + trailingJunk.length, 4);
+  const wavWithTail = Buffer.concat([tailHeader, pcm, trailingJunk]);
   const stripped = stripWavHeaderIfPresent(wavWithTail);
   assert.equal(stripped.length, 48000);
   assert.equal(stripped.equals(pcm), true);
@@ -1687,4 +1690,738 @@ test("ReactionPool.registerClip validates Buffer/Uint8Array types and enforces f
     }),
     false,
   );
+});
+
+function makeWalkFs({
+  dirs = {},
+  files = {},
+  real = {},
+  entries = {},
+  lstatHook = null,
+  onReaddir = null,
+  onClose = null,
+} = {}) {
+  const calls = { mkdir: [], lstat: [], arrayBuffer: 0 };
+  const dirMap = new Map(Object.entries(dirs));
+  const enoent = (target) => {
+    const err = new Error(`ENOENT: ${target}`);
+    err.code = "ENOENT";
+    return err;
+  };
+  const fileIno = (target) => 5000 + Object.keys(files).indexOf(target);
+  const dirIno = (target, overrides) =>
+    overrides.ino ?? 1000 + [...dirMap.keys()].indexOf(target);
+  const dirStat = (target, overrides) => ({
+    isSymbolicLink: () => overrides.symlink === true,
+    isDirectory: () => true,
+    isFile: () => false,
+    dev: 1,
+    ino: dirIno(target, overrides),
+    fileAttributes: overrides.fileAttributes,
+    mode: overrides.mode,
+  });
+  const fileStat = (target) => ({
+    isSymbolicLink: () => false,
+    isDirectory: () => false,
+    isFile: () => true,
+    size: files[target].length,
+    dev: 1,
+    ino: fileIno(target),
+  });
+  const fds = new Map();
+  let nextFd = 10;
+  const fsImpl = {
+    constants: { O_RDONLY: 0 },
+    existsSync: (target) => dirMap.has(target) || Object.hasOwn(files, target),
+    lstatSync(target) {
+      calls.lstat.push(target);
+      if (lstatHook) {
+        const hit = lstatHook(target, calls.lstat.filter((entry) => entry === target).length);
+        if (hit) return hit;
+      }
+      if (dirMap.has(target)) return dirStat(target, dirMap.get(target));
+      if (Object.hasOwn(files, target)) return fileStat(target);
+      throw enoent(target);
+    },
+    realpathSync(target) {
+      if (!dirMap.has(target) && !Object.hasOwn(files, target)) throw enoent(target);
+      return real[target] ?? target;
+    },
+    readdirSync(target) {
+      onReaddir?.(target);
+      return entries[target] ?? [];
+    },
+    openSync(target) {
+      const fd = nextFd++;
+      fds.set(fd, target);
+      return fd;
+    },
+    fstatSync: (fd) => fileStat(fds.get(fd)),
+    readSync(fd, target, offset, length) {
+      const source = files[fds.get(fd)];
+      source.copy(target, offset, 0, Math.min(length, source.length));
+      return Math.min(length, source.length);
+    },
+    closeSync() {
+      onClose?.();
+    },
+    mkdirSync(target, options) {
+      calls.mkdir.push({ path: target, mode: options?.mode });
+      dirMap.set(target, {});
+    },
+  };
+  return { fsImpl, calls };
+}
+
+test("C5 cache walk: loadFromDirectory rejects a symlink or reparse-point ancestor even when it resolves inside the trusted root", () => {
+  const base = path.resolve("/trusted/root");
+  const mid = path.join(base, "mid");
+  const cache = path.join(mid, "cache");
+  const realCache = path.join(base, "real", "cache");
+  const clip = path.join(realCache, "subtle_breath_ok.pcm");
+  const cases = [
+    { label: "symlink ancestor", overrides: { symlink: true } },
+    { label: "reparse-point ancestor", overrides: { fileAttributes: 0x400 } },
+  ];
+  for (const { label, overrides } of cases) {
+    const { fsImpl } = makeWalkFs({
+      dirs: { [base]: {}, [mid]: overrides, [cache]: {}, [realCache]: {} },
+      files: { [clip]: Buffer.from([1, 2, 3, 4]) },
+      // realpath returns the path unchanged, so only the per-component lstat walk can see
+      // the link; the older leaf realpath comparison has nothing to flag.
+      entries: { [cache]: ["subtle_breath_ok.pcm"] },
+    });
+    const pool = new ReactionPool();
+    assert.throws(
+      () => pool.loadFromDirectory(cache, { fsImpl, trustedRootDir: base }),
+      /symlink or reparse point/,
+      label,
+    );
+    assert.equal(pool.size, 0, label);
+  }
+});
+
+test("C5 cache walk: loadFromDirectory aborts when an ancestor is swapped after the walk", () => {
+  const base = path.resolve("/trusted/root");
+  const mid = path.join(base, "mid");
+  const cache = path.join(mid, "cache");
+  const clip = path.join(cache, "subtle_breath_ok.pcm");
+  const swaps = [
+    { label: "inode changed", swapped: { ino: 999 } },
+    { label: "became symlink", swapped: { symlink: true } },
+  ];
+  for (const { label, swapped } of swaps) {
+    const { fsImpl } = makeWalkFs({
+      dirs: { [base]: {}, [mid]: {}, [cache]: {} },
+      files: { [clip]: Buffer.from([1, 2, 3, 4]) },
+      entries: { [cache]: ["subtle_breath_ok.pcm"] },
+      lstatHook: (target, count) =>
+        target === mid && count > 1
+          ? {
+              isSymbolicLink: () => swapped.symlink === true,
+              isDirectory: () => true,
+              isFile: () => false,
+              dev: 1,
+              ino: swapped.ino ?? 1001,
+            }
+          : null,
+    });
+    const pool = new ReactionPool();
+    assert.throws(
+      () => pool.loadFromDirectory(cache, { fsImpl, trustedRootDir: base }),
+      RangeError,
+      label,
+    );
+    assert.equal(pool.size, 0, label);
+  }
+});
+
+test("C5 cache walk: createDir builds missing components with mode 0o700 only after verifying existing ancestors", () => {
+  const base = path.resolve("/trusted/root");
+  const mid = path.join(base, "mid");
+  const cache = path.join(mid, "cache");
+
+  const missing = makeWalkFs({ dirs: { [base]: {} } });
+  assert.equal(
+    new ReactionPool().loadFromDirectory(cache, {
+      fsImpl: missing.fsImpl,
+      trustedRootDir: base,
+      createDir: true,
+    }),
+    0,
+  );
+  assert.deepEqual(missing.calls.mkdir, [
+    { path: mid, mode: 0o700 },
+    { path: cache, mode: 0o700 },
+  ]);
+
+  const readOnly = makeWalkFs({ dirs: { [base]: {} } });
+  assert.equal(
+    new ReactionPool().loadFromDirectory(cache, { fsImpl: readOnly.fsImpl, trustedRootDir: base }),
+    0,
+  );
+  assert.deepEqual(readOnly.calls.mkdir, []);
+
+  const linked = makeWalkFs({ dirs: { [base]: {}, [mid]: { symlink: true } } });
+  assert.throws(
+    () =>
+      new ReactionPool().loadFromDirectory(cache, {
+        fsImpl: linked.fsImpl,
+        trustedRootDir: base,
+        createDir: true,
+      }),
+    RangeError,
+  );
+  assert.deepEqual(linked.calls.mkdir, []);
+});
+
+test("C5 declared length: registerClip rejects a value whose declared byteLength disagrees with its extent", () => {
+  class LyingBytes extends Uint8Array {
+    get byteLength() {
+      return 4;
+    }
+  }
+  const pool = new ReactionPool({ maxFileBytes: 16, maxTotalBytes: 64 });
+  assert.throws(
+    () => pool.registerClip({ id: "subtle_breath_lie", mood: "subtle_breath", pcm24k: new LyingBytes(64) }),
+    RangeError,
+  );
+  assert.throws(
+    () =>
+      pool.registerClip({
+        id: "subtle_breath_lie_frame",
+        mood: "subtle_breath",
+        frames48kOpus: [new LyingBytes(64)],
+      }),
+    RangeError,
+  );
+  // A lie that stays under every cap is only caught by comparing the clone with the declared
+  // length, so this case isolates the post-copy measurement from the cap checks.
+  assert.throws(
+    () => pool.registerClip({ id: "subtle_breath_small_lie", mood: "subtle_breath", pcm24k: new LyingBytes(8) }),
+    /declared byte length does not match/,
+  );
+  assert.throws(
+    () =>
+      pool.registerClip({
+        id: "subtle_breath_small_lie_frame",
+        mood: "subtle_breath",
+        frames48kOpus: [new LyingBytes(8)],
+      }),
+    /declared byte length does not match/,
+  );
+  assert.equal(pool.size, 0);
+  assert.equal(pool.totalBytes, 0);
+});
+
+test("C5 outer RIFF length: stripWavHeaderIfPresent rejects a declared container size that disagrees with the buffer", () => {
+  const good = buildCustomWavBuffer();
+  assert.equal(stripWavHeaderIfPresent(good).length, 4);
+
+  const tooBig = Buffer.from(good);
+  tooBig.writeUInt32LE(good.length - 8 + 100, 4);
+  assert.throws(() => stripWavHeaderIfPresent(tooBig), /RIFF/i);
+
+  const tooSmall = Buffer.from(good);
+  tooSmall.writeUInt32LE(good.length - 8 - 2, 4);
+  assert.throws(() => stripWavHeaderIfPresent(tooSmall), /RIFF/i);
+
+  const trailing = Buffer.concat([good, Buffer.from([9, 9, 9, 9])]);
+  assert.throws(() => stripWavHeaderIfPresent(trailing), /RIFF/i);
+
+  const sentinel = Buffer.from(good);
+  sentinel.writeUInt32LE(0xffffffff, 4);
+  assert.equal(stripWavHeaderIfPresent(sentinel).length, 4);
+});
+
+test("C5 outer RIFF length: OpenAI streaming adapter rejects a stream whose total size disagrees with the RIFF header", async () => {
+  const run = async (mutate) => {
+    const wav = mutate(buildCustomWavBuffer());
+    const adapter = createOpenAiTtsAdapter({
+      apiKey: "k",
+      baseUrl: "https://tts.example.com/v1",
+      fetchImpl: async () => new Response(wav, { status: 200 }),
+    });
+    return adapter.synthesizeClause({ text: "riff", onPcmChunk: () => {} });
+  };
+  const ok = await run((wav) => wav);
+  assert.equal(ok.byteLength, 4);
+  await assert.rejects(
+    run((wav) => {
+      wav.writeUInt32LE(wav.length - 8 + 64, 4);
+      return wav;
+    }),
+    /RIFF/i,
+  );
+  await assert.rejects(run((wav) => Buffer.concat([wav, Buffer.from([7, 7])])), /RIFF/i);
+  const sentinel = await run((wav) => {
+    wav.writeUInt32LE(0xffffffff, 4);
+    return wav;
+  });
+  assert.equal(sentinel.byteLength, 4);
+});
+
+test("C5 injected non-streaming responses: any body that cannot be read incrementally is rejected before it is read", async () => {
+  const makeResponse = ({ contentLength, bytes }) => {
+    const state = { reads: 0 };
+    const headers = new Headers();
+    if (contentLength !== undefined) headers.set("content-length", String(contentLength));
+    return {
+      state,
+      response: {
+        ok: true,
+        status: 200,
+        body: null,
+        headers,
+        async arrayBuffer() {
+          state.reads += 1;
+          return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        },
+      },
+    };
+  };
+  const synth = async (fixture, factory) => {
+    const adapter = factory(async () => fixture.response);
+    return adapter.synthesizeClause({ text: "inject", onPcmChunk: () => {} });
+  };
+  const factories = [
+    (fetchImpl) => createElevenLabsHttpStreamAdapter({ apiKey: "k", voiceId: "v1", maxAudioBytes: 1024, fetchImpl }),
+    (fetchImpl) =>
+      createOpenAiTtsAdapter({
+        apiKey: "k",
+        baseUrl: "https://tts.example.com/v1",
+        maxAudioBytes: 1024,
+        fetchImpl,
+      }),
+  ];
+  for (const factory of factories) {
+    const oversized = makeResponse({ contentLength: 10 * 1024 * 1024, bytes: Buffer.alloc(4) });
+    await assert.rejects(synth(oversized, factory), /size|stream/i);
+    assert.equal(oversized.state.reads, 0, "oversized declared length must be rejected before reading");
+
+    const unknown = makeResponse({ bytes: Buffer.alloc(4) });
+    await assert.rejects(synth(unknown, factory), /size|stream/i);
+    assert.equal(unknown.state.reads, 0, "unknown length must be rejected before reading");
+
+    // A declared length is attacker-controlled metadata: even a small, honest-looking value
+    // cannot bound arrayBuffer(), so a body that is not a stream is never buffered.
+    const lying = makeResponse({ contentLength: 4, bytes: Buffer.alloc(2048) });
+    await assert.rejects(synth(lying, factory), /stream/i);
+    assert.equal(lying.state.reads, 0, "a declared length must not unlock arrayBuffer()");
+
+    const honest = makeResponse({ contentLength: 4, bytes: Buffer.from([1, 2, 3, 4]) });
+    await assert.rejects(synth(honest, factory), /stream/i);
+    assert.equal(honest.state.reads, 0);
+  }
+});
+
+test("C5 rework: without createDir a missing intermediate ancestor ends the load instead of being skipped", () => {
+  const base = path.resolve("/trusted/root");
+  const mid = path.join(base, "mid");
+  const cache = path.join(mid, "cache");
+  const clip = path.join(cache, "subtle_breath_ok.pcm");
+  // The leaf exists while its parent does not: the shape left by a concurrent create or
+  // replace. Every later check would run against an unverified component.
+  const { fsImpl, calls } = makeWalkFs({
+    dirs: { [base]: {}, [cache]: {} },
+    files: { [clip]: Buffer.from([1, 2, 3, 4]) },
+    entries: { [cache]: ["subtle_breath_ok.pcm"] },
+  });
+  const pool = new ReactionPool();
+  assert.equal(pool.loadFromDirectory(cache, { fsImpl, trustedRootDir: base }), 0);
+  assert.equal(pool.size, 0);
+  assert.deepEqual(calls.mkdir, []);
+});
+
+test("C5 rework: the ancestor chain is verified before the directory is listed", () => {
+  const base = path.resolve("/trusted/root");
+  const mid = path.join(base, "mid");
+  const cache = path.join(mid, "cache");
+  const clip = path.join(cache, "subtle_breath_ok.pcm");
+  const swaps = [
+    { label: "inode changed", swapped: { ino: 999 } },
+    { label: "became symlink", swapped: { symlink: true } },
+  ];
+  for (const { label, swapped } of swaps) {
+    let cacheLstats = 0;
+    let listed = false;
+    const { fsImpl } = makeWalkFs({
+      dirs: { [base]: {}, [mid]: {}, [cache]: {} },
+      files: { [clip]: Buffer.from([1, 2, 3, 4]) },
+      entries: { [cache]: ["subtle_breath_ok.pcm"] },
+      // The ancestor is swapped after the walk and restored before the listing returns, so
+      // only a check that runs before readdirSync can see it.
+      lstatHook: (target) => {
+        if (target === cache) cacheLstats += 1;
+        if (target === mid && cacheLstats >= 2 && !listed) {
+          return {
+            isSymbolicLink: () => swapped.symlink === true,
+            isDirectory: () => true,
+            isFile: () => false,
+            dev: 1,
+            ino: swapped.ino ?? 1001,
+          };
+        }
+        return null;
+      },
+      onReaddir: () => {
+        listed = true;
+      },
+    });
+    const pool = new ReactionPool();
+    assert.throws(
+      () => pool.loadFromDirectory(cache, { fsImpl, trustedRootDir: base }),
+      /changed during load/,
+      label,
+    );
+    assert.equal(pool.size, 0, label);
+  }
+});
+
+test("C5 rework: an ancestor swapped while the directory is listed is detected right after the listing", () => {
+  const base = path.resolve("/trusted/root");
+  const mid = path.join(base, "mid");
+  const cache = path.join(mid, "cache");
+  const clip = path.join(cache, "subtle_breath_ok.pcm");
+  const swaps = [
+    { label: "inode changed", swapped: { ino: 999 } },
+    { label: "became symlink", swapped: { symlink: true } },
+  ];
+  for (const { label, swapped } of swaps) {
+    let listed = false;
+    const { fsImpl } = makeWalkFs({
+      dirs: { [base]: {}, [mid]: {}, [cache]: {} },
+      files: { [clip]: Buffer.from([1, 2, 3, 4]) },
+      // No entry matches the clip pattern, so no per-entry check runs: only the check right
+      // after the listing can notice the swap.
+      entries: { [cache]: ["notes.txt"] },
+      lstatHook: (target) =>
+        target === mid && listed
+          ? {
+              isSymbolicLink: () => swapped.symlink === true,
+              isDirectory: () => true,
+              isFile: () => false,
+              dev: 1,
+              ino: swapped.ino ?? 1001,
+            }
+          : null,
+      onReaddir: () => {
+        listed = true;
+      },
+    });
+    const pool = new ReactionPool();
+    assert.throws(
+      () => pool.loadFromDirectory(cache, { fsImpl, trustedRootDir: base }),
+      /changed during load/,
+      label,
+    );
+    assert.equal(pool.size, 0, label);
+  }
+});
+
+test("C5 rework: createCompanionApp creates the private cache directory through the verified walk", async () => {
+  const base = path.resolve("/trusted/root");
+  const envPath = path.join(base, ".env");
+  const envText = [
+    "DISCORD_BOT_TOKEN=bot-token",
+    "DISCORD_APP_ID=app-1",
+    "LLM_PROVIDER=deepseek",
+    "LLM_API_KEY=llm-k",
+    "STT_PROVIDER=deepgram",
+    "DEEPGRAM_API_KEY=dg-k",
+    "TTS_PROVIDER=elevenlabs",
+    "ELEVENLABS_API_KEY=el-k",
+    "ELEVENLABS_VOICE_ID=v-1",
+    "REACTION_CACHE_DIR=.cache/reactions",
+  ].join("\n");
+  const { fsImpl, calls } = makeWalkFs({
+    dirs: { [base]: {} },
+    files: { [envPath]: Buffer.from(envText) },
+  });
+  fsImpl.readFileSync = (target) => {
+    if (target !== envPath) {
+      const err = new Error(`ENOENT: ${target}`);
+      err.code = "ENOENT";
+      throw err;
+    }
+    return envText;
+  };
+  const app = await createCompanionApp({
+    env: {},
+    envPath,
+    configPath: path.join(base, "config.json"),
+    soulPath: path.join(base, "SOUL.md"),
+    trustedRootDir: base,
+    fsImpl,
+    createDiscordClientImpl: () => ({ login: async () => "ok", destroy() {} }),
+    createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
+    createTtsAdapterImpl: () => ({
+      name: () => "elevenlabs-ws",
+      async warmup() {},
+      async synthesizeClause() {},
+      close() {},
+    }),
+    createSttAdapterImpl: () => ({ name: () => "deepgram", async transcribe() {}, close() {} }),
+    createVoiceOrchestratorImpl: () => ({ async start() {}, close() {} }),
+    createCommandHandlerImpl: () => ({ commands: [], async handleInteraction() {} }),
+  });
+  assert.deepEqual(calls.mkdir, [
+    { path: path.join(base, ".cache"), mode: 0o700 },
+    { path: path.join(base, ".cache", "reactions"), mode: 0o700 },
+  ]);
+  await app.stop();
+});
+
+test("C5 rework: registerClip rejects an oversized container from its intrinsic size before any copy is attempted", () => {
+  let lengthReads = 0;
+  class LyingLength extends Uint8Array {
+    get length() {
+      lengthReads += 1;
+      return 4;
+    }
+    get byteLength() {
+      return 4;
+    }
+  }
+  const pool = new ReactionPool({ maxFileBytes: 16, maxTotalBytes: 64 });
+  assert.throws(
+    () => pool.registerClip({ id: "subtle_breath_big", mood: "subtle_breath", pcm24k: new LyingLength(64) }),
+    /maximum file byte limit/,
+  );
+  assert.throws(
+    () =>
+      pool.registerClip({
+        id: "subtle_breath_big_frame",
+        mood: "subtle_breath",
+        frames48kOpus: [new LyingLength(64)],
+      }),
+    /maximum file byte limit/,
+  );
+  assert.equal(lengthReads, 0, "the copy path must not run for an over-cap container");
+  assert.equal(pool.size, 0);
+  assert.equal(pool.totalBytes, 0);
+});
+
+test("C5 rework: the streaming OpenAI adapter rejects a RIFF overrun in the first chunk before emitting any audio", async () => {
+  const good = buildCustomWavBuffer();
+  const overrun = Buffer.concat([good, Buffer.from([5, 6, 7, 8])]);
+  const emitted = [];
+  const adapter = createOpenAiTtsAdapter({
+    apiKey: "k",
+    baseUrl: "https://tts.example.com/v1",
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(overrun);
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  await assert.rejects(
+    adapter.synthesizeClause({ text: "overrun", onPcmChunk: (chunk) => emitted.push(Buffer.from(chunk)) }),
+    /RIFF/i,
+  );
+  assert.equal(emitted.length, 0, "no PCM may reach the caller once the overrun is already known");
+});
+
+test("C5 rework: an ancestor swapped between clip reads aborts the remaining load", () => {
+  const base = path.resolve("/trusted/root");
+  const mid = path.join(base, "mid");
+  const cache = path.join(mid, "cache");
+  const first = path.join(cache, "subtle_breath_a.pcm");
+  const second = path.join(cache, "subtle_breath_b.pcm");
+  let swapped = false;
+  const { fsImpl } = makeWalkFs({
+    dirs: { [base]: {}, [mid]: {}, [cache]: {} },
+    files: { [first]: Buffer.from([1, 2, 3, 4]), [second]: Buffer.from([5, 6, 7, 8]) },
+    entries: { [cache]: ["subtle_breath_a.pcm", "subtle_breath_b.pcm"] },
+    lstatHook: (target) =>
+      target === mid && swapped
+        ? { isSymbolicLink: () => true, isDirectory: () => true, isFile: () => false, dev: 1, ino: 1001 }
+        : null,
+    onClose: () => {
+      swapped = true;
+    },
+  });
+  const pool = new ReactionPool();
+  assert.throws(
+    () => pool.loadFromDirectory(cache, { fsImpl, trustedRootDir: base }),
+    /changed during load/,
+  );
+  assert.equal(pool.size, 0, "a clip read after the swap must not be registered");
+});
+
+const INTRINSIC_VIEW_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  "byteLength",
+).get;
+
+test("C5 rework 2: a length-tracking view that grows when its declared length is read cannot retain more than the cap", () => {
+  const backing = new ArrayBuffer(4, { maxByteLength: 16 });
+  let reads = 0;
+  class GrowingView extends Uint8Array {
+    get byteLength() {
+      reads += 1;
+      backing.resize(8);
+      return Reflect.apply(INTRINSIC_VIEW_BYTE_LENGTH, this, []);
+    }
+  }
+  const pool = new ReactionPool({ maxFileBytes: 4, maxTotalBytes: 16 });
+  assert.throws(
+    () => pool.registerClip({ id: "subtle_breath_grow", mood: "subtle_breath", pcm24k: new GrowingView(backing) }),
+    RangeError,
+  );
+  assert.equal(reads, 1);
+  assert.equal(pool.size, 0);
+  assert.equal(pool.totalBytes, 0);
+
+  const frameBacking = new ArrayBuffer(4, { maxByteLength: 16 });
+  let frameReads = 0;
+  class GrowingFrame extends Uint8Array {
+    get byteLength() {
+      frameReads += 1;
+      frameBacking.resize(8);
+      return Reflect.apply(INTRINSIC_VIEW_BYTE_LENGTH, this, []);
+    }
+  }
+  assert.throws(
+    () =>
+      pool.registerClip({
+        id: "subtle_breath_grow_frame",
+        mood: "subtle_breath",
+        frames48kOpus: [new GrowingFrame(frameBacking)],
+      }),
+    RangeError,
+  );
+  assert.equal(frameReads, 1);
+  assert.equal(pool.size, 0);
+  assert.equal(pool.totalBytes, 0);
+});
+
+test("C5 rework 2: the copy uses the extent saved at snapshot time, so a growth during the declared read is never copied", () => {
+  const backing = new ArrayBuffer(4, { maxByteLength: 16 });
+  new Uint8Array(backing).set([1, 2, 3, 4]);
+  let reads = 0;
+  class GrowingQuietly extends Uint8Array {
+    get byteLength() {
+      reads += 1;
+      backing.resize(8);
+      return 4;
+    }
+  }
+  const pool = new ReactionPool({ maxFileBytes: 16, maxTotalBytes: 64 });
+  assert.equal(
+    pool.registerClip({ id: "subtle_breath_quiet", mood: "subtle_breath", pcm24k: new GrowingQuietly(backing) }),
+    true,
+  );
+  assert.equal(reads, 1, "the declared length is read once");
+  assert.equal(backing.byteLength, 8, "the buffer really did grow");
+  const retained = pool.clips.get("subtle_breath_quiet").pcm24k;
+  assert.deepEqual([...retained], [1, 2, 3, 4]);
+  assert.equal(pool.totalBytes, 4);
+});
+
+test("C5 rework 2: the frames list is read once as a fixed snapshot", () => {
+  const frames = [Buffer.from([1, 2]), Buffer.from([3, 4])];
+  let lengthReads = 0;
+  const watched = new Proxy(frames, {
+    get(target, key, receiver) {
+      if (key === "length") lengthReads += 1;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const pool = new ReactionPool({ maxFileBytes: 16, maxTotalBytes: 64 });
+  assert.equal(
+    pool.registerClip({ id: "subtle_breath_snap", mood: "subtle_breath", frames48kOpus: watched }),
+    true,
+  );
+  assert.equal(lengthReads, 1, "the list length must be read once, then a fixed snapshot is used");
+  assert.equal(pool.totalBytes, 4);
+});
+
+test("C5 rework 3: a view that shrinks and regrows its backing store is rejected before any copy and its getter runs once", () => {
+  const backing = new ArrayBuffer(8, { maxByteLength: 16 });
+  let reads = 0;
+  class ShrinkRegrow extends Uint8Array {
+    get byteLength() {
+      reads += 1;
+      // First read shrinks the store, so a pinned fixed view goes out of bounds and reports
+      // length 0. A second read would regrow it to 8 and let a copy see 8 bytes.
+      if (reads === 1) backing.resize(0);
+      if (reads === 2) backing.resize(8);
+      return Reflect.apply(INTRINSIC_VIEW_BYTE_LENGTH, this, []);
+    }
+  }
+  const pool = new ReactionPool({ maxFileBytes: 4, maxTotalBytes: 16 });
+  assert.throws(
+    () => pool.registerClip({ id: "subtle_breath_shrink", mood: "subtle_breath", pcm24k: new ShrinkRegrow(backing, 0, 8) }),
+    /maximum file byte limit/,
+  );
+  assert.equal(reads, 1, "caller metadata is read once, before the checks, never while cloning");
+  assert.equal(pool.size, 0);
+  assert.equal(pool.totalBytes, 0);
+
+  reads = 0;
+  backing.resize(8);
+  assert.throws(
+    () =>
+      pool.registerClip({
+        id: "subtle_breath_shrink_frame",
+        mood: "subtle_breath",
+        frames48kOpus: [new ShrinkRegrow(backing, 0, 8)],
+      }),
+    /maximum file byte limit/,
+  );
+  assert.equal(reads, 1);
+  assert.equal(pool.size, 0);
+});
+
+test("C5 rework 3: declared byteLength is captured once, so a value that reports different lengths cannot retarget the copy", () => {
+  class ShiftingBytes extends Uint8Array {
+    reads = 0;
+    get byteLength() {
+      this.reads += 1;
+      return this.reads === 1 ? 2 : 8;
+    }
+  }
+  const pool = new ReactionPool({ maxFileBytes: 16, maxTotalBytes: 10 });
+  assert.equal(
+    pool.registerClip({ id: "subtle_breath_kept", mood: "subtle_breath", pcm24k: Buffer.alloc(4, 1) }),
+    true,
+  );
+  const shifting = new ShiftingBytes(8);
+  assert.throws(
+    () => pool.registerClip({ id: "subtle_breath_shift", mood: "subtle_breath", pcm24k: shifting }),
+    /declared byte length does not match/,
+  );
+  assert.equal(shifting.reads, 1, "the getter must not run again while cloning");
+  assert.equal(pool.size, 1);
+  assert.equal(pool.totalBytes, 4);
+});
+
+test("C5 rework 3: a backing store that shrinks after the extent is saved fails closed instead of retaining a short clone", () => {
+  const backing = new ArrayBuffer(8, { maxByteLength: 16 });
+  new Uint8Array(backing).set([1, 2, 3, 4, 5, 6, 7, 8]);
+  class Shrinker extends Uint8Array {
+    get byteLength() {
+      // Runs after the first container's extent was measured and saved.
+      backing.resize(0);
+      return 0;
+    }
+  }
+  const pool = new ReactionPool({ maxFileBytes: 16, maxTotalBytes: 64 });
+  assert.throws(
+    () =>
+      pool.registerClip({
+        id: "subtle_breath_shrunk",
+        mood: "subtle_breath",
+        frames48kOpus: [new Uint8Array(backing, 0, 4), new Shrinker(new ArrayBuffer(0))],
+      }),
+    RangeError,
+  );
+  assert.equal(pool.size, 0);
+  assert.equal(pool.totalBytes, 0);
 });

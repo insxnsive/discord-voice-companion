@@ -71,6 +71,170 @@ function computeClipBytes({ frames48kOpus = [], pcm24k = null }) {
   return total;
 }
 
+// Intrinsic typed-array accessors. A subclass or exotic value can override byteLength,
+// length, buffer and byteOffset, so the real extent is read from %TypedArray%.prototype.
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const INTRINSIC_BYTE_LENGTH = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteLength").get;
+const INTRINSIC_BYTE_OFFSET = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteOffset").get;
+const INTRINSIC_BUFFER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "buffer").get;
+
+function intrinsicByteLength(value) {
+  return Reflect.apply(INTRINSIC_BYTE_LENGTH, value, []);
+}
+
+/**
+ * Take one fixed snapshot of everything a clip will copy: the pcm24k container and each entry
+ * of the frames list, in order. The frames list length and each element are read once. For
+ * every container the backing buffer, offset and extent are measured once through the
+ * intrinsic accessors and saved as plain numbers, and only then is the caller's declared
+ * byteLength read, once. A fixed-length view over a resizable buffer goes out of bounds when
+ * the store shrinks and regains its length when it regrows, so no view is kept: every check
+ * works on the saved numbers, and the copy rebuilds an exact-extent view that throws if the
+ * store no longer covers it. No caller accessor runs after this function returns.
+ */
+function snapshotClipSources({ frames48kOpus = [], pcm24k = null }) {
+  const sources = [];
+  const add = (value, label) => {
+    assertAudioBytes(value, label);
+    const buffer = Reflect.apply(INTRINSIC_BUFFER, value, []);
+    const offset = Reflect.apply(INTRINSIC_BYTE_OFFSET, value, []);
+    const extent = intrinsicByteLength(value);
+    const declared = value.byteLength;
+    sources.push({ label, buffer, offset, extent, declared });
+  };
+  if (pcm24k !== null && pcm24k !== undefined) add(pcm24k, "pcm24k");
+  if (!Array.isArray(frames48kOpus)) {
+    throw new TypeError("frames48kOpus must be an array of Buffer or Uint8Array values");
+  }
+  const count = frames48kOpus.length;
+  const frames = [];
+  for (let index = 0; index < count; index += 1) frames.push(frames48kOpus[index]);
+  for (const frame of frames) add(frame, "frames48kOpus entry");
+  return sources;
+}
+
+/**
+ * Copy exactly the saved extent. The source view is built with an explicit length, so a
+ * backing store that shrank below the saved extent throws a RangeError instead of yielding a
+ * short or regrown copy, and the allocation is exactly the extent that the caps already bounded.
+ */
+function copySavedExtent({ buffer, offset, extent }) {
+  const source = new Uint8Array(buffer, offset, extent);
+  const clone = Buffer.alloc(extent);
+  clone.set(source);
+  return clone;
+}
+
+const FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+
+/**
+ * True for anything that is not a plain directory entry: symlinks, and on Windows junctions
+ * and other reparse points (Node reports junctions as symlinks; fs implementations that
+ * expose a reparse flag or raw file attributes are honoured too).
+ */
+function isLinkLike(stats) {
+  if (!stats) return true;
+  if (stats.isSymbolicLink?.() === true) return true;
+  if (stats.isReparsePoint?.() === true || stats.isJunction?.() === true) return true;
+  if (
+    Number.isInteger(stats.fileAttributes) &&
+    (stats.fileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) !== 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function sameIdentity(recorded, stats) {
+  if (
+    Number.isFinite(recorded.dev) &&
+    Number.isFinite(stats?.dev) &&
+    typeof recorded.ino === "number" &&
+    recorded.ino > 0 &&
+    typeof stats?.ino === "number" &&
+    stats.ino > 0
+  ) {
+    return recorded.dev === stats.dev && recorded.ino === stats.ino;
+  }
+  return true;
+}
+
+function lstatOrNull(fsImpl, target) {
+  try {
+    return fsImpl.lstatSync(target);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * Walk every component from the trusted root down to the cache directory with lstat and
+ * return the verified chain, or null when the directory is absent or not a directory. Any
+ * symlink or reparse point below the root throws. With createDir, missing components are
+ * created one at a time (mode 0o700) only after every existing ancestor above them passed.
+ */
+function walkTrustedChain(dirPath, trustedRootDir, fsImpl, createDir) {
+  const absRoot = path.resolve(trustedRootDir);
+  const absDir = path.resolve(dirPath);
+  const rel = path.relative(absRoot, absDir);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new RangeError("Reaction cache directory is outside trusted root");
+  }
+
+  let current = absRoot;
+  if (typeof fsImpl.realpathSync === "function") {
+    try {
+      current = path.normalize(fsImpl.realpathSync(absRoot));
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  const segments = rel === "" ? [] : rel.split(path.sep);
+  const chain = [];
+  for (let index = 0; index < segments.length; index += 1) {
+    const isLeaf = index === segments.length - 1;
+    current = path.join(current, segments[index]);
+    let stats = lstatOrNull(fsImpl, current);
+    if (!stats) {
+      // A missing component ends the load. Skipping a missing intermediate would leave it
+      // unchecked by every later step if it appears or is replaced concurrently.
+      if (!createDir || typeof fsImpl.mkdirSync !== "function") return null;
+      fsImpl.mkdirSync(current, { mode: 0o700 });
+      stats = fsImpl.lstatSync(current);
+    }
+    if (isLinkLike(stats)) {
+      throw new RangeError(
+        isLeaf
+          ? "Reaction cache directory cannot be a symlink"
+          : "Reaction cache path component cannot be a symlink or reparse point",
+      );
+    }
+    if (!stats.isDirectory?.()) return null;
+    if (process.platform !== "win32" && Number.isInteger(stats.mode) && (stats.mode & 0o002) !== 0) {
+      throw new RangeError("Reaction cache path component cannot be world-writable");
+    }
+    chain.push({ path: current, dev: stats.dev, ino: stats.ino });
+  }
+  return chain;
+}
+
+function verifyChainUnchanged(chain, fsImpl) {
+  for (const entry of chain) {
+    let stats = null;
+    try {
+      stats = fsImpl.lstatSync(entry.path);
+    } catch {
+      stats = null;
+    }
+    if (isLinkLike(stats) || !stats.isDirectory?.() || !sameIdentity(entry, stats)) {
+      throw new RangeError("Reaction cache path changed during load");
+    }
+  }
+}
+
 /**
  * Mood-bucketed reaction audio pool with an LRU cooldown window so short
  * reaction cues do not repeat back-to-back across long voice sessions.
@@ -105,8 +269,17 @@ export class ReactionPool {
     if (!REACTION_MOODS.includes(mood)) {
       throw new RangeError(`Invalid reaction mood: ${mood}`);
     }
-    const clipBytes = computeClipBytes({ frames48kOpus, pcm24k });
+    const sources = snapshotClipSources({ frames48kOpus, pcm24k });
+    let clipBytes = 0;
+    for (const source of sources) clipBytes += source.declared;
     if (clipBytes > this.maxFileBytes) {
+      throw new RangeError("Reaction clip exceeds maximum file byte limit");
+    }
+    // The declared byteLength is caller-controlled. Bound the copy by the saved extents, so
+    // peak allocation never exceeds one clip cap and the copy cannot see a larger extent.
+    let pinnedBytes = 0;
+    for (const source of sources) pinnedBytes += source.extent;
+    if (pinnedBytes > this.maxFileBytes) {
       throw new RangeError("Reaction clip exceeds maximum file byte limit");
     }
     if (this.clips.size >= this.maxClips && !this.clips.has(id)) {
@@ -117,15 +290,30 @@ export class ReactionPool {
     if (nextTotalBytes > this.maxTotalBytes) {
       throw new RangeError("ReactionPool exceeded 8 MiB aggregate byte limit");
     }
-    const clonedPcm = pcm24k ? Buffer.from(pcm24k) : null;
-    const clonedFrames = Object.freeze(
-      Array.isArray(frames48kOpus) ? frames48kOpus.map((frame) => Buffer.from(frame)) : [],
-    );
+    for (const source of sources) {
+      if (source.declared !== source.extent) {
+        throw new RangeError(`${source.label} declared byte length does not match its extent`);
+      }
+    }
+    const clones = sources.map((source) => ({ label: source.label, clone: copySavedExtent(source) }));
+    const clonedPcm = clones.find((entry) => entry.label === "pcm24k")?.clone ?? null;
+    const clonedFrameList = clones
+      .filter((entry) => entry.label !== "pcm24k")
+      .map((entry) => entry.clone);
+    const clonedBytes = clones.reduce((sum, entry) => sum + entry.clone.length, 0);
+    if (clonedBytes > this.maxFileBytes) {
+      throw new RangeError("Reaction clip exceeds maximum file byte limit");
+    }
+    const clonedTotalBytes = this.totalBytes - prevBytes + clonedBytes;
+    if (clonedTotalBytes > this.maxTotalBytes) {
+      throw new RangeError("ReactionPool exceeded 8 MiB aggregate byte limit");
+    }
+    const clonedFrames = Object.freeze(clonedFrameList);
     this.clips.set(
       id,
       Object.freeze({ id, mood, frames48kOpus: clonedFrames, pcm24k: clonedPcm }),
     );
-    this.totalBytes = nextTotalBytes;
+    this.totalBytes = clonedTotalBytes;
     return true;
   }
 
@@ -173,10 +361,24 @@ export class ReactionPool {
 
   loadFromDirectory(
     dirPath,
-    { fsImpl = fs, maxFileBytes = this.maxFileBytes, trustedRootDir } = {},
+    { fsImpl = fs, maxFileBytes = this.maxFileBytes, trustedRootDir, createDir = false } = {},
   ) {
     if (!dirPath) return 0;
-    if (typeof fsImpl.existsSync === "function" && !fsImpl.existsSync(dirPath)) {
+
+    // With a trusted root, every component below it is verified with lstat before anything
+    // is read, and re-verified around each read. Residual race: Node has no openat, so a
+    // component swapped and restored between a verification and the path-based open can
+    // still go unseen; the descriptor identity checks below and the 0o700 private directory
+    // (POSIX only, Windows relies on profile ACLs) narrow that window but do not close it.
+    let chain = [];
+    const anchored =
+      typeof trustedRootDir === "string" &&
+      trustedRootDir.trim().length > 0 &&
+      typeof fsImpl.lstatSync === "function";
+    if (anchored) {
+      chain = walkTrustedChain(dirPath, trustedRootDir, fsImpl, createDir === true);
+      if (chain === null) return 0;
+    } else if (typeof fsImpl.existsSync === "function" && !fsImpl.existsSync(dirPath)) {
       return 0;
     }
 
@@ -222,6 +424,9 @@ export class ReactionPool {
         ? Math.min(this.maxFileBytes, maxFileBytes)
         : this.maxFileBytes;
 
+    // Verify the ancestors immediately before the listing and again right after it, so the
+    // listing is bracketed by two checks and a swap during it cannot go unseen.
+    verifyChainUnchanged(chain, fsImpl);
     let entries;
     try {
       entries = fsImpl.readdirSync(resolvedDir);
@@ -229,6 +434,7 @@ export class ReactionPool {
       if (error && error.code === "ENOENT") return 0;
       throw error;
     }
+    verifyChainUnchanged(chain, fsImpl);
 
     const hasDescriptorFs =
       typeof fsImpl.openSync === "function" &&
@@ -241,6 +447,7 @@ export class ReactionPool {
       if (this.size >= this.maxClips) break;
       const match = CLIP_FILENAME_PATTERN.exec(entry);
       if (!match) continue;
+      verifyChainUnchanged(chain, fsImpl);
 
       const fullPath = path.join(resolvedDir, entry);
       if (typeof fsImpl.realpathSync === "function") {
@@ -338,6 +545,7 @@ export class ReactionPool {
       }
 
       const mood = match[1].toLowerCase();
+      verifyChainUnchanged(chain, fsImpl);
       const slug = match[2];
       const ext = match[3].toLowerCase();
       let pcm24k;

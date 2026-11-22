@@ -111,6 +111,9 @@ export async function createCompanionApp({
   reactionPool.loadFromDirectory(cacheDir, {
     fsImpl,
     trustedRootDir: resolvedTrustedRoot,
+    // Missing cache components are created at 0o700 through the verified walk, so the
+    // private directory is the only writable thing below the trusted root.
+    createDir: true,
   });
 
   const latencyTracker = new LatencyTracker();
