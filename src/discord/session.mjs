@@ -22,6 +22,8 @@ export const REQUIRED_VOICE_PERMISSIONS = Object.freeze(["Connect", "Speak"]);
 
 const MIN_NODE = "22.12.0";
 const MAX_SPEAKER_CACHE = 256;
+const MAX_SPEAKER_FETCHES = 64;
+const SPEAKER_NEGATIVE_TTL_MS = 60000;
 const DAVE_MODULES = Object.freeze(["@discordjs/voice", "@snazzah/davey"]);
 const MAX_PCM_CHUNK_BYTES = 245760;
 
@@ -110,6 +112,7 @@ export function createVoiceOrchestrator({
   let activePlaybackUserId = null;
 
   const speakerBotCache = new Map();
+  const speakerFetchInFlight = new Map();
 
   const state = {
     active: false,
@@ -169,6 +172,31 @@ export function createVoiceOrchestrator({
       }
     }
     return true;
+  }
+
+  function captureSessionSnapshot() {
+    return {
+      epoch: state.sessionEpoch,
+      token: state.sessionToken,
+      connection: voiceConnection,
+      guildId: state.guildId,
+      channelId: state.channelId,
+    };
+  }
+
+  function isSnapshotCurrent(snap) {
+    return Boolean(
+      snap &&
+        state.active &&
+        !state.closed &&
+        state.daveReady &&
+        state.sessionEpoch === snap.epoch &&
+        state.sessionToken === snap.token &&
+        voiceConnection === snap.connection &&
+        state.guildId === snap.guildId &&
+        state.channelId === snap.channelId &&
+        verifyLiveChannelBinding(),
+    );
   }
 
   function isTurnLive(turn) {
@@ -252,43 +280,67 @@ export function createVoiceOrchestrator({
     return undefined;
   }
 
-  function rememberSpeaker(userId, isBot) {
+  function rememberSpeaker(userId, isBot, expiresAt) {
     if (speakerBotCache.size >= MAX_SPEAKER_CACHE) {
       const oldest = speakerBotCache.keys().next().value;
       speakerBotCache.delete(oldest);
     }
-    speakerBotCache.set(userId, isBot);
+    speakerBotCache.set(userId, { isBot, expiresAt });
+  }
+
+  function cachedSpeakerBot(userId) {
+    const entry = speakerBotCache.get(userId);
+    if (!entry) return undefined;
+    if (entry.expiresAt > now()) return entry.isBot;
+    speakerBotCache.delete(userId);
+    return undefined;
   }
 
   async function ensureSpeakerKnown(userId, guildId) {
     const usersCache = state.client?.users?.cache;
     const guildsCache = state.client?.guilds?.cache;
     if (!usersCache && !guildsCache) return false;
-    if (speakerBotCache.has(userId)) return speakerBotCache.get(userId);
+
+    const cached = cachedSpeakerBot(userId);
+    if (cached !== undefined) return cached;
 
     const known = lookupBot(userId, guildId);
     if (known !== undefined) {
-      rememberSpeaker(userId, known);
+      rememberSpeaker(userId, known, Infinity);
       return known;
     }
 
-    const guild = guildsCache?.get?.(guildId);
+    const inFlight = speakerFetchInFlight.get(userId);
+    if (inFlight) return await inFlight;
+    if (speakerFetchInFlight.size >= MAX_SPEAKER_FETCHES) return true;
+
+    const pending = (async () => {
+      try {
+        const guild = guildsCache?.get?.(guildId);
+        let fetched = null;
+        if (typeof guild?.members?.fetch === "function") {
+          fetched = await guild.members.fetch(userId);
+        } else if (typeof state.client?.users?.fetch === "function") {
+          fetched = await state.client.users.fetch(userId);
+        }
+        if (fetched) {
+          const isBot = Boolean(fetched.user?.bot ?? fetched.bot);
+          rememberSpeaker(userId, isBot, Infinity);
+          return isBot;
+        }
+      } catch {
+        // Fall through to the negative cache.
+      }
+      rememberSpeaker(userId, true, now() + SPEAKER_NEGATIVE_TTL_MS);
+      return true;
+    })();
+
+    speakerFetchInFlight.set(userId, pending);
     try {
-      let fetched = null;
-      if (typeof guild?.members?.fetch === "function") {
-        fetched = await guild.members.fetch(userId);
-      } else if (typeof state.client?.users?.fetch === "function") {
-        fetched = await state.client.users.fetch(userId);
-      }
-      if (fetched) {
-        const isBot = Boolean(fetched.user?.bot ?? fetched.bot);
-        rememberSpeaker(userId, isBot);
-        return isBot;
-      }
-    } catch {
-      // Fall through to fail closed.
+      return await pending;
+    } finally {
+      if (speakerFetchInFlight.get(userId) === pending) speakerFetchInFlight.delete(userId);
     }
-    return true;
   }
 
   function detachReceiver() {
@@ -382,6 +434,8 @@ export function createVoiceOrchestrator({
     vad.clear?.();
     history = [];
     state.lastBotReplyAt = 0;
+    speakerBotCache.clear();
+    speakerFetchInFlight.clear();
     state.sessionEpoch += 1;
     state.sessionToken = null;
   }
@@ -413,8 +467,19 @@ export function createVoiceOrchestrator({
       if (state.guildId !== boundGuildId || state.channelId !== boundChannelId) return;
       if (!verifyLiveChannelBinding()) return;
       if (state.mutedUsers.has(userId)) return;
+
+      const snap = captureSessionSnapshot();
       if (await ensureSpeakerKnown(userId, boundGuildId)) return;
-      if (userStreams.has(userId)) return;
+      if (
+        !isSnapshotCurrent(snap) ||
+        snap.token !== boundToken ||
+        snap.guildId !== boundGuildId ||
+        snap.channelId !== boundChannelId ||
+        state.mutedUsers.has(userId) ||
+        userStreams.has(userId)
+      ) {
+        return;
+      }
 
       const EndBehaviorType = resolvedVoiceDeps?.EndBehaviorType;
       const stream = voiceConnection?.receiver?.subscribe?.(userId, {
@@ -717,6 +782,9 @@ export function createVoiceOrchestrator({
     }
 
     const tokenMatches = sessionToken !== undefined && sessionToken === state.sessionToken;
+    if (sessionToken !== undefined && !tokenMatches) {
+      return { ignored: true, dropped: "wrong_guild" };
+    }
     const idsMatch =
       typeof guildId === "string" &&
       guildId.length > 0 &&
@@ -740,15 +808,19 @@ export function createVoiceOrchestrator({
     if (!userId || userId === resolvedBotUserId || isBot || state.mutedUsers.has(userId)) {
       return { ignored: true };
     }
+
+    const snap = captureSessionSnapshot();
     if (await ensureSpeakerKnown(userId, state.guildId)) {
       return { ignored: true };
     }
+    if (!isSnapshotCurrent(snap) || state.mutedUsers.has(userId) || userId === resolvedBotUserId) {
+      return { ignored: true, dropped: "inactive_session" };
+    }
+
     if (!opusPacket || typeof opusPacket.byteLength !== "number") {
       return { ignored: true, dropped: "invalid" };
     }
 
-    const packetEpoch = state.sessionEpoch;
-    const packetToken = state.sessionToken;
     let pcm48;
     try {
       const codec = await ensureTranscoder();
@@ -757,20 +829,13 @@ export function createVoiceOrchestrator({
       return { ignored: true, dropped: "decode" };
     }
 
-    if (
-      !state.active ||
-      state.closed ||
-      !state.daveReady ||
-      !verifyLiveChannelBinding() ||
-      state.sessionEpoch !== packetEpoch ||
-      state.sessionToken !== packetToken
-    ) {
+    if (!isSnapshotCurrent(snap)) {
       return { ignored: true, dropped: "inactive_session" };
     }
     if (
       state.mutedUsers.has(userId) ||
       userId === resolvedBotUserId ||
-      (await ensureSpeakerKnown(userId, state.guildId))
+      cachedSpeakerBot(userId) === true
     ) {
       return { ignored: true };
     }
@@ -922,11 +987,15 @@ export function createVoiceOrchestrator({
   }
 
   async function leaveChannel({ guildId } = {}) {
-    joinNonce += 1;
-    pendingGuildId = null;
-    if (guildId && state.guildId && guildId !== state.guildId) {
+    if (
+      guildId &&
+      ((state.guildId && guildId !== state.guildId) ||
+        (!state.guildId && pendingGuildId && guildId !== pendingGuildId))
+    ) {
       throw new Error("Voice session belongs to another guild");
     }
+    joinNonce += 1;
+    pendingGuildId = null;
     resetTurnAndSession();
     destroyVoice();
     state.guildId = null;

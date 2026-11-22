@@ -961,3 +961,39 @@ test("a detector reset that drops the speaker suppresses onSpeechEnd", async () 
 
   assert.equal(ends.length, 0);
 });
+
+test("resetSpeaker while a detector is unsettled quarantines the speaker", async () => {
+  let calls = 0;
+  let resolveDetector;
+  const pendingDetector = new Promise((resolve) => {
+    resolveDetector = resolve;
+  });
+
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      calls += 1;
+      return () => pendingDetector;
+    },
+    detectorTimeoutMs: 5000,
+    maxInFlightFrames: 1,
+  });
+
+  const pendingFrame = vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  vad.resetSpeaker("u1");
+
+  const blocked = await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  assert.deepEqual(blocked, { ignored: true, dropped: "detector_quarantined" });
+  assert.equal(calls, 1);
+
+  const other = await vad.pushFrame({ userId: "u2", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  assert.equal(other.dropped, "global_backpressure");
+
+  resolveDetector(0.9);
+  await pendingFrame.catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const recovered = await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 40 });
+  assert.notEqual(recovered.dropped, "detector_quarantined");
+  assert.equal(calls, 2);
+});

@@ -252,6 +252,13 @@ export class PerSpeakerVad {
     this.#validateFrame(pcm16kMono);
     this.#pruneIdle(timestampMs);
 
+    if (this.quarantinedUsers.has(userId)) {
+      return { ignored: true, dropped: "detector_quarantined" };
+    }
+    if (this.inFlightCount + this.quarantinedUsers.size >= this.maxInFlightFrames) {
+      return { ignored: true, dropped: "global_backpressure" };
+    }
+
     let state = this.speakers.get(userId);
     if (!state) {
       state = this.#createState(userId, displayName, timestampMs);
@@ -323,17 +330,18 @@ export class PerSpeakerVad {
       epoch: 0,
       queue: Promise.resolve(),
       pendingCount: 0,
+      inFlightDetector: null,
     };
   }
 
   #admitSpeaker(state, timestampMs) {
-    if (this.speakers.size < this.maxSpeakers) {
+    if (this.speakers.size + this.quarantinedUsers.size < this.maxSpeakers) {
       this.speakers.set(state.userId, state);
       return true;
     }
 
     this.#pruneIdle(timestampMs);
-    if (this.speakers.size < this.maxSpeakers) {
+    if (this.speakers.size + this.quarantinedUsers.size < this.maxSpeakers) {
       this.speakers.set(state.userId, state);
       return true;
     }
@@ -371,6 +379,10 @@ export class PerSpeakerVad {
   #dropSpeaker(userId) {
     const state = this.speakers.get(userId);
     if (!state) return;
+    // Keep tracking any still-running detector work before the entry vanishes.
+    if (state.inFlightDetector) {
+      this.quarantinedUsers.set(userId, state.inFlightDetector);
+    }
     // Delete before reset so a detector reset that calls back into the VAD
     // cannot recurse through this speaker entry.
     this.speakers.delete(userId);
@@ -389,6 +401,15 @@ export class PerSpeakerVad {
 
   async #runDetector(state, task) {
     const pending = Promise.resolve().then(task);
+    state.inFlightDetector = pending;
+    pending
+      .finally(() => {
+        if (state.inFlightDetector === pending) state.inFlightDetector = null;
+        if (this.quarantinedUsers.get(state.userId) === pending) {
+          this.quarantinedUsers.delete(state.userId);
+        }
+      })
+      .catch(() => {});
     let timer;
     const timeout = new Promise((resolve, reject) => {
       timer = setTimeout(() => {
@@ -566,6 +587,9 @@ export class PerSpeakerVad {
   /** Drop every speaker's buffered utterance and detector state. */
   clear() {
     for (const state of this.speakers.values()) {
+      if (state.inFlightDetector) {
+        this.quarantinedUsers.set(state.userId, state.inFlightDetector);
+      }
       state.epoch += 1;
       state.detector?.reset?.();
     }

@@ -181,8 +181,9 @@ function makeRealVoiceDeps() {
   const speaking = new EventEmitter();
   const subscriptions = [];
   const played = [];
-  const connection = {
+  const connection = Object.assign(new EventEmitter(), {
     destroyed: false,
+    joinConfig: null,
     receiver: {
       speaking,
       subscribe(userId, options) {
@@ -195,20 +196,24 @@ function makeRealVoiceDeps() {
     destroy() {
       connection.destroyed = true;
     },
-  };
-  const player = {
+  });
+  const player = Object.assign(new EventEmitter(), {
+    stops: 0,
     play(resource) {
       played.push(resource);
       return resource;
     },
-    stop() {},
-  };
+    stop() {
+      player.stops += 1;
+    },
+  });
   const deps = {
     EndBehaviorType: { AfterSilence: 2 },
     StreamType: { Opus: "opus" },
     joined: null,
     joinVoiceChannel(options) {
       deps.joined = options;
+      connection.joinConfig = { channelId: options.channelId };
       return connection;
     },
     createAudioPlayer() {
@@ -1387,4 +1392,253 @@ test("non-moderators cannot move or disconnect the bot from another channel", as
     memberPermissions: { has: (name) => name === "ManageGuild" },
   });
   assert.equal(calls.includes("join"), true);
+});
+
+test("leave during a pending join checks authority before aborting it", async () => {
+  let releaseLoad;
+  const { orchestrator } = buildOrchestrator({
+    playerSink: null,
+    loadVoiceDeps: () =>
+      new Promise((resolve) => {
+        releaseLoad = resolve;
+      }),
+  });
+  await orchestrator.start();
+
+  const pending = orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await tick(5);
+
+  await assert.rejects(() => orchestrator.leaveChannel({ guildId: "g2" }), /another guild/i);
+
+  releaseLoad(makeRealVoiceDeps().deps);
+  await pending;
+  assert.equal(orchestrator.getStatus().guildId, "g1");
+});
+
+test("same-guild leave aborts a pending join", async () => {
+  let releaseLoad;
+  const { orchestrator } = buildOrchestrator({
+    playerSink: null,
+    loadVoiceDeps: () =>
+      new Promise((resolve) => {
+        releaseLoad = resolve;
+      }),
+  });
+  await orchestrator.start();
+
+  const pending = orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await tick(5);
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  releaseLoad(makeRealVoiceDeps().deps);
+
+  await assert.rejects(() => pending, /aborted/i);
+});
+
+test("voiceStateUpdate moves the binding and rebinds the receiver", async () => {
+  const shapes = makeRealVoiceDeps();
+  const client = new EventEmitter();
+  client.user = { id: "bot-1" };
+  const { orchestrator } = buildOrchestrator({
+    client,
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  client.emit(
+    "voiceStateUpdate",
+    { id: "bot-1", channelId: "c1", guild: { id: "g1" } },
+    { id: "bot-1", channelId: "c2", guild: { id: "g1" } },
+  );
+  shapes.connection.joinConfig = { channelId: "c2" };
+
+  assert.equal(orchestrator.getStatus().channelId, "c2");
+  shapes.speaking.emit("start", "u1");
+  await tick(5);
+  assert.equal(shapes.subscriptions.length, 1);
+  client.emit("voiceStateUpdate", { id: "bot-1", channelId: "c2", guild: { id: "g1" } }, { id: "bot-1", channelId: "c3", guild: { id: "g1" } });
+  assert.equal(orchestrator.getStatus().channelId, "c3");
+});
+
+test("connection stateChange follows joinConfig and disconnects cleanly", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  shapes.connection.joinConfig = { channelId: "c3" };
+  for (const listener of shapes.connection.listeners("stateChange")) {
+    listener({ status: "connected" }, { status: "connected" });
+  }
+  assert.equal(orchestrator.getStatus().channelId, "c3");
+
+  shapes.connection.joinConfig = { channelId: null };
+  for (const listener of shapes.connection.listeners("stateChange")) {
+    listener({ status: "connected" }, { status: "disconnected" });
+  }
+  assert.equal(orchestrator.getStatus().guildId, null);
+  assert.equal(orchestrator.getStatus().channelId, null);
+});
+
+test("a stale joinConfig binding makes packets inactive", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  shapes.connection.joinConfig = { channelId: "other" };
+
+  const result = await orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "u1",
+    opusPacket: Buffer.alloc(8),
+  });
+  assert.deepEqual(result, { ignored: true, dropped: "inactive_session" });
+});
+
+test("muting the draining speaker stops the voice player", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  const before = shapes.player.stops;
+  orchestrator.muteUser("u1", true);
+  assert.ok(shapes.player.stops > before);
+});
+
+test("connection and player errors are contained and recorded", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  assert.doesNotThrow(() => shapes.connection.emit("error", new Error("boom")));
+  assert.equal(orchestrator.getStatus().lastError, "voice connection error");
+
+  assert.doesNotThrow(() => shapes.player.emit?.("error", new Error("boom")));
+});
+
+test("voice state listeners are removed on teardown", async () => {
+  const shapes = makeRealVoiceDeps();
+  const client = new EventEmitter();
+  client.user = { id: "bot-1" };
+  client.guilds = { cache: new Map() };
+  const { orchestrator } = buildOrchestrator({
+    client,
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  assert.equal(client.listenerCount("voiceStateUpdate"), 1);
+
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  assert.equal(client.listenerCount("voiceStateUpdate"), 0);
+});
+
+test("speaker lookups dedupe and negative-cache for 60 seconds", async () => {
+  let clock = 1000;
+  let fetchCalls = 0;
+  const client = {
+    user: { id: "bot-1" },
+    users: { cache: new Map() },
+    guilds: {
+      cache: new Map([
+        [
+          "g1",
+          {
+            members: {
+              cache: new Map(),
+              async fetch() {
+                fetchCalls += 1;
+                throw new Error("rest down");
+              },
+            },
+          },
+        ],
+      ]),
+    },
+  };
+  const { orchestrator } = buildOrchestrator({
+    client,
+    botUserId: "bot-1",
+    now: () => clock,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const call = () =>
+    orchestrator.handleOpusPacket({
+      guildId: "g1",
+      channelId: "c1",
+      userId: "ghost",
+      opusPacket: Buffer.alloc(8),
+    });
+
+  await Promise.all(Array.from({ length: 25 }, call));
+  for (let i = 0; i < 10; i += 1) await call();
+  assert.equal(fetchCalls, 1);
+
+  clock += 61000;
+  await call();
+  assert.equal(fetchCalls, 2);
+});
+
+test("a speaker lookup that outlives a rejoin cannot subscribe or push", async () => {
+  const shapes = makeRealVoiceDeps();
+  let releaseFetch;
+  const client = {
+    user: { id: "bot-1" },
+    users: { cache: new Map() },
+    guilds: {
+      cache: new Map([
+        [
+          "g1",
+          {
+            members: {
+              cache: new Map(),
+              fetch: () =>
+                new Promise((resolve) => {
+                  releaseFetch = resolve;
+                }),
+            },
+          },
+        ],
+      ]),
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    client,
+    botUserId: "bot-1",
+    voiceDeps: shapes.deps,
+    playerSink: null,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const pendingPacket = orchestrator.handleOpusPacket({
+    guildId: "g1",
+    channelId: "c1",
+    userId: "late",
+    opusPacket: Buffer.alloc(8),
+  });
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+  releaseFetch({ user: { bot: false } });
+
+  const result = await pendingPacket;
+  assert.deepEqual(result, { ignored: true, dropped: "inactive_session" });
+  assert.equal(vad.pushes.length, 0);
 });
