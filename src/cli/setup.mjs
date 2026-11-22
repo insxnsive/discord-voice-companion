@@ -95,19 +95,51 @@ function writePrivateFile(targetPath, data, { encoding, fsImpl }) {
     tempFileCounter += 1;
     const tmpPath = `${targetPath}.tmp-${process.pid}-${tempFileCounter}`;
     assertTargetNotSymlink(tmpPath, fsImpl);
-    const writeOpts = { mode: 0o600, flag: "wx" };
-    if (encoding) writeOpts.encoding = encoding;
+    let stageCreated = false;
+    let fd = null;
     try {
-      fsImpl.writeFileSync(tmpPath, data, writeOpts);
+      if (
+        typeof fsImpl.openSync === "function" &&
+        typeof fsImpl.writeSync === "function" &&
+        typeof fsImpl.closeSync === "function"
+      ) {
+        fd = fsImpl.openSync(tmpPath, "wx", 0o600);
+        stageCreated = true;
+        const payload = Buffer.isBuffer(data)
+          ? data
+          : Buffer.from(String(data), encoding || "utf8");
+        let offset = 0;
+        while (offset < payload.length) {
+          const written = fsImpl.writeSync(fd, payload, offset, payload.length - offset, offset);
+          if (written <= 0) break;
+          offset += written;
+        }
+        fsImpl.closeSync(fd);
+        fd = null;
+      } else {
+        const writeOpts = { mode: 0o600, flag: "wx" };
+        if (encoding) writeOpts.encoding = encoding;
+        fsImpl.writeFileSync(tmpPath, data, writeOpts);
+        stageCreated = true;
+      }
       fsImpl.chmodSync?.(tmpPath, 0o600);
       assertTargetNotSymlink(targetPath, fsImpl);
       fsImpl.renameSync(tmpPath, targetPath);
       fsImpl.chmodSync?.(targetPath, 0o600);
     } catch (error) {
-      try {
-        fsImpl.unlinkSync?.(tmpPath);
-      } catch {
-        // Ignore temp cleanup errors.
+      if (fd !== null) {
+        try {
+          fsImpl.closeSync(fd);
+        } catch {
+          // Ignore close errors.
+        }
+      }
+      if (stageCreated) {
+        try {
+          fsImpl.unlinkSync?.(tmpPath);
+        } catch {
+          // Ignore temp cleanup errors.
+        }
       }
       throw error;
     }

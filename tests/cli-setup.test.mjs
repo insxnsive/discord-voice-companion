@@ -9,6 +9,7 @@ import {
   pregenerateReactionClips,
   runSetupWizard,
 } from "../src/cli/setup.mjs";
+import * as entryMod from "../src/index.mjs";
 import { createCompanionApp } from "../src/index.mjs";
 import { loadConfig } from "../src/config/config.mjs";
 import { createLlmClient } from "../src/llm/client.mjs";
@@ -711,4 +712,194 @@ test("createCompanionApp wires opusTranscoder, registers slashCommands on start(
   await assert.rejects(startPromise, /stopped during startup/i);
   await stopPromise;
   assert.equal(app2Closed, true);
+});
+
+test("normalizeSlashCommands converts string option types and bare string choices without mutating inputs", () => {
+  assert.equal(typeof entryMod.normalizeSlashCommands, "function");
+
+  const a3Commands = [
+    {
+      name: "mode",
+      description: "Switch mode",
+      options: [
+        {
+          name: "chime",
+          description: "Chime mode",
+          type: "STRING",
+          required: false,
+          choices: ["smart", "always", { name: "Mention", value: "mention" }],
+        },
+        {
+          name: "group",
+          type: "SUB_COMMAND_GROUP",
+          options: [
+            {
+              name: "sub",
+              type: "SUB_COMMAND",
+              options: [
+                { name: "count", type: "INTEGER" },
+                { name: "flag", type: "BOOLEAN" },
+                { name: "who", type: "USER" },
+                { name: "chan", type: "CHANNEL" },
+                { name: "role", type: "ROLE" },
+                { name: "any", type: "MENTIONABLE" },
+                { name: "ratio", type: "NUMBER" },
+                { name: "clip", type: "ATTACHMENT" },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    {
+      name: "join",
+      description: "Join channel",
+      options: [
+        {
+          name: "channel",
+          type: 7,
+          choices: [{ name: "Lobby", value: "lobby" }],
+        },
+      ],
+    },
+  ];
+  const snapshotBefore = JSON.stringify(a3Commands);
+
+  const normalized = entryMod.normalizeSlashCommands(a3Commands);
+  assert.equal(JSON.stringify(a3Commands), snapshotBefore);
+
+  assert.equal(normalized[0].options[0].type, 3);
+  assert.deepEqual(normalized[0].options[0].choices, [
+    { name: "smart", value: "smart" },
+    { name: "always", value: "always" },
+    { name: "Mention", value: "mention" },
+  ]);
+  assert.equal(normalized[0].options[1].type, 2);
+  assert.equal(normalized[0].options[1].options[0].type, 1);
+  assert.deepEqual(
+    normalized[0].options[1].options[0].options.map((o) => o.type),
+    [4, 5, 6, 7, 8, 9, 10, 11],
+  );
+  assert.equal(normalized[1].options[0].type, 7);
+  assert.deepEqual(normalized[1].options[0].choices, [{ name: "Lobby", value: "lobby" }]);
+});
+
+test("stop() cleans up deferred ready/clientReady listeners and startup failure before ready detaches fallback listeners", async () => {
+  const { EventEmitter } = await import("node:events");
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "app-ready-cleanup-root");
+  mockFs.dirs.add(root);
+  mockFs.files.set(
+    path.join(root, ".env"),
+    [
+      "DISCORD_BOT_TOKEN=bot-token-ready",
+      "DISCORD_APP_ID=app-1",
+      "LLM_PROVIDER=deepseek",
+      "LLM_API_KEY=llm-k",
+      "STT_PROVIDER=deepgram",
+      "DEEPGRAM_API_KEY=dg-k",
+      "TTS_PROVIDER=elevenlabs",
+      "ELEVENLABS_API_KEY=el-k",
+      "ELEVENLABS_VOICE_ID=v-1",
+    ].join("\n"),
+  );
+
+  const client1 = new EventEmitter();
+  client1.login = async () => {};
+  client1.destroy = () => {};
+  const fakeTranscoder = { backend: "mock-opus", encode: () => Buffer.alloc(4), decode: () => Buffer.alloc(4) };
+
+  const app1 = await createCompanionApp({
+    env: {},
+    envPath: path.join(root, ".env"),
+    configPath: path.join(root, "config.json"),
+    soulPath: path.join(root, "SOUL.md"),
+    trustedRootDir: root,
+    fsImpl: mockFs,
+    client: client1,
+    slashCommands: [{ name: "mode", options: [{ name: "kind", type: "STRING", choices: ["smart"] }] }],
+    createOpusTranscoderImpl: async () => fakeTranscoder,
+    createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
+    createTtsAdapterImpl: () => ({ name: () => "el", async warmup() {}, async synthesizeClause() {}, close() {} }),
+    createSttAdapterImpl: () => ({ name: () => "dg", async transcribe() {}, close() {} }),
+    createVoiceOrchestratorImpl: () => ({ async start() {}, close() {} }),
+    createCommandHandlerImpl: () => ({ commands: [], async handleInteraction() {} }),
+  });
+
+  await app1.start();
+  assert.ok(client1.listenerCount("ready") >= 1);
+  await app1.stop();
+  assert.equal(client1.listenerCount("ready"), 0);
+  assert.equal(client1.listenerCount("clientReady"), 0);
+
+  // If orchestrator.start() throws before ready, fallback listeners must still be cleaned up
+  const client2 = new EventEmitter();
+  client2.login = async () => {};
+  client2.destroy = () => {};
+  const app2 = await createCompanionApp({
+    env: {},
+    envPath: path.join(root, ".env"),
+    configPath: path.join(root, "config.json"),
+    soulPath: path.join(root, "SOUL.md"),
+    trustedRootDir: root,
+    fsImpl: mockFs,
+    client: client2,
+    slashCommands: [{ name: "join" }],
+    createOpusTranscoderImpl: async () => fakeTranscoder,
+    createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
+    createTtsAdapterImpl: () => ({ name: () => "el", async warmup() {}, async synthesizeClause() {}, close() {} }),
+    createSttAdapterImpl: () => ({ name: () => "dg", async transcribe() {}, close() {} }),
+    createVoiceOrchestratorImpl: () => ({
+      async start() {
+        throw new Error("boom during start");
+      },
+      close() {},
+    }),
+    createCommandHandlerImpl: () => ({ commands: [], async handleInteraction() {} }),
+  });
+
+  await assert.rejects(() => app2.start(), /boom during start/);
+  assert.equal(client2.listenerCount("ready"), 0);
+  assert.equal(client2.listenerCount("clientReady"), 0);
+});
+
+test("runSetupWizard does not unlink an unowned pre-existing .tmp- file on EEXIST", async () => {
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "eexist-tmp-root");
+  mockFs.dirs.add(root);
+  const envTarget = path.join(root, ".env");
+  mockFs.files.set(envTarget, "DISCORD_BOT_TOKEN=keep-original\n");
+
+  const unlinkedTargets = [];
+  mockFs.openSync = () => {
+    const err = new Error("EEXIST: file already exists");
+    err.code = "EEXIST";
+    throw err;
+  };
+  mockFs.writeSync = () => 0;
+  mockFs.closeSync = () => {};
+  mockFs.unlinkSync = (target) => {
+    unlinkedTargets.push(path.resolve(target));
+  };
+
+  await assert.rejects(
+    () =>
+      runSetupWizard({
+        answers: {
+          discordToken: "new-token",
+          discordAppId: "app-2",
+          llmProvider: "deepseek",
+          sttProvider: "deepgram",
+          ttsProvider: "elevenlabs",
+        },
+        skipPregenerate: true,
+        fsImpl: mockFs,
+        envPath: ".env",
+        trustedRootDir: root,
+      }),
+    /EEXIST/,
+  );
+
+  assert.equal(unlinkedTargets.length, 0);
+  assert.equal(mockFs.files.get(envTarget), "DISCORD_BOT_TOKEN=keep-original\n");
 });

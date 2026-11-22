@@ -9,6 +9,63 @@ import { createLlmClient } from "./llm/client.mjs";
 import { createTtsAdapter } from "./tts/adapters.mjs";
 import { ReactionPool } from "./tts/reactions.mjs";
 
+const DISCORD_OPTION_TYPE_MAP = Object.freeze({
+  SUB_COMMAND: 1,
+  SUB_COMMAND_GROUP: 2,
+  STRING: 3,
+  INTEGER: 4,
+  BOOLEAN: 5,
+  USER: 6,
+  CHANNEL: 7,
+  ROLE: 8,
+  MENTIONABLE: 9,
+  NUMBER: 10,
+  ATTACHMENT: 11,
+});
+
+function normalizeChoice(choice) {
+  if (typeof choice === "string") {
+    return { name: String(choice), value: choice };
+  }
+  if (choice && typeof choice === "object") {
+    return { ...choice };
+  }
+  return choice;
+}
+
+function normalizeCommandOption(option) {
+  if (!option || typeof option !== "object") return option;
+  const normalized = { ...option };
+  if (typeof normalized.type === "string") {
+    const mapped = DISCORD_OPTION_TYPE_MAP[normalized.type.toUpperCase()];
+    if (mapped !== undefined) {
+      normalized.type = mapped;
+    }
+  }
+  if (Array.isArray(option.choices)) {
+    normalized.choices = option.choices.map(normalizeChoice);
+  }
+  if (Array.isArray(option.options)) {
+    normalized.options = option.options.map(normalizeCommandOption);
+  }
+  return normalized;
+}
+
+/**
+ * Normalize slash command option types and choice entries into cloned Discord API-compatible objects.
+ */
+export function normalizeSlashCommands(commands = []) {
+  if (!Array.isArray(commands)) return [];
+  return commands.map((command) => {
+    if (!command || typeof command !== "object") return command;
+    const cloned = { ...command };
+    if (Array.isArray(command.options)) {
+      cloned.options = command.options.map(normalizeCommandOption);
+    }
+    return cloned;
+  });
+}
+
 async function loadOptionalModule(specifier) {
   try {
     return await import(specifier);
@@ -183,6 +240,24 @@ export async function createCompanionApp({
     resolvedClient.on("interactionCreate", interactionListener);
   }
 
+  let readyListeners = [];
+
+  function detachListener(event, fn) {
+    if (!resolvedClient || !fn) return;
+    if (typeof resolvedClient.off === "function") {
+      resolvedClient.off(event, fn);
+    } else if (typeof resolvedClient.removeListener === "function") {
+      resolvedClient.removeListener(event, fn);
+    }
+  }
+
+  function clearReadyListeners() {
+    for (const { event, fn } of readyListeners) {
+      detachListener(event, fn);
+    }
+    readyListeners = [];
+  }
+
   let stopped = false;
   let stoppingPromise = null;
   let activeStart = null;
@@ -191,16 +266,26 @@ export async function createCompanionApp({
     if (!resolvedClient || !Array.isArray(resolvedSlashCommands) || resolvedSlashCommands.length === 0) {
       return;
     }
+    const normalizedCommands = normalizeSlashCommands(resolvedSlashCommands);
     if (typeof resolvedClient.application?.commands?.set === "function") {
-      await resolvedClient.application.commands.set(resolvedSlashCommands);
+      await resolvedClient.application.commands.set(normalizedCommands);
       return;
     }
     if (typeof resolvedClient.once === "function") {
-      resolvedClient.once("ready", () => {
-        Promise.resolve(resolvedClient.application?.commands?.set?.(resolvedSlashCommands)).catch(
+      clearReadyListeners();
+      let registered = false;
+      const onReady = () => {
+        if (registered || stopped || stoppingPromise) return;
+        registered = true;
+        clearReadyListeners();
+        Promise.resolve(resolvedClient.application?.commands?.set?.(normalizedCommands)).catch(
           () => {},
         );
-      });
+      };
+      for (const event of ["ready", "clientReady"]) {
+        readyListeners.push({ event, fn: onReady });
+        resolvedClient.once(event, onReady);
+      }
     }
   }
 
@@ -218,29 +303,34 @@ export async function createCompanionApp({
     if (activeStart) return activeStart;
 
     activeStart = (async () => {
-      if (!orchestrator && missingRuntimeModules.length > 0) {
-        throw new Error(
-          `Missing runtime module(s) required to start companion: ${missingRuntimeModules.join(", ")}`,
-        );
+      try {
+        if (!orchestrator && missingRuntimeModules.length > 0) {
+          throw new Error(
+            `Missing runtime module(s) required to start companion: ${missingRuntimeModules.join(", ")}`,
+          );
+        }
+        if (!orchestrator && config.discord.token && !resolvedClient && missingRuntimeModules.includes("discord.js")) {
+          throw new Error("discord.js package is required when DISCORD_BOT_TOKEN is configured");
+        }
+        if (typeof resolvedClient?.login === "function" && config.discord.token) {
+          await resolvedClient.login(config.discord.token);
+        }
+        await ensureNotStoppedDuringStartup();
+        await registerSlashCommands();
+        await ensureNotStoppedDuringStartup();
+        await ttsAdapter?.warmup?.().catch(() => {});
+        await ensureNotStoppedDuringStartup();
+        await orchestrator?.start?.({ client: resolvedClient });
+        await ensureNotStoppedDuringStartup();
+        return {
+          started: true,
+          config: redactedConfig,
+          loadedReactionClips: reactionPool.size,
+        };
+      } catch (error) {
+        clearReadyListeners();
+        throw error;
       }
-      if (!orchestrator && config.discord.token && !resolvedClient && missingRuntimeModules.includes("discord.js")) {
-        throw new Error("discord.js package is required when DISCORD_BOT_TOKEN is configured");
-      }
-      if (typeof resolvedClient?.login === "function" && config.discord.token) {
-        await resolvedClient.login(config.discord.token);
-      }
-      await ensureNotStoppedDuringStartup();
-      await registerSlashCommands();
-      await ensureNotStoppedDuringStartup();
-      await ttsAdapter?.warmup?.().catch(() => {});
-      await ensureNotStoppedDuringStartup();
-      await orchestrator?.start?.({ client: resolvedClient });
-      await ensureNotStoppedDuringStartup();
-      return {
-        started: true,
-        config: redactedConfig,
-        loadedReactionClips: reactionPool.size,
-      };
     })();
 
     try {
@@ -255,13 +345,10 @@ export async function createCompanionApp({
     if (stoppingPromise) return stoppingPromise;
     stoppingPromise = (async () => {
       if (resolvedClient && interactionListener) {
-        if (typeof resolvedClient.off === "function") {
-          resolvedClient.off("interactionCreate", interactionListener);
-        } else if (typeof resolvedClient.removeListener === "function") {
-          resolvedClient.removeListener("interactionCreate", interactionListener);
-        }
+        detachListener("interactionCreate", interactionListener);
         interactionListener = null;
       }
+      clearReadyListeners();
       await Promise.allSettled([
         Promise.resolve().then(() => resolvedClient?.destroy?.()),
         Promise.resolve().then(() => orchestrator?.close?.()),
