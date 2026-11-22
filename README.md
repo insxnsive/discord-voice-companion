@@ -18,6 +18,8 @@ npm start
 npm test
 ```
 
+`npm start` automatically registers the five Discord slash commands (`/join`, `/leave`, `/mode`, `/status`, `/mute-user`) with the application client during startup.
+
 ## Configuration and providers
 
 Configuration loads with explicit environment variables overriding `.env`, followed by `config.json`, and then provider defaults. Persona instructions come from `SOUL.md`.

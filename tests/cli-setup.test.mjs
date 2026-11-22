@@ -46,6 +46,21 @@ function createMockSetupFs() {
       files.delete(key);
       symlinks.delete(key);
     },
+    renameSync(oldTarget, newTarget) {
+      const oldKey = path.resolve(oldTarget);
+      const newKey = path.resolve(newTarget);
+      if (!files.has(oldKey)) {
+        const err = new Error(`ENOENT: ${oldTarget}`);
+        err.code = "ENOENT";
+        throw err;
+      }
+      files.set(newKey, files.get(oldKey));
+      files.delete(oldKey);
+      if (modes.has(oldKey)) {
+        modes.set(newKey, modes.get(oldKey));
+        modes.delete(oldKey);
+      }
+    },
     writeFileSync(target, data, opts = {}) {
       const key = path.resolve(target);
       if (opts?.flag === "wx" && (files.has(key) || dirs.has(key) || symlinks.has(key))) {
@@ -348,6 +363,7 @@ test("SOUL.md and README.md pass the prose gate with required content and zero A
   assert.match(readmeText, /0600/);
   assert.match(readmeText, /0700/);
   assert.match(readmeText, /WSS/i);
+  assert.match(readmeText, /automatically registers/i);
   assert.match(readmeText, /\/join/);
   assert.match(readmeText, /\/mute-user/);
   assert.match(readmeText, /faster-whisper/);
@@ -538,4 +554,161 @@ test("createCompanionApp constructs Discord client, binds interactionCreate, log
   assert.equal(ttsClosed, true);
   assert.equal(sttClosed, true);
   assert.equal(fakeClient.listenerCount("interactionCreate"), 0);
+});
+
+test("runSetupWizard preserves existing .env on ENOSPC via atomic rename and refuses symlink cache ancestor before mkdir", async () => {
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "atomic-env-root");
+  const envTarget = path.join(root, ".env");
+  mockFs.dirs.add(root);
+  mockFs.files.set(envTarget, "DISCORD_BOT_TOKEN=existing-token\n");
+
+  const origWrite = mockFs.writeFileSync.bind(mockFs);
+  mockFs.writeFileSync = (target, data, opts) => {
+    if (String(target).includes(".tmp-")) {
+      const err = new Error("ENOSPC: no space left on device");
+      err.code = "ENOSPC";
+      throw err;
+    }
+    return origWrite(target, data, opts);
+  };
+
+  await assert.rejects(
+    () =>
+      runSetupWizard({
+        answers: {
+          discordToken: "new-token",
+          discordAppId: "app-2",
+          llmProvider: "deepseek",
+          sttProvider: "deepgram",
+          ttsProvider: "elevenlabs",
+        },
+        skipPregenerate: true,
+        fsImpl: mockFs,
+        envPath: ".env",
+        trustedRootDir: root,
+      }),
+    /ENOSPC/,
+  );
+
+  // Original .env must remain intact because staging temp write failed before renameSync
+  assert.equal(mockFs.files.get(envTarget), "DISCORD_BOT_TOKEN=existing-token\n");
+  assert.equal(mockFs.unlinkCalls.includes(envTarget), false);
+
+  // Symlinked ancestor under trustedRootDir must fail before mkdirSync is called
+  const linkDir = path.join(root, "symlink-parent");
+  mockFs.symlinks.add(linkDir);
+  let mkdirCalledForSymlink = false;
+  mockFs.mkdirSync = (target) => {
+    if (path.resolve(target).startsWith(linkDir)) {
+      mkdirCalledForSymlink = true;
+    }
+  };
+  await assert.rejects(
+    () =>
+      pregenerateReactionClips({
+        ttsAdapter: { async synthesizeClause() {} },
+        cacheDir: "symlink-parent/reactions",
+        trustedRootDir: root,
+        fsImpl: mockFs,
+      }),
+    RangeError,
+  );
+  assert.equal(mkdirCalledForSymlink, false);
+});
+
+test("createCompanionApp wires opusTranscoder, registers slashCommands on start(), and rejects start() if stop() runs mid-startup", async () => {
+  const { EventEmitter } = await import("node:events");
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "app-slash-root");
+  mockFs.dirs.add(root);
+  mockFs.files.set(
+    path.join(root, ".env"),
+    [
+      "DISCORD_BOT_TOKEN=bot-token-slash",
+      "DISCORD_APP_ID=app-1",
+      "LLM_PROVIDER=deepseek",
+      "LLM_API_KEY=llm-k",
+      "STT_PROVIDER=deepgram",
+      "DEEPGRAM_API_KEY=dg-k",
+      "TTS_PROVIDER=elevenlabs",
+      "ELEVENLABS_API_KEY=el-k",
+      "ELEVENLABS_VOICE_ID=v-1",
+    ].join("\n"),
+  );
+
+  const expectedCommands = [{ name: "join" }, { name: "leave" }, { name: "mode" }, { name: "status" }, { name: "mute-user" }];
+  const fakeTranscoder = { backend: "mock-opus", encode: () => Buffer.alloc(4), decode: () => Buffer.alloc(4) };
+  let seenTranscoder = null;
+  let registeredCommands = null;
+
+  const client1 = new EventEmitter();
+  client1.login = async () => {};
+  client1.destroy = () => {};
+  client1.application = {
+    commands: {
+      async set(cmds) {
+        registeredCommands = cmds;
+      },
+    },
+  };
+
+  const app1 = await createCompanionApp({
+    env: {},
+    envPath: path.join(root, ".env"),
+    configPath: path.join(root, "config.json"),
+    soulPath: path.join(root, "SOUL.md"),
+    trustedRootDir: root,
+    fsImpl: mockFs,
+    client: client1,
+    slashCommands: expectedCommands,
+    createOpusTranscoderImpl: async () => fakeTranscoder,
+    createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
+    createTtsAdapterImpl: () => ({ name: () => "el", async warmup() {}, async synthesizeClause() {}, close() {} }),
+    createSttAdapterImpl: () => ({ name: () => "dg", async transcribe() {}, close() {} }),
+    createVoiceOrchestratorImpl: (opts) => {
+      seenTranscoder = opts.opusTranscoder;
+      return { async start() {}, close() {} };
+    },
+    createCommandHandlerImpl: () => ({ commands: expectedCommands, async handleInteraction() {} }),
+  });
+
+  assert.equal(seenTranscoder, fakeTranscoder);
+  await app1.start();
+  assert.deepEqual(registeredCommands, expectedCommands);
+
+  // If stop() runs while orchestrator.start() is awaiting, start() must reject cleanly
+  let releaseOrchStart;
+  const orchStartGate = new Promise((resolve) => {
+    releaseOrchStart = resolve;
+  });
+  let app2Closed = false;
+  const app2 = await createCompanionApp({
+    env: {},
+    envPath: path.join(root, ".env"),
+    configPath: path.join(root, "config.json"),
+    soulPath: path.join(root, "SOUL.md"),
+    trustedRootDir: root,
+    fsImpl: mockFs,
+    createDiscordClientImpl: () => ({ login: async () => {}, destroy() {}, on() {}, off() {} }),
+    createOpusTranscoderImpl: async () => fakeTranscoder,
+    createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
+    createTtsAdapterImpl: () => ({ name: () => "el", async warmup() {}, async synthesizeClause() {}, close() { app2Closed = true; } }),
+    createSttAdapterImpl: () => ({ name: () => "dg", async transcribe() {}, close() {} }),
+    createVoiceOrchestratorImpl: () => ({
+      async start() {
+        await orchStartGate;
+      },
+      close() {},
+    }),
+    createCommandHandlerImpl: () => ({ commands: [], async handleInteraction() {} }),
+  });
+
+  const startPromise = app2.start();
+  await new Promise((r) => setTimeout(r, 10));
+  const stopPromise = app2.stop();
+  releaseOrchStart();
+  await assert.rejects(startPromise, /stopped during startup/i);
+  await stopPromise;
+  assert.equal(app2Closed, true);
 });

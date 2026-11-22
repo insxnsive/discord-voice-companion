@@ -69,30 +69,54 @@ function assertNoSymlinksOnPath(rootPath, targetPath, fsImpl) {
   }
 }
 
-function writePrivateFile(targetPath, data, { encoding, fsImpl }) {
-  if (typeof fsImpl.lstatSync === "function") {
-    let existing = null;
-    try {
-      existing = fsImpl.lstatSync(targetPath);
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") throw error;
-    }
-    if (existing?.isSymbolicLink?.()) {
-      throw new RangeError("Refusing to write to a symlink target");
-    }
-    if (existing) {
-      if (!existing.isFile?.()) {
-        throw new RangeError("Target path is not a regular file");
-      }
-      fsImpl.unlinkSync?.(targetPath);
-    }
+let tempFileCounter = 0;
+
+function assertTargetNotSymlink(targetPath, fsImpl) {
+  if (typeof fsImpl.lstatSync !== "function") return null;
+  let existing = null;
+  try {
+    existing = fsImpl.lstatSync(targetPath);
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
   }
-  const writeOpts = {
-    mode: 0o600,
-    flag: typeof fsImpl.unlinkSync === "function" ? "wx" : "w",
-  };
-  if (encoding) writeOpts.encoding = encoding;
-  fsImpl.writeFileSync(targetPath, data, writeOpts);
+  if (existing?.isSymbolicLink?.()) {
+    throw new RangeError("Refusing to write to a symlink target");
+  }
+  if (existing && !existing.isFile?.()) {
+    throw new RangeError("Target path is not a regular file");
+  }
+  return existing;
+}
+
+function writePrivateFile(targetPath, data, { encoding, fsImpl }) {
+  assertTargetNotSymlink(targetPath, fsImpl);
+
+  if (typeof fsImpl.renameSync === "function") {
+    tempFileCounter += 1;
+    const tmpPath = `${targetPath}.tmp-${process.pid}-${tempFileCounter}`;
+    assertTargetNotSymlink(tmpPath, fsImpl);
+    const writeOpts = { mode: 0o600, flag: "wx" };
+    if (encoding) writeOpts.encoding = encoding;
+    try {
+      fsImpl.writeFileSync(tmpPath, data, writeOpts);
+      fsImpl.chmodSync?.(tmpPath, 0o600);
+      assertTargetNotSymlink(targetPath, fsImpl);
+      fsImpl.renameSync(tmpPath, targetPath);
+      fsImpl.chmodSync?.(targetPath, 0o600);
+    } catch (error) {
+      try {
+        fsImpl.unlinkSync?.(tmpPath);
+      } catch {
+        // Ignore temp cleanup errors.
+      }
+      throw error;
+    }
+    return;
+  }
+
+  const fallbackOpts = { mode: 0o600, flag: "w" };
+  if (encoding) fallbackOpts.encoding = encoding;
+  fsImpl.writeFileSync(targetPath, data, fallbackOpts);
   fsImpl.chmodSync?.(targetPath, 0o600);
 }
 
@@ -207,17 +231,25 @@ export async function pregenerateReactionClips({
   }
 
   let resolvedCacheDir;
+  let symlinkCheckRoot;
   if (trustedRootDir) {
     const contained = resolveContainedPath(trustedRootDir, cleanCacheDir, "Reaction cache directory");
     resolvedCacheDir = contained.resolvedTarget;
+    symlinkCheckRoot = contained.resolvedRoot;
     if (typeof fsImpl.realpathSync === "function") {
       try {
         const canonicalRoot = fsImpl.realpathSync(contained.resolvedRoot);
-        if (typeof fsImpl.existsSync !== "function" || fsImpl.existsSync(resolvedCacheDir)) {
-          const canonicalTarget = fsImpl.realpathSync(resolvedCacheDir);
-          if (!isWithinRoot(canonicalTarget, canonicalRoot)) {
-            throw new RangeError("Reaction cache directory is outside trusted root");
+        let ancestor = resolvedCacheDir;
+        while (ancestor && ancestor !== path.dirname(ancestor)) {
+          if (typeof fsImpl.existsSync !== "function" || fsImpl.existsSync(ancestor)) {
+            const canonicalAncestor = fsImpl.realpathSync(ancestor);
+            if (!isWithinRoot(canonicalAncestor, canonicalRoot)) {
+              throw new RangeError("Reaction cache directory is outside trusted root");
+            }
+            break;
           }
+          if (ancestor === contained.resolvedRoot) break;
+          ancestor = path.dirname(ancestor);
         }
       } catch (error) {
         if (error instanceof RangeError) throw error;
@@ -225,7 +257,10 @@ export async function pregenerateReactionClips({
     }
   } else {
     resolvedCacheDir = path.resolve(cleanCacheDir);
+    symlinkCheckRoot = path.dirname(resolvedCacheDir);
   }
+
+  assertNoSymlinksOnPath(symlinkCheckRoot, resolvedCacheDir, fsImpl);
 
   fsImpl.mkdirSync(resolvedCacheDir, { recursive: true, mode: 0o700 });
   fsImpl.chmodSync?.(resolvedCacheDir, 0o700);
@@ -237,12 +272,6 @@ export async function pregenerateReactionClips({
     }
     resolvedCacheDir = canonicalDir;
   }
-
-  assertNoSymlinksOnPath(
-    trustedRootDir ? path.resolve(trustedRootDir) : path.dirname(resolvedCacheDir),
-    resolvedCacheDir,
-    fsImpl,
-  );
 
   const files = [];
   for (const prompt of prompts) {

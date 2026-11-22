@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { LatencyTracker } from "./types.mjs";
+import { createOpusTranscoder } from "./audio/pcm.mjs";
 import { loadConfig, redactConfig } from "./config/config.mjs";
 import { createLlmClient } from "./llm/client.mjs";
 import { createTtsAdapter } from "./tts/adapters.mjs";
@@ -30,11 +31,14 @@ export async function createCompanionApp({
   trustedRootDir = process.cwd(),
   fsImpl = fs,
   createDiscordClientImpl,
+  createOpusTranscoderImpl = createOpusTranscoder,
   createLlmClientImpl = createLlmClient,
   createTtsAdapterImpl = createTtsAdapter,
   createSttAdapterImpl,
   createVoiceOrchestratorImpl,
   createCommandHandlerImpl,
+  opusTranscoder: providedOpusTranscoder,
+  slashCommands: providedSlashCommands,
   client,
   voiceDeps,
 } = {}) {
@@ -57,6 +61,18 @@ export async function createCompanionApp({
   const ttsAdapter = createTtsAdapterImpl(config);
 
   const missingRuntimeModules = [];
+
+  let opusTranscoder = providedOpusTranscoder ?? null;
+  if (!opusTranscoder && typeof createOpusTranscoderImpl === "function") {
+    try {
+      opusTranscoder = await createOpusTranscoderImpl();
+    } catch (error) {
+      if (createOpusTranscoderImpl !== createOpusTranscoder) {
+        throw error;
+      }
+      missingRuntimeModules.push("@discordjs/opus|opusscript");
+    }
+  }
 
   let resolvedClient = client ?? null;
   if (!resolvedClient) {
@@ -98,6 +114,7 @@ export async function createCompanionApp({
       llmClient,
       ttsAdapter,
       sttAdapter,
+      opusTranscoder,
       client: resolvedClient,
       voiceDeps,
     });
@@ -113,6 +130,7 @@ export async function createCompanionApp({
         llmClient,
         ttsAdapter,
         sttAdapter,
+        opusTranscoder,
         client: resolvedClient,
         voiceDeps,
       });
@@ -122,6 +140,7 @@ export async function createCompanionApp({
   }
 
   let commandHandler = null;
+  let resolvedSlashCommands = Array.isArray(providedSlashCommands) ? providedSlashCommands : null;
   if (typeof createCommandHandlerImpl === "function") {
     commandHandler = createCommandHandlerImpl({
       config,
@@ -130,6 +149,9 @@ export async function createCompanionApp({
       orchestrator,
       client: resolvedClient,
     });
+    if (!resolvedSlashCommands && Array.isArray(commandHandler?.commands)) {
+      resolvedSlashCommands = commandHandler.commands;
+    }
   } else {
     const commandMod = await loadOptionalModule("./discord/commands.mjs");
     if (commandMod && typeof commandMod.createCommandHandler === "function") {
@@ -140,6 +162,11 @@ export async function createCompanionApp({
         orchestrator,
         client: resolvedClient,
       });
+      if (!resolvedSlashCommands && Array.isArray(commandMod.SLASH_COMMANDS)) {
+        resolvedSlashCommands = commandMod.SLASH_COMMANDS;
+      } else if (!resolvedSlashCommands && Array.isArray(commandHandler?.commands)) {
+        resolvedSlashCommands = commandHandler.commands;
+      }
     } else {
       missingRuntimeModules.push("./discord/commands.mjs");
     }
@@ -160,6 +187,30 @@ export async function createCompanionApp({
   let stoppingPromise = null;
   let activeStart = null;
 
+  async function registerSlashCommands() {
+    if (!resolvedClient || !Array.isArray(resolvedSlashCommands) || resolvedSlashCommands.length === 0) {
+      return;
+    }
+    if (typeof resolvedClient.application?.commands?.set === "function") {
+      await resolvedClient.application.commands.set(resolvedSlashCommands);
+      return;
+    }
+    if (typeof resolvedClient.once === "function") {
+      resolvedClient.once("ready", () => {
+        Promise.resolve(resolvedClient.application?.commands?.set?.(resolvedSlashCommands)).catch(
+          () => {},
+        );
+      });
+    }
+  }
+
+  async function ensureNotStoppedDuringStartup() {
+    if (!stopped && !stoppingPromise) return;
+    if (stoppingPromise) await stoppingPromise;
+    else await stop();
+    throw new Error("Companion app stopped during startup");
+  }
+
   async function start() {
     if (stopped || stoppingPromise) {
       throw new Error("Companion has already been stopped");
@@ -178,14 +229,13 @@ export async function createCompanionApp({
       if (typeof resolvedClient?.login === "function" && config.discord.token) {
         await resolvedClient.login(config.discord.token);
       }
-      if (stopped || stoppingPromise) {
-        throw new Error("Companion stopped during startup");
-      }
+      await ensureNotStoppedDuringStartup();
+      await registerSlashCommands();
+      await ensureNotStoppedDuringStartup();
       await ttsAdapter?.warmup?.().catch(() => {});
-      if (stopped || stoppingPromise) {
-        throw new Error("Companion stopped during startup");
-      }
+      await ensureNotStoppedDuringStartup();
       await orchestrator?.start?.({ client: resolvedClient });
+      await ensureNotStoppedDuringStartup();
       return {
         started: true,
         config: redactedConfig,
@@ -231,6 +281,7 @@ export async function createCompanionApp({
     llmClient,
     ttsAdapter,
     sttAdapter,
+    opusTranscoder,
     orchestrator,
     commandHandler,
     start,
