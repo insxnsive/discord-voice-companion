@@ -1,7 +1,7 @@
 import { validateEndpointUrl } from "../config/config.mjs";
 import { assertAdapterContract } from "../types.mjs";
 
-const DEFAULT_MAX_AUDIO_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_AUDIO_BYTES = 4 * 1024 * 1024;
 const MAX_AUDIO_BYTES_LIMIT = 16 * 1024 * 1024;
 const MAX_WS_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const DEFAULT_TTS_TIMEOUT_MS = 15000;
@@ -186,7 +186,10 @@ export function stripWavHeaderIfPresent(buf) {
         throw new Error("WAV header missing fmt chunk before data");
       }
       const dataStart = offset + 8;
-      if (chunkSize > 0 && chunkSize !== 0xffffffff && dataStart + chunkSize <= buffer.length) {
+      if (chunkSize !== 0xffffffff) {
+        if (dataStart + chunkSize > buffer.length) {
+          throw new Error("Truncated WAV data chunk");
+        }
         return buffer.subarray(dataStart, dataStart + chunkSize);
       }
       return buffer.subarray(dataStart);
@@ -682,11 +685,23 @@ export function createOpenAiTtsAdapter({
 
       let headerResolved = false;
       let headerBuf = Buffer.alloc(0);
+      let remainingDataBytes = Infinity;
       let firstByteAt = null;
       const emitter = createPcmEvenEmitter((chunk) => {
         if (firstByteAt === null) firstByteAt = now();
         if (typeof onPcmChunk === "function") onPcmChunk(chunk);
       });
+
+      const pushBoundedPcm = (buf) => {
+        if (buf.length === 0 || remainingDataBytes === 0) return;
+        const slice = Number.isFinite(remainingDataBytes)
+          ? buf.subarray(0, Math.min(buf.length, remainingDataBytes))
+          : buf;
+        if (Number.isFinite(remainingDataBytes)) {
+          remainingDataBytes -= slice.length;
+        }
+        if (slice.length > 0) emitter.push(slice);
+      };
 
       const tryResolveHeader = () => {
         const prefixLen = Math.min(4, headerBuf.length);
@@ -712,10 +727,11 @@ export function createOpenAiTtsAdapter({
             if (!sawFmt) {
               throw new Error("WAV header missing fmt chunk before data");
             }
+            remainingDataBytes = chunkSize !== 0xffffffff ? chunkSize : Infinity;
             headerResolved = true;
             const pcmStart = headerBuf.subarray(offset + 8);
             headerBuf = null;
-            if (pcmStart.length > 0) emitter.push(pcmStart);
+            pushBoundedPcm(pcmStart);
             return;
           }
           const step = 8 + chunkSize + (chunkSize % 2);
@@ -758,7 +774,7 @@ export function createOpenAiTtsAdapter({
         now,
         onChunk: (buf) => {
           if (headerResolved) {
-            emitter.push(buf);
+            pushBoundedPcm(buf);
             return;
           }
           headerBuf = headerBuf.length === 0 ? buf : Buffer.concat([headerBuf, buf]);
@@ -773,6 +789,9 @@ export function createOpenAiTtsAdapter({
         }
         emitter.push(headerBuf);
         headerBuf = null;
+      }
+      if (headerResolved && Number.isFinite(remainingDataBytes) && remainingDataBytes > 0) {
+        throw new Error("Truncated WAV data chunk");
       }
       emitter.flush();
 

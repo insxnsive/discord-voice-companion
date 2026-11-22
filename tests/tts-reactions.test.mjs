@@ -987,9 +987,9 @@ test("WS aligns odd base64 PCM chunks, routes callback/send errors, bounds warmu
   });
   await assert.rejects(() => warmupTimeoutAdapter.warmup(), /timed out|abort/i);
 
-  // Default maxAudioBytes allows 5 MiB (> 4 MiB, <= 16 MiB)
+  // Default maxAudioBytes is 4 MiB (rejects 5 MiB), while explicit override up to 16 MiB succeeds
   const fiveMiB = Buffer.alloc(5 * 1024 * 1024);
-  const httpDefaultAdapter = createElevenLabsHttpStreamAdapter({
+  const httpDefaultRejected = createElevenLabsHttpStreamAdapter({
     apiKey: "el-key",
     voiceId: "voice_capri_01",
     fetchImpl: async () =>
@@ -1003,7 +1003,30 @@ test("WS aligns odd base64 PCM chunks, routes callback/send errors, bounds warmu
         { status: 200 },
       ),
   });
-  const bigMeta = await httpDefaultAdapter.synthesizeClause({ text: "Long story", onPcmChunk: () => {} });
+  await assert.rejects(
+    () => httpDefaultRejected.synthesizeClause({ text: "Too long for default", onPcmChunk: () => {} }),
+    /size limit/i,
+  );
+
+  const httpExplicitOverride = createElevenLabsHttpStreamAdapter({
+    apiKey: "el-key",
+    voiceId: "voice_capri_01",
+    maxAudioBytes: 8 * 1024 * 1024,
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(fiveMiB);
+            c.close();
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  const bigMeta = await httpExplicitOverride.synthesizeClause({
+    text: "Long story with 8 MiB limit",
+    onPcmChunk: () => {},
+  });
   assert.equal(bigMeta.byteLength, 5 * 1024 * 1024);
 });
 
@@ -1061,4 +1084,74 @@ test("ReactionPool skips symlinks before openSync when O_NOFOLLOW is undefined a
   assert.equal(stored.frames48kOpus[0][0], 1);
   assert.equal(Object.isFrozen(stored), true);
   assert.equal(Object.isFrozen(stored.frames48kOpus), true);
+});
+
+test("OpenAI TTS clips streamed WAV at declared data chunk extent and rejects truncated WAV data", async () => {
+  const pcm = Buffer.alloc(48000);
+  for (let i = 0; i < pcm.length; i += 2) {
+    pcm.writeInt16LE(((i * 7) % 32768) - 16384, i);
+  }
+  const trailingList = Buffer.from("LIST\x04\x00\x00\x00INFO", "latin1");
+  assert.equal(trailingList.length, 12);
+
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + pcm.length + trailingList.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(24000, 24);
+  header.writeUInt32LE(48000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(pcm.length, 40);
+
+  const wavWithTrailingList = Buffer.concat([header, pcm, trailingList]);
+  const streamedChunks = [];
+  const oaAdapter = createOpenAiTtsAdapter({
+    apiKey: "sk-test-key",
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(wavWithTrailingList.subarray(0, 20000));
+            controller.enqueue(wavWithTrailingList.subarray(20000, 48040));
+            controller.enqueue(wavWithTrailingList.subarray(48040));
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  const res = await oaAdapter.synthesizeClause({
+    text: "Bounded data extent",
+    onPcmChunk: (buf) => streamedChunks.push(Buffer.from(buf)),
+  });
+  assert.equal(res.byteLength, 48000);
+  assert.equal(Buffer.concat(streamedChunks).equals(pcm), true);
+
+  const truncatedWav = Buffer.concat([header, pcm.subarray(0, 1000)]);
+  assert.throws(() => stripWavHeaderIfPresent(truncatedWav), /Truncated WAV/i);
+
+  const truncAdapter = createOpenAiTtsAdapter({
+    apiKey: "sk-test-key",
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(truncatedWav.subarray(0, 500));
+            controller.enqueue(truncatedWav.subarray(500));
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  await assert.rejects(
+    () => truncAdapter.synthesizeClause({ text: "Truncated audio", onPcmChunk: () => {} }),
+    /Truncated WAV/i,
+  );
 });
