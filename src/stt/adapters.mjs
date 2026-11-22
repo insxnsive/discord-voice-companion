@@ -224,10 +224,9 @@ async function runHttpRequest({
     if (error instanceof SttRequestError) {
       throw error;
     }
-    if (error?.name === "AbortError") {
-      throw new SttRequestError(`${label} aborted`);
-    }
-    if (controller.signal.aborted) {
+    if (controller.signal.aborted || error?.name === "AbortError") {
+      // The caller signal wins over the internal timer, so an expired timer
+      // reads as timed out and a caller abort reads as aborted.
       throw new SttRequestError(signal?.aborted ? `${label} aborted` : `${label} timed out`);
     }
     // Anything else, including Node fetch TypeErrors that may echo request
@@ -363,6 +362,7 @@ async function transcribeOverSocket({
 
     detach.push(
       onSocket(socket, "message", (data) => {
+        if (settled || signal?.aborted || isClosed?.()) return;
         if (socketMessageLength(data) > maxResponseBytes) {
           finish(new SttRequestError(`${label} response exceeded the size limit`));
           return;

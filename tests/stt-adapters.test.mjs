@@ -721,3 +721,39 @@ test("close() marks the adapter closed, closes tracked sockets, and blocks new w
   await assert.rejects(() => adapter.transcribe(PCM), /closed/i);
   assert.equal(MockWebSocket.instances.length, 1);
 });
+
+test("REST internal timeouts report timed out instead of aborted", async () => {
+  const adapter = createRestWhisperAdapter({
+    provider: "openai",
+    apiKey: "sk_test_key",
+    timeoutMs: 50,
+    fetchImpl: (url, options) =>
+      new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      }),
+  });
+
+  await assert.rejects(() => adapter.transcribe(PCM), /timed out/i);
+});
+
+test("REST adapters cancel the error body before reporting a status failure", async () => {
+  let cancelled = false;
+  const adapter = createRestWhisperAdapter({
+    provider: "openai",
+    apiKey: "sk_test_key",
+    fetchImpl: async () => ({
+      status: 401,
+      ok: false,
+      body: {
+        cancel: async () => {
+          cancelled = true;
+        },
+      },
+    }),
+  });
+
+  await assert.rejects(() => adapter.transcribe(PCM), /401/);
+  assert.equal(cancelled, true);
+});
