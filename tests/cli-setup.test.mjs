@@ -263,6 +263,7 @@ test("createCompanionApp loads clips inside trustedRootDir, absorbs warmup failu
   const root = path.resolve(REPO_ROOT, "app-root");
   const cacheDir = path.resolve(root, ".cache", "reactions");
   mockFs.dirs.add(root);
+  mockFs.dirs.add(path.resolve(root, ".cache"));
   mockFs.dirs.add(cacheDir);
   mockFs.files.set(path.join(cacheDir, "subtle_breath_01.pcm"), Buffer.from([1, 2, 3, 4]));
   mockFs.files.set(
@@ -1138,8 +1139,8 @@ test("redactConfig strips credentials, query strings, and fragments from endpoin
 
   assert.equal(redacted.discord.token, "[REDACTED]");
   assert.equal(redacted.llm.apiKey, "[REDACTED]");
-  assert.equal(redacted.llm.baseUrl, "https://api.openai.com/v1");
-  assert.equal(redacted.stt.localUrl, "http://127.0.0.1:8080/v1");
-  assert.equal(redacted.tts.baseUrl, "https://tts.example.com/v1");
+  assert.equal(redacted.llm.baseUrl, "https://api.openai.com");
+  assert.equal(redacted.stt.localUrl, "http://127.0.0.1:8080");
+  assert.equal(redacted.tts.baseUrl, "https://tts.example.com");
   assert.equal(redacted.extraBroken.baseUrl, "[REDACTED]");
 });

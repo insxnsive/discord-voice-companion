@@ -6,7 +6,15 @@ const DEFAULT_PERSONA_PROMPT =
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const SAFE_HEADER_NAMES = new Set(["x-opencode-client", "content-type", "accept", "user-agent"]);
+// Header names whose values may be echoed in diagnostics, and only when the value is one of
+// the fixed literals below. Any other value for these names, and every value for any other
+// header name, is reported as set ("[REDACTED]") without its content.
+const SAFE_HEADER_VALUES = new Map([
+  ["x-opencode-client", new Set(["discord-voice-companion"])],
+  ["content-type", new Set(["application/json"])],
+  ["accept", new Set(["application/json", "text/event-stream", "*/*"])],
+  ["user-agent", new Set(["discord-voice-companion"])],
+]);
 const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f]/;
 
 function deepFreeze(value) {
@@ -445,7 +453,10 @@ function redactUrlCredentials(value) {
   if (typeof value !== "string" || value.length === 0) return value;
   try {
     const parsed = new URL(value);
-    return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
+    if (parsed.origin === "null") return "[REDACTED]";
+    // Diagnostics report scheme, host and port only. Any path can carry a tenant label or a
+    // token, so none is echoed.
+    return parsed.origin;
   } catch {
     return "[REDACTED]";
   }
@@ -464,10 +475,13 @@ function redactNode(value, inHeaders = false) {
     if (FORBIDDEN_KEYS.has(key) || key === "extraBody") continue;
     const entry = value[key];
     if (inHeaders) {
-      copy[key] =
-        SAFE_HEADER_NAMES.has(key.toLowerCase()) || !isNonEmptySecret(entry)
-          ? redactNode(entry, false)
-          : "[REDACTED]";
+      if (!isNonEmptySecret(entry)) {
+        copy[key] = redactNode(entry, false);
+      } else if (typeof entry === "string" && SAFE_HEADER_VALUES.get(key.toLowerCase())?.has(entry)) {
+        copy[key] = entry;
+      } else {
+        copy[key] = "[REDACTED]";
+      }
     } else if (SECRET_KEY_PATTERN.test(key) && isNonEmptySecret(entry)) {
       copy[key] = "[REDACTED]";
     } else if (URL_KEY_PATTERN.test(key) && typeof entry === "string" && entry.length > 0) {

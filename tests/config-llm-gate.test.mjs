@@ -565,3 +565,53 @@ test("B1-REWORK-2: trailing SSE catch, bounded gate response, extraBody omission
   assert.deepEqual(bigGate, { shouldReply: false, reason: "gate_error", usedGateModel: true });
   assert.equal(cancelledBigGate, true);
 });
+
+test("C5 diagnostics: redactConfig reports scheme, host and port only and never echoes any path content", () => {
+  const redacted = redactConfig({
+    llm: { baseUrl: "https://api.example.com/v1/tok_AbC123xyz9876" },
+    stt: { localUrl: "http://127.0.0.1:8080/v1" },
+    tts: { baseUrl: "https://tts.example.com:8443/Secret-Path/abc" },
+    extra: { baseUrl: "https://host.example.com/a/b/c/d/e/f" },
+    label: { baseUrl: "https://proxy.example.com/private-label/v1" },
+    broken: { baseUrl: "not a url" },
+  });
+  assert.equal(redacted.llm.baseUrl, "https://api.example.com");
+  assert.equal(redacted.stt.localUrl, "http://127.0.0.1:8080");
+  assert.equal(redacted.tts.baseUrl, "https://tts.example.com:8443");
+  assert.equal(redacted.label.baseUrl, "https://proxy.example.com");
+  assert.equal(redacted.extra.baseUrl, "https://host.example.com");
+  assert.equal(redacted.broken.baseUrl, "[REDACTED]");
+  assert.equal(JSON.stringify(redacted).includes("tok_AbC123xyz9876"), false);
+  assert.equal(JSON.stringify(redacted).includes("Secret-Path"), false);
+  assert.equal(JSON.stringify(redacted).includes("private-label"), false);
+});
+
+test("C5 diagnostics: custom values of allowlisted header names are reported as set, not echoed", () => {
+  const redacted = redactConfig({
+    llm: {
+      headers: {
+        "x-opencode-client": "discord-voice-companion",
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        "user-agent": "sk-live-leaked-token",
+        "x-opencode-client-extra": "custom-value",
+        empty: "",
+      },
+    },
+  });
+  assert.equal(redacted.llm.headers["x-opencode-client"], "discord-voice-companion");
+  assert.equal(redacted.llm.headers["Content-Type"], "application/json");
+  assert.equal(redacted.llm.headers.Accept, "text/event-stream");
+  assert.equal(redacted.llm.headers["user-agent"], "[REDACTED]");
+  assert.equal(redacted.llm.headers["x-opencode-client-extra"], "[REDACTED]");
+  assert.equal(redacted.llm.headers.empty, "");
+
+  const viaLoad = loadConfig({
+    env: { LLM_PROVIDER: "opencode" },
+    configPath: "config.json",
+    fsImpl: makeMemoryFs({
+      "config.json": JSON.stringify({ llm: { headers: { "x-opencode-client": "custom-tenant-4411" } } }),
+    }),
+  });
+  assert.equal(redactConfig(viaLoad).llm.headers["x-opencode-client"], "[REDACTED]");
+});

@@ -121,16 +121,10 @@ async function readBoundedAudioStream(response, { maxAudioBytes, signal, now, on
   let firstByteAt = null;
 
   if (!response.body) {
-    const buf = Buffer.from(await response.arrayBuffer());
-    if (buf.length > maxAudioBytes) {
-      throw new Error("TTS audio exceeded size limit");
-    }
-    if (buf.length > 0) {
-      firstByteAt = now();
-      onChunk(buf);
-      byteLength = buf.length;
-    }
-    return { firstByteAt, byteLength };
+    // A body that is not a stream cannot be bounded: arrayBuffer() allocates the whole payload
+    // before any cap can run, and a declared content-length is caller-controlled metadata
+    // that does not limit that allocation. Only a readable stream is accepted.
+    throw new Error("TTS response body is not a stream, so its size cannot be bounded");
   }
 
   const reader = response.body.getReader();
@@ -192,6 +186,16 @@ export function stripWavHeaderIfPresent(buf, { sampleRate = 24000 } = {}) {
     throw new Error("Invalid WAV header");
   }
 
+  // The whole buffer is known here, so the declared RIFF container size must match it exactly
+  // once the data chunk is located (truncation is reported first). 0xffffffff is the
+  // streaming sentinel and skips the comparison.
+  const riffSize = buffer.readUInt32LE(4);
+  const assertRiffMatchesBuffer = () => {
+    if (riffSize !== 0xffffffff && riffSize + 8 !== buffer.length) {
+      throw new Error("WAV RIFF length does not match buffer size");
+    }
+  };
+
   const scanLimit = Math.min(buffer.length, MAX_WAV_SCAN_BYTES);
   let offset = 12;
   let sawFmt = false;
@@ -207,8 +211,10 @@ export function stripWavHeaderIfPresent(buf, { sampleRate = 24000 } = {}) {
         if (dataStart + chunkSize > buffer.length) {
           throw new Error("Truncated WAV data chunk");
         }
+        assertRiffMatchesBuffer();
         return buffer.subarray(dataStart, dataStart + chunkSize);
       }
+      assertRiffMatchesBuffer();
       return buffer.subarray(dataStart);
     }
     const step = 8 + chunkSize + (chunkSize % 2);
@@ -741,6 +747,16 @@ export function createOpenAiTtsAdapter({
       let headerResolved = false;
       let headerBuf = Buffer.alloc(0);
       let remainingDataBytes = Infinity;
+      // Outer RIFF length is only known for streamed input once the header arrives, so it is
+      // enforced against the running total and again at end of stream. A 0xffffffff declared
+      // size is the streaming sentinel and keeps only the bounded header scan.
+      let declaredRiffEnd = null;
+      let receivedBytes = 0;
+      const assertWithinDeclaredRiff = () => {
+        if (declaredRiffEnd !== null && receivedBytes > declaredRiffEnd) {
+          throw new Error("WAV RIFF length exceeded by streamed data");
+        }
+      };
       let firstByteAt = null;
       const emitter = createPcmEvenEmitter((chunk) => {
         if (firstByteAt === null) firstByteAt = now();
@@ -772,6 +788,13 @@ export function createOpenAiTtsAdapter({
         if (headerBuf.toString("ascii", 8, 12) !== "WAVE") {
           throw new Error("Invalid WAV header");
         }
+        if (declaredRiffEnd === null) {
+          const riffSize = headerBuf.readUInt32LE(4);
+          if (riffSize !== 0xffffffff) declaredRiffEnd = riffSize + 8;
+        }
+        // The overrun may already be known from the first chunk. Reject it here, before the
+        // header scan hands any PCM from that chunk to the emitter.
+        assertWithinDeclaredRiff();
 
         const scanLimit = Math.min(headerBuf.length, MAX_WAV_SCAN_BYTES);
         let offset = 12;
@@ -782,6 +805,13 @@ export function createOpenAiTtsAdapter({
           if (chunkId === "data") {
             if (!sawFmt) {
               throw new Error("WAV header missing fmt chunk before data");
+            }
+            if (
+              declaredRiffEnd !== null &&
+              chunkSize !== 0xffffffff &&
+              offset + 8 + chunkSize > declaredRiffEnd
+            ) {
+              throw new Error("WAV data chunk exceeds RIFF length");
             }
             remainingDataBytes = chunkSize !== 0xffffffff ? chunkSize : Infinity;
             headerResolved = true;
@@ -820,17 +850,20 @@ export function createOpenAiTtsAdapter({
         }
       };
 
-      await readBoundedAudioStream(response, {
+      const streamResult = await readBoundedAudioStream(response, {
         maxAudioBytes: safeMaxAudioBytes,
         signal: combinedSignal,
         now,
         onChunk: (buf) => {
+          receivedBytes += buf.length;
           if (headerResolved) {
+            assertWithinDeclaredRiff();
             pushBoundedPcm(buf);
             return;
           }
           headerBuf = headerBuf.length === 0 ? buf : Buffer.concat([headerBuf, buf]);
           tryResolveHeader();
+          assertWithinDeclaredRiff();
         },
       });
 
@@ -844,6 +877,9 @@ export function createOpenAiTtsAdapter({
       }
       if (headerResolved && Number.isFinite(remainingDataBytes) && remainingDataBytes > 0) {
         throw new Error("Truncated WAV data chunk");
+      }
+      if (declaredRiffEnd !== null && streamResult.byteLength !== declaredRiffEnd) {
+        throw new Error("WAV RIFF length does not match streamed size");
       }
       emitter.flush();
 
