@@ -204,6 +204,13 @@ export class PerSpeakerVad {
     this.maxSpeakers = maxSpeakers;
     this.idleSpeakerTtlMs = idleSpeakerTtlMs;
     this.maxPendingFrames = maxPendingFrames;
+    if (
+      !Number.isSafeInteger(maxInFlightFrames) ||
+      maxInFlightFrames < 1 ||
+      maxInFlightFrames > 256
+    ) {
+      throw new RangeError("maxInFlightFrames must be an integer between 1 and 256");
+    }
     this.maxInFlightFrames = maxInFlightFrames;
     this.inFlightCount = 0;
     this.isBotSpeaking = isBotSpeaking;
@@ -261,12 +268,17 @@ export class PerSpeakerVad {
       () => undefined,
     );
 
+    let outcome;
     try {
-      return await task;
+      outcome = await task;
     } finally {
       state.pendingCount -= 1;
       this.inFlightCount -= 1;
     }
+    // Release the ingress slot before external callbacks so slow STT or LLM
+    // work downstream can never starve the VAD.
+    if (typeof outcome?.post === "function") await outcome.post();
+    return outcome?.result;
   }
 
   #validateFrame(frame) {
@@ -376,22 +388,23 @@ export class PerSpeakerVad {
     if (!state.detector) {
       const detector = await this.detectorFactory(userId);
       if (!this.#isCurrent(userId, state, startEpoch)) {
-        return { ignored: true, dropped: "reset" };
+        return { result: { ignored: true, dropped: "reset" } };
       }
       state.detector = detector;
     }
 
     if (!this.#isCurrent(userId, state, startEpoch)) {
-      return { ignored: true, dropped: "reset" };
+      return { result: { ignored: true, dropped: "reset" } };
     }
 
     const samples = pcm16MonoToFloat32(pcm16kMono);
     const probability = await state.detector(samples);
     if (!this.#isCurrent(userId, state, startEpoch)) {
-      return { ignored: true, dropped: "reset" };
+      return { result: { ignored: true, dropped: "reset" } };
     }
 
     const isSpeech = probability >= this.speechThreshold;
+    let post;
 
     if (isSpeech) {
       state.speechMs += this.frameMs;
@@ -406,6 +419,9 @@ export class PerSpeakerVad {
           displayName: state.displayName,
           timestampMs,
         });
+        if (!this.#isCurrent(userId, state, startEpoch)) {
+          return { result: { ignored: true, dropped: "reset" } };
+        }
       }
 
       if (!state.bargeInFired && state.speechMs >= this.bargeInMs && this.isBotSpeaking()) {
@@ -415,13 +431,16 @@ export class PerSpeakerVad {
           displayName: state.displayName,
           timestampMs,
         });
+        if (!this.#isCurrent(userId, state, startEpoch)) {
+          return { result: { ignored: true, dropped: "reset" } };
+        }
       }
 
       if (
         state.bufferedBytes >= this.maxUtteranceBytes ||
         state.speechMs >= this.maxUtteranceMs
       ) {
-        await this.#finish(state, timestampMs);
+        post = this.#finish(state, timestampMs);
       }
     } else if (state.active) {
       state.silenceMs += this.frameMs;
@@ -429,11 +448,14 @@ export class PerSpeakerVad {
         this.#appendChunk(state, pcm16kMono);
       }
       if (state.silenceMs >= this.hangoverMs || state.bufferedBytes >= this.maxUtteranceBytes) {
-        await this.#finish(state, timestampMs);
+        post = this.#finish(state, timestampMs);
       }
     }
 
-    return { ignored: false, speech: isSpeech, probability };
+    return {
+      result: { ignored: false, speech: isSpeech, probability },
+      post,
+    };
   }
 
   #appendChunk(state, frame) {
@@ -441,7 +463,7 @@ export class PerSpeakerVad {
     state.bufferedBytes += frame.byteLength;
   }
 
-  async #finish(state, timestampMs) {
+  #finish(state, timestampMs) {
     const chunks = state.chunks;
     const speechMs = state.speechMs;
     const { userId, displayName } = state;
@@ -456,17 +478,20 @@ export class PerSpeakerVad {
     state.detector?.reset?.();
 
     if (speechMs < this.minSpeechMs) {
-      this.onNoiseDrop?.({ userId, displayName, speechMs });
-      return;
+      return async () => {
+        this.onNoiseDrop?.({ userId, displayName, speechMs });
+      };
     }
 
-    await this.onSpeechEnd?.({
-      userId,
-      displayName,
-      pcm16kMono: Buffer.concat(chunks),
-      durationMs: speechMs,
-      endedAt: timestampMs,
-    });
+    return async () => {
+      await this.onSpeechEnd?.({
+        userId,
+        displayName,
+        pcm16kMono: Buffer.concat(chunks),
+        durationMs: speechMs,
+        endedAt: timestampMs,
+      });
+    };
   }
 
   /** Drop one speaker's buffered utterance and detector state. */

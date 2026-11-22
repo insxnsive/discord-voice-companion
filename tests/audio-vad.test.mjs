@@ -741,3 +741,84 @@ test("createFrameAccumulator rejects invalid frame and chunk limits", () => {
   );
   assert.doesNotThrow(() => createFrameAccumulator(2048, { maxChunkBytes: 2048 }));
 });
+
+test("resetSpeaker inside onSpeechStart suppresses the utterance", async () => {
+  const ends = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 10,
+    maxUtteranceBytes: 640,
+    onSpeechStart: () => vad.resetSpeaker("u1"),
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+
+  assert.equal(ends.length, 0);
+  assert.equal(vad.speakers.has("u1"), false);
+});
+
+test("resetSpeaker inside onBargeIn suppresses the stale speech end", async () => {
+  const ends = [];
+  const barges = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 40,
+    maxUtteranceBytes: 9 * VAD_FRAME_BYTES,
+    isBotSpeaking: () => true,
+    onBargeIn: (event) => {
+      barges.push(event);
+      vad.resetSpeaker("u2");
+    },
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  for (let i = 0; i < 9; i += 1) {
+    await vad.pushFrame({
+      userId: "u2",
+      displayName: "Ben",
+      pcm16kMono: monoFrame(9000),
+      timestampMs: i * 20,
+    });
+  }
+
+  assert.equal(barges.length, 1);
+  assert.equal(ends.length, 0);
+});
+
+test("a slow onSpeechEnd does not hold VAD in-flight slots", async () => {
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 40,
+    maxUtteranceBytes: 3 * VAD_FRAME_BYTES,
+    hangoverMs: 240,
+    maxInFlightFrames: 1,
+    onSpeechEnd: () => new Promise(() => {}),
+  });
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 40 });
+
+  const hung = vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(0), timestampMs: 60 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const next = await vad.pushFrame({
+    userId: "u1",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 80,
+  });
+
+  assert.notEqual(next.dropped, "global_backpressure");
+  assert.equal(vad.inFlightCount, 0);
+  void hung;
+});
+
+test("maxInFlightFrames must be an integer between 1 and 256", () => {
+  for (const invalid of [0, -1, 1.5, 257]) {
+    assert.throws(() => new PerSpeakerVad({ maxInFlightFrames: invalid }), RangeError);
+  }
+  assert.doesNotThrow(() => new PerSpeakerVad({ maxInFlightFrames: 1 }));
+  assert.doesNotThrow(() => new PerSpeakerVad({ maxInFlightFrames: 256 }));
+});
