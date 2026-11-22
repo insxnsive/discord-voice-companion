@@ -12,6 +12,7 @@ export const DEFAULT_STT_TIMEOUT_MS = 15000;
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f]/;
+const HEADER_CONTROL_PATTERN = /[\r\n\u0000]/;
 const HALLUCINATIONS = new Set([
   "thank you",
   "thanks for watching",
@@ -27,6 +28,30 @@ class SttRequestError extends Error {}
 function assertPositiveLimit(value, label) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new RangeError(`${label} must be a positive integer`);
+  }
+}
+
+function assertResponseLimit(value) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > DEFAULT_MAX_RESPONSE_BYTES) {
+    throw new RangeError(
+      `maxResponseBytes must be a positive integer <= ${DEFAULT_MAX_RESPONSE_BYTES}`,
+    );
+  }
+}
+
+function assertApiKey(apiKey, label) {
+  if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
+    throw new RangeError(`${label} requires an API key`);
+  }
+  if (HEADER_CONTROL_PATTERN.test(apiKey)) {
+    throw new RangeError(`${label} API key contains invalid characters`);
+  }
+}
+
+function assertHeaderValue(value, label) {
+  if (value === undefined || value === null) return;
+  if (typeof value !== "string" || HEADER_CONTROL_PATTERN.test(value)) {
+    throw new RangeError(`${label} contains invalid characters`);
   }
 }
 
@@ -59,6 +84,9 @@ function assertWebSocketUrl(rawUrl, label = "url") {
   const text = String(rawUrl ?? "");
   if (!text || CONTROL_CHAR_PATTERN.test(text)) {
     throw new RangeError(`${label} contains invalid characters`);
+  }
+  if (text.includes("#") || text.includes("?")) {
+    throw new RangeError(`${label} must not contain query parameters or fragments`);
   }
   let parsed;
   try {
@@ -144,7 +172,7 @@ async function readBoundedBody(res, maxResponseBytes) {
         total += chunk.byteLength;
         if (total > maxResponseBytes) {
           await reader.cancel?.().catch?.(() => {});
-          throw new RangeError("STT response exceeded the maximum allowed size");
+          throw new SttRequestError("STT response exceeded the maximum allowed size");
         }
         chunks.push(chunk);
       }
@@ -157,14 +185,14 @@ async function readBoundedBody(res, maxResponseBytes) {
   if (typeof res?.arrayBuffer === "function") {
     const buffer = Buffer.from(await res.arrayBuffer());
     if (buffer.byteLength > maxResponseBytes) {
-      throw new RangeError("STT response exceeded the maximum allowed size");
+      throw new SttRequestError("STT response exceeded the maximum allowed size");
     }
     return buffer.toString("utf8");
   }
 
   const text = typeof res?.text === "function" ? await res.text() : "";
   if (Buffer.byteLength(text, "utf8") > maxResponseBytes) {
-    throw new RangeError("STT response exceeded the maximum allowed size");
+    throw new SttRequestError("STT response exceeded the maximum allowed size");
   }
   return text;
 }
@@ -193,12 +221,17 @@ async function runHttpRequest({
     });
     return await handleResponse(res);
   } catch (error) {
-    if (error instanceof SttRequestError || error instanceof RangeError || error instanceof TypeError) {
+    if (error instanceof SttRequestError) {
       throw error;
+    }
+    if (error?.name === "AbortError") {
+      throw new SttRequestError(`${label} aborted`);
     }
     if (controller.signal.aborted) {
       throw new SttRequestError(signal?.aborted ? `${label} aborted` : `${label} timed out`);
     }
+    // Anything else, including Node fetch TypeErrors that may echo request
+    // material, collapses to a fixed message.
     throw new SttRequestError(`${label} request failed`);
   } finally {
     clearTimeout(timer);
@@ -268,14 +301,19 @@ async function transcribeOverSocket({
   maxResponseBytes,
   buildMessages,
   readFinal,
-  registerSocket,
+  sockets,
+  isClosed,
 }) {
   if (signal?.aborted) throw new SttRequestError(`${label} aborted`);
 
   const Impl = await resolveWebSocketImpl(WebSocketImpl);
+  if (signal?.aborted || isClosed?.()) {
+    throw new SttRequestError(`${label} aborted`);
+  }
+
   const socket = new Impl(socketUrl, { headers, maxPayload: maxResponseBytes });
+  sockets?.add(socket);
   attachPermanentErrorHandler(socket);
-  registerSocket?.(socket);
 
   return await new Promise((resolve, reject) => {
     let settled = false;
@@ -294,7 +332,7 @@ async function transcribeOverSocket({
           // Listener removal is best effort.
         }
       }
-      registerSocket?.(null);
+      sockets?.delete(socket);
       try {
         socket.close?.();
       } catch {
@@ -310,6 +348,11 @@ async function transcribeOverSocket({
 
     detach.push(
       onSocket(socket, "open", () => {
+        if (settled) return;
+        if (signal?.aborted || isClosed?.()) {
+          finish(new SttRequestError(`${label} aborted`));
+          return;
+        }
         try {
           for (const message of buildMessages(pcm16kMono)) socket.send(message);
         } catch {
@@ -346,6 +389,10 @@ async function transcribeOverSocket({
         finish(new SttRequestError(`${label} closed before a final transcript`)),
       ),
     );
+
+    if (signal?.aborted || isClosed?.()) {
+      finish(new SttRequestError(`${label} aborted`));
+    }
   });
 }
 
@@ -360,11 +407,11 @@ export function createDeepgramSttAdapter({
   WebSocketImpl,
 } = {}) {
   assertMaxPcmBytes(maxPcmBytes);
-  assertPositiveLimit(maxResponseBytes, "maxResponseBytes");
+  assertResponseLimit(maxResponseBytes);
   assertPositiveLimit(timeoutMs, "timeoutMs");
-  if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
-    throw new RangeError("Deepgram STT adapter requires an API key");
-  }
+  assertApiKey(apiKey, "Deepgram STT adapter");
+  assertHeaderValue(language, "language");
+  assertHeaderValue(model, "model");
 
   const target = assertWebSocketUrl(url ?? "wss://api.deepgram.com/v1/listen", "stt.deepgramUrl");
   target.searchParams.set("model", model);
@@ -375,13 +422,15 @@ export function createDeepgramSttAdapter({
   target.searchParams.set("interim_results", "false");
   const socketUrl = target.toString();
 
-  let activeSocket = null;
+  const sockets = new Set();
+  let closed = false;
 
   return {
     name() {
       return "deepgram";
     },
     async transcribe(pcm16kMono, { signal } = {}) {
+      if (closed) throw new SttRequestError("Deepgram STT adapter is closed");
       const byteLength = assertValidPcm16kMono(pcm16kMono, maxPcmBytes);
       if (byteLength === 0) return "";
       return await transcribeOverSocket({
@@ -401,19 +450,20 @@ export function createDeepgramSttAdapter({
           const transcript = parsed.channel?.alternatives?.[0]?.transcript;
           return typeof transcript === "string" ? transcript : "";
         },
-        registerSocket: (socket) => {
-          activeSocket = socket;
-        },
+        sockets,
+        isClosed: () => closed,
       });
     },
     close() {
-      const socket = activeSocket;
-      activeSocket = null;
-      try {
-        socket?.close?.();
-      } catch {
-        // Idempotent shutdown.
+      closed = true;
+      for (const socket of [...sockets]) {
+        try {
+          socket.close?.();
+        } catch {
+          // Idempotent shutdown.
+        }
       }
+      sockets.clear();
     },
   };
 }
@@ -429,11 +479,11 @@ export function createScribeSttAdapter({
   WebSocketImpl,
 } = {}) {
   assertMaxPcmBytes(maxPcmBytes);
-  assertPositiveLimit(maxResponseBytes, "maxResponseBytes");
+  assertResponseLimit(maxResponseBytes);
   assertPositiveLimit(timeoutMs, "timeoutMs");
-  if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
-    throw new RangeError("ElevenLabs STT adapter requires an API key");
-  }
+  assertApiKey(apiKey, "ElevenLabs STT adapter");
+  assertHeaderValue(languageCode, "language");
+  assertHeaderValue(modelId, "model");
 
   const target = assertWebSocketUrl(
     url ?? "wss://api.elevenlabs.io/v1/speech-to-text/realtime",
@@ -444,13 +494,15 @@ export function createScribeSttAdapter({
   target.searchParams.set("language_code", languageCode);
   const socketUrl = target.toString();
 
-  let activeSocket = null;
+  const sockets = new Set();
+  let closed = false;
 
   return {
     name() {
       return "elevenlabs";
     },
     async transcribe(pcm16kMono, { signal } = {}) {
+      if (closed) throw new SttRequestError("ElevenLabs STT adapter is closed");
       const byteLength = assertValidPcm16kMono(pcm16kMono, maxPcmBytes);
       if (byteLength === 0) return "";
       return await transcribeOverSocket({
@@ -480,19 +532,20 @@ export function createScribeSttAdapter({
           }
           return typeof parsed.text === "string" ? parsed.text : "";
         },
-        registerSocket: (socket) => {
-          activeSocket = socket;
-        },
+        sockets,
+        isClosed: () => closed,
       });
     },
     close() {
-      const socket = activeSocket;
-      activeSocket = null;
-      try {
-        socket?.close?.();
-      } catch {
-        // Idempotent shutdown.
+      closed = true;
+      for (const socket of [...sockets]) {
+        try {
+          socket.close?.();
+        } catch {
+          // Idempotent shutdown.
+        }
       }
+      sockets.clear();
     },
   };
 }
@@ -507,8 +560,10 @@ export function createFasterWhisperAdapter({
   fetchImpl = fetch,
 } = {}) {
   assertMaxPcmBytes(maxPcmBytes);
-  assertPositiveLimit(maxResponseBytes, "maxResponseBytes");
+  assertResponseLimit(maxResponseBytes);
   assertPositiveLimit(timeoutMs, "timeoutMs");
+  assertHeaderValue(language, "language");
+  assertHeaderValue(prompt, "prompt");
 
   const base = validateEndpointUrl(baseUrl, "stt.localUrl");
   const primaryUrl = `${base}/v1/audio/pcm`;
@@ -599,16 +654,14 @@ export function createRestWhisperAdapter({
   fetchImpl = fetch,
 } = {}) {
   assertMaxPcmBytes(maxPcmBytes);
-  assertPositiveLimit(maxResponseBytes, "maxResponseBytes");
+  assertResponseLimit(maxResponseBytes);
   assertPositiveLimit(timeoutMs, "timeoutMs");
 
   const preset = REST_PRESETS[provider];
   if (!preset) {
     throw new RangeError(`unsupported REST STT provider: ${String(provider)}`);
   }
-  if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
-    throw new RangeError(`${provider} STT adapter requires an API key`);
-  }
+  assertApiKey(apiKey, `${provider} STT adapter`);
 
   const base = validateEndpointUrl(baseUrl ?? preset.baseUrl, "stt.baseUrl");
   const resolvedModel = model ?? preset.model;

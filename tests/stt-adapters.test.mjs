@@ -468,3 +468,256 @@ test("createSttAdapter maps config.stt keys and rejects unknown providers", () =
     RangeError,
   );
 });
+
+test("REST adapters honor caller aborts quickly and sanitize fetch TypeErrors", async () => {
+  const controller = new AbortController();
+  const aborting = createRestWhisperAdapter({
+    provider: "openai",
+    apiKey: "sk_test_key",
+    timeoutMs: 2000,
+    fetchImpl: (url, options) =>
+      new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        });
+      }),
+  });
+
+  const startedAt = Date.now();
+  const pending = aborting.transcribe(PCM, { signal: controller.signal });
+  setTimeout(() => controller.abort(), 20);
+
+  await assert.rejects(pending, /aborted/i);
+  assert.ok(Date.now() - startedAt < 300, "caller abort must beat the internal timeout");
+
+  const leaking = createRestWhisperAdapter({
+    provider: "groq",
+    apiKey: "groq_key",
+    fetchImpl: async () => {
+      throw new TypeError("fetch failed: secret-token");
+    },
+  });
+
+  await assert.rejects(
+    () => leaking.transcribe(PCM),
+    (error) => {
+      assert.match(error.message, /request failed/i);
+      assert.equal(error.message.includes("secret-token"), false);
+      return true;
+    },
+  );
+});
+
+test("createSttAdapter forwards the mapped credential to each provider", async () => {
+  MockWebSocket.reset();
+  const stt = {
+    deepgramApiKey: "dg_key",
+    elevenlabsApiKey: "el_key",
+    openaiApiKey: "openai_key",
+    groqApiKey: "groq_key",
+    localUrl: "http://127.0.0.1:4373",
+    language: "en",
+  };
+
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return jsonResponse({ text: "ok" });
+  };
+
+  const groq = createSttAdapter({ stt: { ...stt, provider: "groq" } }, { fetchImpl });
+  await groq.transcribe(PCM);
+  assert.equal(calls.at(-1).options.headers.Authorization, "Bearer groq_key");
+
+  const openai = createSttAdapter({ stt: { ...stt, provider: "openai" } }, { fetchImpl });
+  await openai.transcribe(PCM);
+  assert.equal(calls.at(-1).options.headers.Authorization, "Bearer openai_key");
+
+  const deepgram = createSttAdapter(
+    { stt: { ...stt, provider: "deepgram" } },
+    { WebSocketImpl: MockWebSocket },
+  );
+  const deepgramPromise = deepgram.transcribe(PCM);
+  await tick();
+  const deepgramSocket = MockWebSocket.last();
+  assert.equal(deepgramSocket.options.headers.Authorization, "Token dg_key");
+  deepgramSocket.emit(
+    "message",
+    JSON.stringify({ is_final: true, channel: { alternatives: [{ transcript: "ok" }] } }),
+  );
+  assert.equal(await deepgramPromise, "ok");
+
+  const scribe = createSttAdapter(
+    { stt: { ...stt, provider: "elevenlabs" } },
+    { WebSocketImpl: MockWebSocket },
+  );
+  const scribePromise = scribe.transcribe(PCM);
+  await tick();
+  const scribeSocket = MockWebSocket.last();
+  assert.equal(scribeSocket.options.headers["xi-api-key"], "el_key");
+  scribeSocket.emit(
+    "message",
+    JSON.stringify({ message_type: "committed_transcript", text: "ok" }),
+  );
+  assert.equal(await scribePromise, "ok");
+});
+
+test("Deepgram ignores interim transcripts and resolves only on the final one", async () => {
+  MockWebSocket.reset();
+  const adapter = createDeepgramSttAdapter({ apiKey: "dg_key", WebSocketImpl: MockWebSocket });
+  const promise = adapter.transcribe(PCM);
+  await tick();
+  const socket = MockWebSocket.last();
+
+  socket.emit(
+    "message",
+    JSON.stringify({
+      is_final: false,
+      speech_final: false,
+      channel: { alternatives: [{ transcript: "partial wrong" }] },
+    }),
+  );
+  socket.emit(
+    "message",
+    JSON.stringify({ is_final: true, channel: { alternatives: [{ transcript: "final right" }] } }),
+  );
+
+  assert.equal(await promise, "final right");
+});
+
+test("faster-whisper sends the prompt header and falls back on 405 after cancelling the body", async () => {
+  let cancelled = false;
+  const calls = [];
+  const adapter = createFasterWhisperAdapter({
+    baseUrl: "http://127.0.0.1:4373",
+    prompt: "library returns",
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), options });
+      if (calls.length === 1) {
+        return {
+          status: 405,
+          ok: false,
+          body: {
+            cancel: async () => {
+              cancelled = true;
+            },
+          },
+        };
+      }
+      return jsonResponse({ text: "after fallback" });
+    },
+  });
+
+  assert.equal(await adapter.transcribe(PCM), "after fallback");
+  assert.equal(calls[0].url, "http://127.0.0.1:4373/v1/audio/pcm");
+  assert.equal(calls[0].options.headers["x-prompt"], "library returns");
+  assert.equal(cancelled, true);
+  assert.ok(calls[1].url.endsWith("/v1/audio/transcriptions"));
+});
+
+test("WebSocket adapters reject odd length PCM before opening a socket", async () => {
+  MockWebSocket.reset();
+  const deepgram = createDeepgramSttAdapter({ apiKey: "dg_key", WebSocketImpl: MockWebSocket });
+  await assert.rejects(() => deepgram.transcribe(Buffer.from([1, 2, 3])), RangeError);
+
+  const scribe = createScribeSttAdapter({ apiKey: "el_key", WebSocketImpl: MockWebSocket });
+  await assert.rejects(() => scribe.transcribe(Buffer.from([1, 2, 3])), RangeError);
+
+  assert.equal(MockWebSocket.instances.length, 0);
+});
+
+test("adapters reject credentials with control characters without echoing them", async () => {
+  assert.throws(
+    () => createRestWhisperAdapter({ provider: "openai", apiKey: "sk_bad\nkey" }),
+    (error) => {
+      assert.equal(error.message.includes("sk_bad"), false);
+      return true;
+    },
+  );
+  assert.throws(
+    () => createDeepgramSttAdapter({ apiKey: "bad\rkey" }),
+    (error) => {
+      assert.equal(error.message.includes("bad"), false);
+      return true;
+    },
+  );
+  assert.throws(
+    () => createScribeSttAdapter({ apiKey: "bad\u0000key" }),
+    (error) => {
+      assert.equal(error.message.includes("bad"), false);
+      return true;
+    },
+  );
+  assert.throws(
+    () => createFasterWhisperAdapter({ prompt: "line one\nline two" }),
+    (error) => {
+      assert.equal(error.message.includes("line one"), false);
+      return true;
+    },
+  );
+});
+
+test("adapters reject response limits above the 256 KiB ceiling", () => {
+  const tooLarge = DEFAULT_MAX_RESPONSE_BYTES + 1;
+  assert.throws(
+    () => createFasterWhisperAdapter({ maxResponseBytes: tooLarge }),
+    RangeError,
+  );
+  assert.throws(
+    () => createRestWhisperAdapter({ provider: "openai", apiKey: "k", maxResponseBytes: tooLarge }),
+    RangeError,
+  );
+  assert.throws(
+    () => createDeepgramSttAdapter({ apiKey: "k", maxResponseBytes: tooLarge }),
+    RangeError,
+  );
+  assert.throws(
+    () => createScribeSttAdapter({ apiKey: "k", maxResponseBytes: tooLarge }),
+    RangeError,
+  );
+});
+
+test("WebSocket URLs with query strings or fragments are rejected", () => {
+  assert.throws(
+    () =>
+      createDeepgramSttAdapter({
+        apiKey: "k",
+        url: "wss://api.deepgram.com/v1/listen?model=nova-3",
+      }),
+    RangeError,
+  );
+  assert.throws(
+    () =>
+      createDeepgramSttAdapter({
+        apiKey: "k",
+        url: "wss://api.deepgram.com/v1/listen#fragment",
+      }),
+    RangeError,
+  );
+  assert.throws(
+    () =>
+      createScribeSttAdapter({
+        apiKey: "k",
+        url: "wss://api.elevenlabs.io/v1/speech-to-text/realtime?x=1",
+      }),
+    RangeError,
+  );
+});
+
+test("close() marks the adapter closed, closes tracked sockets, and blocks new work", async () => {
+  MockWebSocket.reset();
+  MockWebSocket.autoOpen = false;
+  const adapter = createDeepgramSttAdapter({ apiKey: "dg_key", WebSocketImpl: MockWebSocket });
+
+  const pending = adapter.transcribe(PCM);
+  await tick();
+  const socket = MockWebSocket.last();
+
+  adapter.close();
+  assert.equal(socket.closed, true);
+  await assert.rejects(pending, /aborted|closed|failed/i);
+  await assert.rejects(() => adapter.transcribe(PCM), /closed/i);
+  assert.equal(MockWebSocket.instances.length, 1);
+});
