@@ -1141,3 +1141,274 @@ test("createDecoder close deletes the real backend decoder exactly once", async 
   second.close();
   assert.equal(deletes, 2);
 });
+
+test("stateful decoders through the real transcoder do not share state", async () => {
+  class StatefulBackend {
+    static Application = { AUDIO: 2049 };
+
+    constructor() {
+      this.count = 0;
+    }
+
+    encode() {
+      return Buffer.from([1]);
+    }
+
+    decode() {
+      this.count += 1;
+      return Buffer.alloc(2, this.count);
+    }
+
+    delete() {}
+  }
+
+  const transcoder = await createOpusTranscoder({
+    loadNative: async () => {
+      throw new Error("no native");
+    },
+    loadJs: async () => ({ default: StatefulBackend }),
+  });
+
+  const first = transcoder.createDecoder();
+  const second = transcoder.createDecoder();
+
+  assert.equal(first.decode(Buffer.from([1]))[0], 1);
+  assert.equal(first.decode(Buffer.from([1]))[0], 2);
+  assert.equal(second.decode(Buffer.from([1]))[0], 1);
+  assert.equal(first.decode(Buffer.from([1]))[0], 3);
+});
+
+test("60 ms silence frames count as 60 ms toward the hangover", async () => {
+  const ends = [];
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => (samples) => (computeRms(samples) > 0 ? 0.9 : 0),
+    minSpeechMs: 60,
+    hangoverMs: 120,
+    frameMs: 20,
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000, 960), timestampMs: 60 });
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(0, 960), timestampMs: 120 });
+  await vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(0, 960), timestampMs: 180 });
+
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0].durationMs, 60);
+  assert.equal(ends[0].endedAt, 180);
+});
+
+test("union cap counts quarantined users and never evicts them", async () => {
+  let calls = 0;
+  let rejectHung;
+  const hung = new Promise((resolve, reject) => {
+    rejectHung = reject;
+  });
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      calls += 1;
+      return calls === 1 ? () => hung : () => 0.9;
+    },
+    detectorTimeoutMs: 20,
+    maxSpeakers: 2,
+    maxInFlightFrames: 8,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "q", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+  assert.equal(vad.quarantinedUsers.has("q"), true);
+
+  await vad.pushFrame({ userId: "a", pcm16kMono: monoFrame(9000), timestampMs: 10 });
+  assert.equal(vad.speakers.get("a").active, true);
+
+  const blocked = await vad.pushFrame({
+    userId: "b",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 20,
+  });
+  assert.equal(blocked.dropped, "max_speakers");
+  assert.equal(vad.quarantinedUsers.has("q"), true);
+  assert.equal(vad.speakers.has("a"), true);
+  assert.equal(vad.speakers.has("b"), false);
+
+  rejectHung(new Error("late"));
+});
+
+test("union size counts quarantined users that left the speaker map", async () => {
+  let calls = 0;
+  let rejectHung;
+  const hung = new Promise((resolve, reject) => {
+    rejectHung = reject;
+  });
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      calls += 1;
+      return calls === 1 ? () => hung : () => 0.9;
+    },
+    detectorTimeoutMs: 20,
+    maxSpeakers: 2,
+    maxInFlightFrames: 8,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "q", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+  vad.resetSpeaker("q");
+  assert.equal(vad.speakers.has("q"), false);
+  assert.equal(vad.quarantinedUsers.has("q"), true);
+
+  await vad.pushFrame({ userId: "a", pcm16kMono: monoFrame(9000), timestampMs: 10 });
+  const blocked = await vad.pushFrame({
+    userId: "b",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 20,
+  });
+  assert.equal(blocked.dropped, "max_speakers");
+
+  rejectHung(new Error("late"));
+});
+
+test("eviction picks the LRU live speaker and never the quarantined one", async () => {
+  let factoryCalls = 0;
+  let rejectHung;
+  const hung = new Promise((resolve, reject) => {
+    rejectHung = reject;
+  });
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      factoryCalls += 1;
+      if (factoryCalls === 1) return () => hung;
+      return (samples) => (computeRms(samples) > 0 ? 0.9 : 0);
+    },
+    detectorTimeoutMs: 20,
+    maxSpeakers: 3,
+    maxInFlightFrames: 8,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "q", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+  assert.equal(vad.quarantinedUsers.has("q"), true);
+
+  await vad.pushFrame({ userId: "a", pcm16kMono: monoFrame(0), timestampMs: 10 });
+  await vad.pushFrame({ userId: "b", pcm16kMono: monoFrame(0), timestampMs: 20 });
+  assert.equal(vad.speakers.size, 3);
+
+  await vad.pushFrame({ userId: "c", pcm16kMono: monoFrame(0), timestampMs: 30 });
+
+  assert.equal(vad.speakers.has("a"), false);
+  assert.equal(vad.speakers.has("b"), true);
+  assert.equal(vad.speakers.has("c"), true);
+  assert.equal(vad.quarantinedUsers.has("q"), true);
+
+  const qFrame = await vad.pushFrame({
+    userId: "q",
+    pcm16kMono: monoFrame(9000),
+    timestampMs: 40,
+  });
+  assert.equal(qFrame.dropped, "detector_quarantined");
+
+  rejectHung(new Error("late"));
+});
+
+test("decode after close throws instead of reusing a deleted decoder", async () => {
+  class DeleteCountingBackend {
+    static Application = { AUDIO: 2049 };
+
+    constructor() {
+      this.deleted = false;
+    }
+
+    encode() {
+      return Buffer.from([1]);
+    }
+
+    decode() {
+      return Buffer.alloc(2);
+    }
+
+    delete() {
+      this.deleted = true;
+    }
+  }
+
+  const transcoder = await createOpusTranscoder({
+    loadNative: async () => {
+      throw new Error("no native");
+    },
+    loadJs: async () => ({ default: DeleteCountingBackend }),
+  });
+
+  const decoder = transcoder.createDecoder();
+  assert.equal(decoder.decode(Buffer.from([1])).length, 2);
+  decoder.close();
+  assert.throws(() => decoder.decode(Buffer.from([1])), /closed/i);
+});
+
+test("the post-eviction union recheck rejects a re-entrant admission", async () => {
+  let vad;
+  const reentry = { fired: false };
+  vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      const detect = () => 0.9;
+      detect.reset = () => {
+        if (!reentry.fired) {
+          reentry.fired = true;
+          vad.pushFrame({ userId: "v", pcm16kMono: monoFrame(0), timestampMs: 5 });
+        }
+      };
+      return detect;
+    },
+    minSpeechMs: 40,
+    maxSpeakers: 2,
+    maxInFlightFrames: 8,
+  });
+
+  await vad.pushFrame({ userId: "a", pcm16kMono: monoFrame(0), timestampMs: 10 });
+  await vad.pushFrame({ userId: "b", pcm16kMono: monoFrame(0), timestampMs: 20 });
+
+  const c = await vad.pushFrame({ userId: "c", pcm16kMono: monoFrame(0), timestampMs: 30 });
+
+  assert.equal(c.dropped, "max_speakers");
+  assert.ok(vad.speakers.size <= 2);
+  assert.equal(vad.speakers.has("c"), false);
+});
+
+test("eviction reset that re-enters admission is caught by the recheck", async () => {
+  let vad;
+  let resetCalls = 0;
+  let reentrantPush = null;
+  const frame = Buffer.alloc(640, 1);
+
+  vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      const detect = async () => 0.1;
+      detect.reset = () => {
+        resetCalls += 1;
+        reentrantPush = vad?.pushFrame({
+          userId: "v",
+          displayName: "V",
+          pcm16kMono: frame,
+          timestampMs: 300,
+        });
+      };
+      return detect;
+    },
+    maxSpeakers: 2,
+    idleSpeakerTtlMs: 60000,
+    maxInFlightFrames: 8,
+  });
+
+  await vad.pushFrame({ userId: "a", pcm16kMono: frame, timestampMs: 100 });
+  await vad.pushFrame({ userId: "b", pcm16kMono: frame, timestampMs: 200 });
+  const c = await vad.pushFrame({ userId: "c", pcm16kMono: frame, timestampMs: 300 });
+  if (reentrantPush) await reentrantPush;
+
+  assert.equal(resetCalls, 1);
+  assert.deepEqual(c, { ignored: true, dropped: "max_speakers" });
+  assert.deepEqual([...vad.speakers.keys()].sort(), ["b", "v"]);
+  assert.equal(vad.speakers.size, 2);
+});

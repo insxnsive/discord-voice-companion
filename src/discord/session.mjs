@@ -22,6 +22,7 @@ export const REQUIRED_VOICE_PERMISSIONS = Object.freeze(["Connect", "Speak"]);
 
 const MIN_NODE = "22.12.0";
 const MAX_SPEAKER_CACHE = 256;
+const MAX_SPEAKER_DECODERS = 32;
 const MAX_SPEAKER_FETCHES = 64;
 const SPEAKER_NEGATIVE_TTL_MS = 60000;
 const DAVE_MODULES = Object.freeze(["@discordjs/voice", "@snazzah/davey"]);
@@ -363,8 +364,16 @@ export function createVoiceOrchestrator({
   function detachReceiver() {
     const speaking = voiceConnection?.receiver?.speaking;
     if (speaking && speakingListener) {
-      speaking.off?.("start", speakingListener);
-      speaking.removeListener?.("start", speakingListener);
+      try {
+        speaking.off?.("start", speakingListener);
+      } catch {
+        // A throwing receiver removal must not stop teardown.
+      }
+      try {
+        speaking.removeListener?.("start", speakingListener);
+      } catch {
+        // Best effort.
+      }
     }
     speakingListener = null;
 
@@ -392,26 +401,66 @@ export function createVoiceOrchestrator({
   function detachConnectionListeners() {
     if (voiceConnection) {
       if (voiceStateListener && state.client?.off) {
-        state.client.off("voiceStateUpdate", voiceStateListener);
-        state.client.removeListener?.("voiceStateUpdate", voiceStateListener);
+        try {
+          state.client.off("voiceStateUpdate", voiceStateListener);
+        } catch {
+          // A throwing removal hook must not stop teardown.
+        }
+        try {
+          state.client.removeListener?.("voiceStateUpdate", voiceStateListener);
+        } catch {
+          // Best effort.
+        }
       }
       if (connectionStateListener) {
-        voiceConnection.off?.("stateChange", connectionStateListener);
-        voiceConnection.removeListener?.("stateChange", connectionStateListener);
+        try {
+          voiceConnection.off?.("stateChange", connectionStateListener);
+        } catch {
+          // Best effort.
+        }
+        try {
+          voiceConnection.removeListener?.("stateChange", connectionStateListener);
+        } catch {
+          // Best effort.
+        }
       }
       if (connectionErrorListener) {
-        voiceConnection.off?.("error", connectionErrorListener);
-        voiceConnection.removeListener?.("error", connectionErrorListener);
+        try {
+          voiceConnection.off?.("error", connectionErrorListener);
+        } catch {
+          // Best effort.
+        }
+        try {
+          voiceConnection.removeListener?.("error", connectionErrorListener);
+        } catch {
+          // Best effort.
+        }
       }
     }
     if (voicePlayer) {
       if (playerStateListener) {
-        voicePlayer.off?.("stateChange", playerStateListener);
-        voicePlayer.removeListener?.("stateChange", playerStateListener);
+        try {
+          voicePlayer.off?.("stateChange", playerStateListener);
+        } catch {
+          // Best effort.
+        }
+        try {
+          voicePlayer.removeListener?.("stateChange", playerStateListener);
+        } catch {
+          // Best effort.
+        }
       }
       if (playerErrorListener) {
-        voicePlayer.off?.("error", playerErrorListener);
-        voicePlayer.removeListener?.("error", playerErrorListener);
+        try {
+          voicePlayer.off?.("error", playerErrorListener);
+        } catch {
+          // Best effort.
+        }
+        try {
+          voicePlayer.removeListener?.("error", playerErrorListener);
+        } catch {
+          // Best effort.
+        }
       }
     }
     voiceStateListener = null;
@@ -439,6 +488,15 @@ export function createVoiceOrchestrator({
     voicePlayer = null;
     voiceConnection = null;
     activePlaybackUserId = null;
+  }
+
+  function clearGuildScopedState() {
+    state.mutedUsers.clear();
+    vad.setIgnoredUsers?.([]);
+    state.chimeMode = CHIME_MODES.includes(config?.chime?.mode) ? config.chime.mode : "smart";
+    state.fillerMode = FILLER_MODES.includes(config?.reactions?.mode)
+      ? config.reactions.mode
+      : "adaptive";
   }
 
   function resetTurnAndSession() {
@@ -517,7 +575,31 @@ export function createVoiceOrchestrator({
       const codec = await ensureTranscoder();
       if (!isSnapshotCurrent(snap)) return;
       let streamDecoder = speakerDecoders.get(userId);
-      if (!streamDecoder) {
+      if (streamDecoder) {
+        speakerDecoders.delete(userId);
+        speakerDecoders.set(userId, streamDecoder);
+      } else {
+        if (speakerDecoders.size >= MAX_SPEAKER_DECODERS) {
+          let oldestId = null;
+          for (const id of speakerDecoders.keys()) {
+            if (!userStreams.has(id)) {
+              oldestId = id;
+              break;
+            }
+          }
+          if (!oldestId) {
+            // Every cached decoder is still serving a live stream. Decline the
+            // new subscription rather than closing a decoder in use.
+            return;
+          }
+          const evicted = speakerDecoders.get(oldestId);
+          speakerDecoders.delete(oldestId);
+          try {
+            evicted?.close?.();
+          } catch {
+            // Decoder teardown is best effort.
+          }
+        }
         streamDecoder = codec?.createDecoder ? codec.createDecoder() : codec;
         speakerDecoders.set(userId, streamDecoder);
       }
@@ -1025,63 +1107,54 @@ export function createVoiceOrchestrator({
           });
 
           bindReceiver(guildId, channelId, state.sessionToken);
-        } catch (error) {
-          destroyVoice();
-          state.guildId = null;
-          state.channelId = null;
-          state.active = false;
-          state.sessionToken = null;
-          throw error;
-        }
 
-        connectionErrorListener = () => {
-          state.lastError = "voice connection error";
-        };
-        voiceConnection?.on?.("error", connectionErrorListener);
-
-        connectionStateListener = (_oldState, nextState) => {
-          try {
-            if (state.closed) return;
-            if (nextState?.status === "disconnected" || nextState?.status === "destroyed") {
-              if (voiceConnection?.joinConfig?.channelId !== state.channelId) {
-                handleExternalVoiceTransition(null);
-              }
-              return;
-            }
-            const bound = voiceConnection?.joinConfig?.channelId;
-            if (bound && bound !== state.channelId) {
-              handleExternalVoiceTransition(bound);
-            }
-          } catch {
+          connectionErrorListener = () => {
             state.lastError = "voice connection error";
-          }
-        };
-        voiceConnection?.on?.("stateChange", connectionStateListener);
+          };
+          voiceConnection?.on?.("error", connectionErrorListener);
 
-        if (typeof state.client?.on === "function") {
-          voiceStateListener = (_oldState, newState) => {
+          connectionStateListener = (_oldState, nextState) => {
             try {
-              if (state.closed || !resolvedBotUserId) return;
-              if ((newState?.id ?? _oldState?.id) !== resolvedBotUserId) return;
-              if (newState?.guild?.id && state.guildId && newState.guild.id !== state.guildId) {
+              if (state.closed) return;
+              if (nextState?.status === "disconnected" || nextState?.status === "destroyed") {
+                if (voiceConnection?.joinConfig?.channelId !== state.channelId) {
+                  handleExternalVoiceTransition(null);
+                }
                 return;
               }
-              const nextChannelId = newState?.channelId ?? null;
-              if (nextChannelId !== state.channelId) {
-                handleExternalVoiceTransition(nextChannelId);
+              const bound = voiceConnection?.joinConfig?.channelId;
+              if (bound && bound !== state.channelId) {
+                handleExternalVoiceTransition(bound);
               }
             } catch {
-              state.lastError = "voice state failed";
+              state.lastError = "voice connection error";
             }
           };
-          state.client.on("voiceStateUpdate", voiceStateListener);
-        }
+          voiceConnection?.on?.("stateChange", connectionStateListener);
 
-        if (
-          typeof resolvedVoiceDeps.createAudioPlayer === "function" &&
-          typeof voiceConnection?.subscribe === "function"
-        ) {
-          try {
+          if (typeof state.client?.on === "function") {
+            voiceStateListener = (_oldState, newState) => {
+              try {
+                if (state.closed || !resolvedBotUserId) return;
+                if ((newState?.id ?? _oldState?.id) !== resolvedBotUserId) return;
+                if (newState?.guild?.id && state.guildId && newState.guild.id !== state.guildId) {
+                  return;
+                }
+                const nextChannelId = newState?.channelId ?? null;
+                if (nextChannelId !== state.channelId) {
+                  handleExternalVoiceTransition(nextChannelId);
+                }
+              } catch {
+                state.lastError = "voice state failed";
+              }
+            };
+            state.client.on("voiceStateUpdate", voiceStateListener);
+          }
+
+          if (
+            typeof resolvedVoiceDeps.createAudioPlayer === "function" &&
+            typeof voiceConnection?.subscribe === "function"
+          ) {
             voicePlayer = resolvedVoiceDeps.createAudioPlayer();
             voiceConnection.subscribe(voicePlayer);
 
@@ -1094,14 +1167,15 @@ export function createVoiceOrchestrator({
               if (nextState?.status === "idle") activePlaybackUserId = null;
             };
             voicePlayer?.on?.("stateChange", playerStateListener);
-          } catch (error) {
-            destroyVoice();
-            state.guildId = null;
-            state.channelId = null;
-            state.active = false;
-            state.sessionToken = null;
-            throw error;
           }
+        } catch (error) {
+          destroyVoice();
+          state.guildId = null;
+          state.channelId = null;
+          state.active = false;
+          state.sessionToken = null;
+          clearGuildScopedState();
+          throw error;
         }
       }
 
