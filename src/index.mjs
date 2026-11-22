@@ -29,6 +29,7 @@ export async function createCompanionApp({
   soulPath = "SOUL.md",
   trustedRootDir = process.cwd(),
   fsImpl = fs,
+  createDiscordClientImpl,
   createLlmClientImpl = createLlmClient,
   createTtsAdapterImpl = createTtsAdapter,
   createSttAdapterImpl,
@@ -57,6 +58,25 @@ export async function createCompanionApp({
 
   const missingRuntimeModules = [];
 
+  let resolvedClient = client ?? null;
+  if (!resolvedClient) {
+    if (typeof createDiscordClientImpl === "function") {
+      resolvedClient = createDiscordClientImpl({ config });
+    } else if (config.discord.token) {
+      const discordMod = await loadOptionalModule("discord.js");
+      if (discordMod?.Client && discordMod?.GatewayIntentBits) {
+        resolvedClient = new discordMod.Client({
+          intents: [
+            discordMod.GatewayIntentBits.Guilds,
+            discordMod.GatewayIntentBits.GuildVoiceStates,
+          ],
+        });
+      } else {
+        missingRuntimeModules.push("discord.js");
+      }
+    }
+  }
+
   let sttAdapter = null;
   if (typeof createSttAdapterImpl === "function") {
     sttAdapter = createSttAdapterImpl(config);
@@ -78,7 +98,7 @@ export async function createCompanionApp({
       llmClient,
       ttsAdapter,
       sttAdapter,
-      client,
+      client: resolvedClient,
       voiceDeps,
     });
   } else {
@@ -93,7 +113,7 @@ export async function createCompanionApp({
         llmClient,
         ttsAdapter,
         sttAdapter,
-        client,
+        client: resolvedClient,
         voiceDeps,
       });
     } else {
@@ -108,7 +128,7 @@ export async function createCompanionApp({
       reactionPool,
       latencyTracker,
       orchestrator,
-      client,
+      client: resolvedClient,
     });
   } else {
     const commandMod = await loadOptionalModule("./discord/commands.mjs");
@@ -118,40 +138,94 @@ export async function createCompanionApp({
         reactionPool,
         latencyTracker,
         orchestrator,
-        client,
+        client: resolvedClient,
       });
     } else {
       missingRuntimeModules.push("./discord/commands.mjs");
     }
   }
 
+  let interactionListener = null;
+  if (
+    resolvedClient &&
+    typeof resolvedClient.on === "function" &&
+    commandHandler &&
+    typeof commandHandler.handleInteraction === "function"
+  ) {
+    interactionListener = (interaction) => commandHandler.handleInteraction(interaction);
+    resolvedClient.on("interactionCreate", interactionListener);
+  }
+
   let stopped = false;
+  let stoppingPromise = null;
+  let activeStart = null;
 
   async function start() {
-    if (!orchestrator && missingRuntimeModules.length > 0) {
-      throw new Error(
-        `Missing runtime module(s) required to start companion: ${missingRuntimeModules.join(", ")}`,
-      );
+    if (stopped || stoppingPromise) {
+      throw new Error("Companion has already been stopped");
     }
-    await ttsAdapter?.warmup?.().catch(() => {});
-    await orchestrator?.start?.({ client });
-    return {
-      started: true,
-      config: redactedConfig,
-      loadedReactionClips: reactionPool.size,
-    };
+    if (activeStart) return activeStart;
+
+    activeStart = (async () => {
+      if (!orchestrator && missingRuntimeModules.length > 0) {
+        throw new Error(
+          `Missing runtime module(s) required to start companion: ${missingRuntimeModules.join(", ")}`,
+        );
+      }
+      if (!orchestrator && config.discord.token && !resolvedClient && missingRuntimeModules.includes("discord.js")) {
+        throw new Error("discord.js package is required when DISCORD_BOT_TOKEN is configured");
+      }
+      if (typeof resolvedClient?.login === "function" && config.discord.token) {
+        await resolvedClient.login(config.discord.token);
+      }
+      if (stopped || stoppingPromise) {
+        throw new Error("Companion stopped during startup");
+      }
+      await ttsAdapter?.warmup?.().catch(() => {});
+      if (stopped || stoppingPromise) {
+        throw new Error("Companion stopped during startup");
+      }
+      await orchestrator?.start?.({ client: resolvedClient });
+      return {
+        started: true,
+        config: redactedConfig,
+        loadedReactionClips: reactionPool.size,
+      };
+    })();
+
+    try {
+      return await activeStart;
+    } finally {
+      activeStart = null;
+    }
   }
 
   async function stop() {
     if (stopped) return;
-    stopped = true;
-    await orchestrator?.close?.();
-    await ttsAdapter?.close?.();
-    await sttAdapter?.close?.();
+    if (stoppingPromise) return stoppingPromise;
+    stoppingPromise = (async () => {
+      if (resolvedClient && interactionListener) {
+        if (typeof resolvedClient.off === "function") {
+          resolvedClient.off("interactionCreate", interactionListener);
+        } else if (typeof resolvedClient.removeListener === "function") {
+          resolvedClient.removeListener("interactionCreate", interactionListener);
+        }
+        interactionListener = null;
+      }
+      await Promise.allSettled([
+        Promise.resolve().then(() => resolvedClient?.destroy?.()),
+        Promise.resolve().then(() => orchestrator?.close?.()),
+        Promise.resolve().then(() => ttsAdapter?.close?.()),
+        Promise.resolve().then(() => sttAdapter?.close?.()),
+      ]);
+      stopped = true;
+    })();
+    return stoppingPromise;
   }
 
   return {
     config: redactedConfig,
+    client: resolvedClient,
     reactionPool,
     latencyTracker,
     llmClient,

@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CHIME_MODES, FILLER_MODES, PROVIDERS } from "../types.mjs";
-import { loadConfig, redactConfig, validateEndpointUrl } from "../config/config.mjs";
+import { LLM_PRESETS, loadConfig, redactConfig, validateEndpointUrl } from "../config/config.mjs";
 import { createTtsAdapter } from "../tts/adapters.mjs";
 import { REACTION_CLIP_PROMPTS } from "../tts/reactions.mjs";
 
@@ -43,6 +43,57 @@ function resolveContainedPath(baseRoot, targetPath, label) {
     throw new RangeError(`${label} is outside trusted root`);
   }
   return { resolvedRoot, resolvedTarget };
+}
+
+function assertNoSymlinksOnPath(rootPath, targetPath, fsImpl) {
+  if (typeof fsImpl.lstatSync !== "function") return;
+  const rel = path.relative(rootPath, targetPath);
+  const segments = rel ? rel.split(path.sep).filter(Boolean) : [];
+  let cursor = rootPath;
+  const check = (candidate) => {
+    let st;
+    try {
+      st = fsImpl.lstatSync(candidate);
+    } catch (error) {
+      if (error && error.code === "ENOENT") return;
+      throw error;
+    }
+    if (st?.isSymbolicLink?.()) {
+      throw new RangeError("Setup target path cannot contain symlinks");
+    }
+  };
+  check(cursor);
+  for (const seg of segments) {
+    cursor = path.join(cursor, seg);
+    check(cursor);
+  }
+}
+
+function writePrivateFile(targetPath, data, { encoding, fsImpl }) {
+  if (typeof fsImpl.lstatSync === "function") {
+    let existing = null;
+    try {
+      existing = fsImpl.lstatSync(targetPath);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (existing?.isSymbolicLink?.()) {
+      throw new RangeError("Refusing to write to a symlink target");
+    }
+    if (existing) {
+      if (!existing.isFile?.()) {
+        throw new RangeError("Target path is not a regular file");
+      }
+      fsImpl.unlinkSync?.(targetPath);
+    }
+  }
+  const writeOpts = {
+    mode: 0o600,
+    flag: typeof fsImpl.unlinkSync === "function" ? "wx" : "w",
+  };
+  if (encoding) writeOpts.encoding = encoding;
+  fsImpl.writeFileSync(targetPath, data, writeOpts);
+  fsImpl.chmodSync?.(targetPath, 0o600);
 }
 
 /**
@@ -177,6 +228,7 @@ export async function pregenerateReactionClips({
   }
 
   fsImpl.mkdirSync(resolvedCacheDir, { recursive: true, mode: 0o700 });
+  fsImpl.chmodSync?.(resolvedCacheDir, 0o700);
   if (trustedRootDir && typeof fsImpl.realpathSync === "function") {
     const canonicalRoot = fsImpl.realpathSync(path.resolve(trustedRootDir));
     const canonicalDir = fsImpl.realpathSync(resolvedCacheDir);
@@ -185,6 +237,12 @@ export async function pregenerateReactionClips({
     }
     resolvedCacheDir = canonicalDir;
   }
+
+  assertNoSymlinksOnPath(
+    trustedRootDir ? path.resolve(trustedRootDir) : path.dirname(resolvedCacheDir),
+    resolvedCacheDir,
+    fsImpl,
+  );
 
   const files = [];
   for (const prompt of prompts) {
@@ -201,8 +259,7 @@ export async function pregenerateReactionClips({
     });
     const audioBuffer = Buffer.concat(chunks);
     const filePath = path.join(resolvedCacheDir, `${safeId}.pcm`);
-    fsImpl.writeFileSync(filePath, audioBuffer, { mode: 0o600 });
-    fsImpl.chmodSync?.(filePath, 0o600);
+    writePrivateFile(filePath, audioBuffer, { fsImpl });
     files.push(filePath);
   }
 
@@ -214,21 +271,31 @@ export async function pregenerateReactionClips({
 }
 
 async function collectInteractiveAnswers(promptImpl, defaults = {}) {
-  const ask = async (label, fallback = "") => {
-    const answer = await promptImpl(label, fallback);
+  const ask = async (label, fallback = "", opts = {}) => {
+    const answer = await promptImpl(label, fallback, opts);
     return typeof answer === "string" && answer.trim().length > 0 ? answer.trim() : fallback;
   };
 
-  const discordToken = await ask("Discord bot token");
+  const discordToken = await ask("Discord bot token", "", { secret: true });
   const discordAppId = await ask("Discord application id");
   const llmProvider = await ask("LLM provider (opencode/deepseek/openai/openrouter/groq/ollama/custom)", defaults.llmProvider ?? "deepseek");
-  const llmApiKey = llmProvider === "ollama" ? "" : await ask("LLM API key");
+  const llmApiKey = llmProvider === "ollama" ? "" : await ask("LLM API key", "", { secret: true });
   const llmBaseUrl = llmProvider === "custom" ? await ask("Custom LLM base URL") : "";
+  const preset = LLM_PRESETS[llmProvider];
+  let llmReplyModel = "";
+  let llmGateModel = "";
+  if (llmProvider === "custom" || !preset?.replyModel) {
+    llmReplyModel = assertNoControlChars(await ask("Custom LLM reply model"));
+    if (!llmReplyModel) {
+      throw new RangeError("Custom LLM provider requires a reply model");
+    }
+    llmGateModel = assertNoControlChars(await ask("Custom LLM gate model", llmReplyModel)) || llmReplyModel;
+  }
   const sttProvider = await ask("STT provider (deepgram/elevenlabs/openai/groq/faster-whisper)", defaults.sttProvider ?? "deepgram");
-  const sttApiKey = sttProvider === "faster-whisper" ? "" : await ask(`${sttProvider} STT API key`);
+  const sttApiKey = sttProvider === "faster-whisper" ? "" : await ask(`${sttProvider} STT API key`, "", { secret: true });
   const localSttUrl = sttProvider === "faster-whisper" ? await ask("Local faster-whisper URL", "http://127.0.0.1:4373") : "";
   const ttsProvider = await ask("TTS provider (elevenlabs/openai/openai-compatible)", defaults.ttsProvider ?? "elevenlabs");
-  const ttsApiKey = await ask(`${ttsProvider} TTS API key`);
+  const ttsApiKey = await ask(`${ttsProvider} TTS API key`, "", { secret: true });
   const ttsBaseUrl = ttsProvider === "openai-compatible" ? await ask("TTS base URL") : "";
   const elevenlabsVoiceId = await ask("TTS voice id", ttsProvider === "openai" ? "nova" : "");
   const expressiveInput = ttsProvider === "elevenlabs" ? await ask("Enable ElevenLabs v4 expressive audio tags? (true/false)", "false") : "false";
@@ -242,6 +309,8 @@ async function collectInteractiveAnswers(promptImpl, defaults = {}) {
     llmProvider,
     llmApiKey,
     llmBaseUrl,
+    llmReplyModel,
+    llmGateModel,
     sttProvider,
     sttApiKey,
     localSttUrl,
@@ -285,13 +354,23 @@ export async function runSetupWizard({
     envPath,
     "envPath",
   );
+  if (typeof fsImpl.realpathSync === "function") {
+    const canonicalRoot = fsImpl.realpathSync(resolvedRoot);
+    const parentCandidate = path.dirname(resolvedEnvPath);
+    if (typeof fsImpl.existsSync !== "function" || fsImpl.existsSync(parentCandidate)) {
+      const canonicalParent = fsImpl.realpathSync(parentCandidate);
+      if (!isWithinRoot(canonicalParent, canonicalRoot)) {
+        throw new RangeError("envPath parent directory is outside trusted root");
+      }
+    }
+  }
+  assertNoSymlinksOnPath(resolvedRoot, resolvedEnvPath, fsImpl);
 
   const envDir = path.dirname(resolvedEnvPath);
   if (typeof fsImpl.mkdirSync === "function") {
     fsImpl.mkdirSync(envDir, { recursive: true, mode: 0o700 });
   }
-  fsImpl.writeFileSync(resolvedEnvPath, envContent, { encoding: "utf8", mode: 0o600 });
-  fsImpl.chmodSync?.(resolvedEnvPath, 0o600);
+  writePrivateFile(resolvedEnvPath, envContent, { encoding: "utf8", fsImpl });
 
   const loadedConfig = loadConfig({ env: {}, envPath: resolvedEnvPath, fsImpl });
   const targetCacheDir = loadedConfig.reactions.cacheDir || cacheDir;
@@ -333,14 +412,36 @@ const isCliEntry =
 
 if (isCliEntry) {
   const readline = await import("node:readline/promises");
+  const { Writable } = await import("node:stream");
+  let muteOutput = false;
+  const silentOrEchoOutput = new Writable({
+    write(chunk, encoding, callback) {
+      if (!muteOutput) {
+        process.stdout.write(chunk, encoding);
+      }
+      callback();
+    },
+  });
   const rl = readline.createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output: silentOrEchoOutput,
+    terminal: Boolean(process.stdin.isTTY),
   });
   try {
     const result = await runSetupWizard({
-      promptImpl: async (question, fallback = "") => {
+      promptImpl: async (question, fallback = "", opts = {}) => {
         const suffix = fallback ? ` [${fallback}]` : "";
+        if (opts.secret) {
+          process.stdout.write(`${question}${suffix}: `);
+          muteOutput = true;
+          try {
+            const line = await rl.question("");
+            return line.trim() || fallback;
+          } finally {
+            muteOutput = false;
+            process.stdout.write("\n");
+          }
+        }
         const line = await rl.question(`${question}${suffix}: `);
         return line.trim() || fallback;
       },

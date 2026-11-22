@@ -10,6 +10,8 @@ import {
   runSetupWizard,
 } from "../src/cli/setup.mjs";
 import { createCompanionApp } from "../src/index.mjs";
+import { loadConfig } from "../src/config/config.mjs";
+import { createLlmClient } from "../src/llm/client.mjs";
 import { REACTION_CLIP_PROMPTS } from "../src/tts/reactions.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,25 +19,40 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 function createMockSetupFs() {
   const dirs = new Set([REPO_ROOT, path.posix.resolve("/trusted/root")]);
   const files = new Map();
+  const symlinks = new Set();
   const modes = new Map();
   const chmodCalls = [];
+  const unlinkCalls = [];
 
   return {
     dirs,
     files,
+    symlinks,
     modes,
     chmodCalls,
+    unlinkCalls,
     existsSync(target) {
       const key = path.resolve(target);
-      return dirs.has(key) || files.has(key);
+      return dirs.has(key) || files.has(key) || symlinks.has(key);
     },
     mkdirSync(target, opts = {}) {
       const key = path.resolve(target);
       dirs.add(key);
       if (opts.mode !== undefined) modes.set(key, opts.mode);
     },
+    unlinkSync(target) {
+      const key = path.resolve(target);
+      unlinkCalls.push(key);
+      files.delete(key);
+      symlinks.delete(key);
+    },
     writeFileSync(target, data, opts = {}) {
       const key = path.resolve(target);
+      if (opts?.flag === "wx" && (files.has(key) || dirs.has(key) || symlinks.has(key))) {
+        const err = new Error(`EEXIST: ${target}`);
+        err.code = "EEXIST";
+        throw err;
+      }
       files.set(key, Buffer.isBuffer(data) ? Buffer.from(data) : String(data));
       if (typeof opts === "object" && opts?.mode !== undefined) {
         modes.set(key, opts.mode);
@@ -61,6 +78,9 @@ function createMockSetupFs() {
     },
     lstatSync(target) {
       const key = path.resolve(target);
+      if (symlinks.has(key)) {
+        return { isSymbolicLink: () => true, isDirectory: () => false, isFile: () => false, dev: 1, ino: 9 };
+      }
       if (dirs.has(key)) {
         return { isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false, dev: 1, ino: 1 };
       }
@@ -326,8 +346,196 @@ test("SOUL.md and README.md pass the prose gate with required content and zero A
   assert.match(readmeText, /700\s*ms/);
   assert.match(readmeText, /22\.12\.0/);
   assert.match(readmeText, /0600/);
+  assert.match(readmeText, /0700/);
+  assert.match(readmeText, /WSS/i);
   assert.match(readmeText, /\/join/);
   assert.match(readmeText, /\/mute-user/);
   assert.match(readmeText, /faster-whisper/);
   assert.match(readmeText, /eleven_flash_v2_5/);
+});
+
+test("interactive custom LLM setup prompts for reply/gate models, marks secrets, enforces 0600/0700 chmods, and blocks symlinks", async () => {
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "wizard-custom-root");
+  mockFs.dirs.add(root);
+
+  const promptsSeen = [];
+  const scriptedReplies = {
+    "Discord bot token": "disc-secret",
+    "Discord application id": "app-999",
+    "LLM provider": "custom",
+    "LLM API key": "custom-llm-secret",
+    "Custom LLM base URL": "https://llm.example.com/v1",
+    "Custom LLM reply model": "custom-fast-chat",
+    "Custom LLM gate model": "custom-fast-gate",
+    "STT provider": "deepgram",
+    "deepgram STT API key": "dg-secret",
+    "TTS provider": "elevenlabs",
+    "elevenlabs TTS API key": "el-secret",
+    "TTS voice id": "voice-capri",
+  };
+
+  const out = await runSetupWizard({
+    promptImpl: async (question, fallback = "", opts = {}) => {
+      promptsSeen.push({ question, fallback, opts });
+      for (const [prefix, val] of Object.entries(scriptedReplies)) {
+        if (question.startsWith(prefix)) return val;
+      }
+      return fallback;
+    },
+    skipPregenerate: false,
+    ttsAdapterFactory: () => ({
+      async synthesizeClause({ onPcmChunk }) {
+        onPcmChunk(Buffer.from([1, 2, 3, 4]));
+        return { firstByteAt: 1, byteLength: 4 };
+      },
+      close() {},
+    }),
+    fsImpl: mockFs,
+    envPath: ".env",
+    cacheDir: ".cache/reactions",
+    trustedRootDir: root,
+  });
+
+  // Secret prompts must include { secret: true }
+  const secretPrompts = promptsSeen.filter((p) => p.opts?.secret === true);
+  assert.equal(secretPrompts.length, 4);
+  assert.ok(promptsSeen.some((p) => p.question.includes("reply model")));
+  assert.ok(promptsSeen.some((p) => p.question.includes("gate model")));
+
+  // Resulting .env loads cleanly into createLlmClient without throwing
+  const reloaded = loadConfig({ env: {}, envPath: out.envPath, fsImpl: mockFs });
+  assert.equal(reloaded.llm.replyModel, "custom-fast-chat");
+  assert.equal(reloaded.llm.gateModel, "custom-fast-gate");
+  const llm = createLlmClient({ config: reloaded });
+  assert.equal(typeof llm.streamReply, "function");
+
+  // chmod 0600 on .env and 0700 on cacheDir
+  assert.ok(mockFs.chmodCalls.some((c) => c.target === out.envPath && c.mode === 0o600));
+  assert.ok(mockFs.chmodCalls.some((c) => c.target === out.cacheDir && c.mode === 0o700));
+
+  // Symlinked .env and out-of-root envPath must both reject with RangeError
+  mockFs.symlinks.add(path.resolve(root, "link.env"));
+  await assert.rejects(
+    () =>
+      runSetupWizard({
+        answers: {
+          discordToken: "t",
+          discordAppId: "a",
+          llmProvider: "deepseek",
+          sttProvider: "deepgram",
+          ttsProvider: "elevenlabs",
+        },
+        skipPregenerate: true,
+        fsImpl: mockFs,
+        envPath: "link.env",
+        trustedRootDir: root,
+      }),
+    RangeError,
+  );
+  await assert.rejects(
+    () =>
+      runSetupWizard({
+        answers: {
+          discordToken: "t",
+          discordAppId: "a",
+          llmProvider: "deepseek",
+          sttProvider: "deepgram",
+          ttsProvider: "elevenlabs",
+        },
+        skipPregenerate: true,
+        fsImpl: mockFs,
+        envPath: "../outside.env",
+        trustedRootDir: root,
+      }),
+    RangeError,
+  );
+});
+
+test("createCompanionApp constructs Discord client, binds interactionCreate, logs in on start(), and closes adapters even when orchestrator.close rejects", async () => {
+  const { EventEmitter } = await import("node:events");
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, "app-client-root");
+  mockFs.dirs.add(root);
+  mockFs.files.set(
+    path.join(root, ".env"),
+    [
+      "DISCORD_BOT_TOKEN=bot-login-token",
+      "DISCORD_APP_ID=app-1",
+      "LLM_PROVIDER=deepseek",
+      "LLM_API_KEY=llm-k",
+      "STT_PROVIDER=deepgram",
+      "DEEPGRAM_API_KEY=dg-k",
+      "TTS_PROVIDER=elevenlabs",
+      "ELEVENLABS_API_KEY=el-k",
+      "ELEVENLABS_VOICE_ID=v-1",
+    ].join("\n"),
+  );
+
+  let fakeClient = null;
+  const interactionsHandled = [];
+  let loginTokenSeen = null;
+  let clientDestroyed = false;
+  let ttsClosed = false;
+  let sttClosed = false;
+
+  const app = await createCompanionApp({
+    env: {},
+    envPath: path.join(root, ".env"),
+    configPath: path.join(root, "config.json"),
+    soulPath: path.join(root, "SOUL.md"),
+    trustedRootDir: root,
+    fsImpl: mockFs,
+    createDiscordClientImpl: () => {
+      fakeClient = new EventEmitter();
+      fakeClient.login = async (tok) => {
+        loginTokenSeen = tok;
+      };
+      fakeClient.destroy = () => {
+        clientDestroyed = true;
+      };
+      return fakeClient;
+    },
+    createLlmClientImpl: () => ({ streamReply: async () => {}, shouldChimeIn: async () => false }),
+    createTtsAdapterImpl: () => ({
+      name: () => "elevenlabs-ws",
+      async warmup() {},
+      async synthesizeClause() {},
+      close() {
+        ttsClosed = true;
+      },
+    }),
+    createSttAdapterImpl: () => ({
+      name: () => "deepgram",
+      async transcribe() {},
+      close() {
+        sttClosed = true;
+      },
+    }),
+    createVoiceOrchestratorImpl: () => ({
+      async start() {},
+      async close() {
+        throw new Error("orchestrator teardown failed");
+      },
+    }),
+    createCommandHandlerImpl: () => ({
+      commands: [],
+      async handleInteraction(interaction) {
+        interactionsHandled.push(interaction.id);
+      },
+    }),
+  });
+
+  assert.equal(fakeClient.listenerCount("interactionCreate"), 1);
+  fakeClient.emit("interactionCreate", { id: "ix-1" });
+  assert.deepEqual(interactionsHandled, ["ix-1"]);
+
+  await app.start();
+  assert.equal(loginTokenSeen, "bot-login-token");
+
+  await app.stop();
+  assert.equal(clientDestroyed, true);
+  assert.equal(ttsClosed, true);
+  assert.equal(sttClosed, true);
+  assert.equal(fakeClient.listenerCount("interactionCreate"), 0);
 });
