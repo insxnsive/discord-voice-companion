@@ -1,7 +1,7 @@
 import { validateEndpointUrl } from "../config/config.mjs";
 import { assertAdapterContract } from "../types.mjs";
 
-const DEFAULT_MAX_AUDIO_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_AUDIO_BYTES = 16 * 1024 * 1024;
 const MAX_AUDIO_BYTES_LIMIT = 16 * 1024 * 1024;
 const MAX_WS_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const DEFAULT_TTS_TIMEOUT_MS = 15000;
@@ -181,6 +181,16 @@ export function stripWavHeaderIfPresent(buf) {
   while (offset + 8 <= scanLimit) {
     const chunkId = buffer.toString("ascii", offset, offset + 4);
     const chunkSize = buffer.readUInt32LE(offset + 4);
+    if (chunkId === "data") {
+      if (!sawFmt) {
+        throw new Error("WAV header missing fmt chunk before data");
+      }
+      const dataStart = offset + 8;
+      if (chunkSize > 0 && chunkSize !== 0xffffffff && dataStart + chunkSize <= buffer.length) {
+        return buffer.subarray(dataStart, dataStart + chunkSize);
+      }
+      return buffer.subarray(dataStart);
+    }
     const step = 8 + chunkSize + (chunkSize % 2);
     if (chunkSize > MAX_WAV_SCAN_BYTES || step < 8) {
       throw new Error("Invalid WAV chunk size");
@@ -195,11 +205,6 @@ export function stripWavHeaderIfPresent(buf) {
         throw new Error("Unsupported non-PCM WAV format");
       }
       sawFmt = true;
-    } else if (chunkId === "data") {
-      if (!sawFmt) {
-        throw new Error("WAV header missing fmt chunk before data");
-      }
-      return buffer.subarray(offset + 8);
     }
     offset += step;
   }
@@ -338,18 +343,23 @@ export function createElevenLabsWsAdapter({
 
   async function warmup() {
     if (idleSocket && idleSocket.readyState === 1) return;
-    const ws = await openSocket();
-    idleSocket = ws;
-    const clearIdle = attachSocketListeners(ws, {
-      close() {
-        if (idleSocket === ws) idleSocket = null;
-        clearIdle();
-      },
-      error() {
-        if (idleSocket === ws) idleSocket = null;
-        clearIdle();
-      },
-    });
+    const deadline = createTimeoutController(timeoutMs, "TTS WebSocket warmup");
+    try {
+      const ws = await openSocket(deadline.signal);
+      idleSocket = ws;
+      const clearIdle = attachSocketListeners(ws, {
+        close() {
+          if (idleSocket === ws) idleSocket = null;
+          clearIdle();
+        },
+        error() {
+          if (idleSocket === ws) idleSocket = null;
+          clearIdle();
+        },
+      });
+    } finally {
+      deadline.clear();
+    }
   }
 
   async function synthesizeClause({ text, signal, onPcmChunk } = {}) {
@@ -442,7 +452,12 @@ export function createElevenLabsWsAdapter({
                 }
                 byteLength += pcm.length;
                 if (firstByteAt === null) firstByteAt = now();
-                emitter.push(pcm);
+                try {
+                  emitter.push(pcm);
+                } catch (cbErr) {
+                  finish(cbErr instanceof Error ? cbErr : new Error("TTS WebSocket chunk callback failed"));
+                  return;
+                }
               }
             }
 
@@ -470,19 +485,23 @@ export function createElevenLabsWsAdapter({
           return;
         }
 
-        ws.send(
-          JSON.stringify({
-            text: " ",
-            voice_settings: { stability: 0.45, similarity_boost: 0.85 },
-          }),
-        );
-        ws.send(
-          JSON.stringify({
-            text: `${text} `,
-            try_trigger_generation: true,
-          }),
-        );
-        ws.send(JSON.stringify({ text: "" }));
+        try {
+          ws.send(
+            JSON.stringify({
+              text: " ",
+              voice_settings: { stability: 0.45, similarity_boost: 0.85 },
+            }),
+          );
+          ws.send(
+            JSON.stringify({
+              text: `${text} `,
+              try_trigger_generation: true,
+            }),
+          );
+          ws.send(JSON.stringify({ text: "" }));
+        } catch (sendErr) {
+          finish(sendErr instanceof Error ? sendErr : new Error("TTS WebSocket send failed"));
+        }
       });
     } finally {
       deadline.clear();
@@ -689,6 +708,16 @@ export function createOpenAiTtsAdapter({
         while (offset + 8 <= headerBuf.length) {
           const chunkId = headerBuf.toString("ascii", offset, offset + 4);
           const chunkSize = headerBuf.readUInt32LE(offset + 4);
+          if (chunkId === "data") {
+            if (!sawFmt) {
+              throw new Error("WAV header missing fmt chunk before data");
+            }
+            headerResolved = true;
+            const pcmStart = headerBuf.subarray(offset + 8);
+            headerBuf = null;
+            if (pcmStart.length > 0) emitter.push(pcmStart);
+            return;
+          }
           const step = 8 + chunkSize + (chunkSize % 2);
           if (chunkSize > MAX_WAV_SCAN_BYTES || step < 8) {
             throw new Error("Invalid WAV chunk size");
@@ -709,15 +738,6 @@ export function createOpenAiTtsAdapter({
               throw new Error("Unsupported non-PCM WAV format");
             }
             sawFmt = true;
-          } else if (chunkId === "data") {
-            if (!sawFmt) {
-              throw new Error("WAV header missing fmt chunk before data");
-            }
-            headerResolved = true;
-            const pcmStart = headerBuf.subarray(offset + 8);
-            headerBuf = null;
-            if (pcmStart.length > 0) emitter.push(pcmStart);
-            return;
           } else if (offset + step > headerBuf.length) {
             if (headerBuf.length > MAX_WAV_SCAN_BYTES) {
               throw new Error("WAV header exceeded maximum scan size");

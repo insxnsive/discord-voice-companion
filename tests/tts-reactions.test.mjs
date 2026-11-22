@@ -808,17 +808,23 @@ test("ReactionPool uses global cross-mood LRU on cooldown exhaustion, enforces 8
     fsImpl: {
       constants: { O_RDONLY: 0, O_NOFOLLOW: 128 },
       existsSync: () => true,
-      lstatSync: () => ({
-        isSymbolicLink: () => false,
-        isDirectory: () => true,
-        isFile: () => false,
-      }),
+      lstatSync: (p) => {
+        if (p === "safe-root") {
+          return { isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false, ino: 100 };
+        }
+        return {
+          isSymbolicLink: () => false,
+          isDirectory: () => false,
+          isFile: () => true,
+          ino: p.includes("curious_hmm_01") ? 11 : 10,
+        };
+      },
       readdirSync: () => ["subtle_breath_01.pcm", "curious_hmm_01.pcm"],
       openSync: (p) => (p.includes("curious_hmm_01") ? 11 : 10),
       fstatSync: (fd) =>
         fd === 11
-          ? { isSymbolicLink: () => false, isFile: () => false, size: 4 }
-          : { isSymbolicLink: () => false, isFile: () => true, size: 4 },
+          ? { isSymbolicLink: () => false, isFile: () => false, size: 4, ino: 11 }
+          : { isSymbolicLink: () => false, isFile: () => true, size: 4, ino: 10 },
       readSync: (_fd, target) => {
         Buffer.from([1, 2, 3, 4]).copy(target);
         return 4;
@@ -830,4 +836,229 @@ test("ReactionPool uses global cross-mood LRU on cooldown exhaustion, enforces 8
   });
   assert.equal(fdLoaded, 1);
   assert.equal(closedFds, 2);
+});
+
+test("1-second (48000-byte PCM) 24kHz WAV passes stripWavHeaderIfPresent and createOpenAiTtsAdapter", async () => {
+  const pcm = Buffer.alloc(48000);
+  for (let i = 0; i < pcm.length; i += 2) {
+    pcm.writeInt16LE((i % 32768) - 16384, i);
+  }
+  const trailingJunk = Buffer.from("INFO");
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(24000, 24);
+  header.writeUInt32LE(48000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(pcm.length, 40);
+
+  const wavWithTail = Buffer.concat([header, pcm, trailingJunk]);
+  const stripped = stripWavHeaderIfPresent(wavWithTail);
+  assert.equal(stripped.length, 48000);
+  assert.equal(stripped.equals(pcm), true);
+
+  const fullWav = Buffer.concat([header, pcm]);
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(fullWav.subarray(0, 20000));
+      controller.enqueue(fullWav.subarray(20000));
+      controller.close();
+    },
+  });
+
+  const chunks = [];
+  const oaAdapter = createOpenAiTtsAdapter({
+    apiKey: "sk-test-key",
+    fetchImpl: async () => new Response(stream, { status: 200 }),
+  });
+  const res = await oaAdapter.synthesizeClause({
+    text: "One full second of audio",
+    onPcmChunk: (chunk) => chunks.push(Buffer.from(chunk)),
+  });
+  assert.equal(res.byteLength, 48000);
+  assert.equal(Buffer.concat(chunks).equals(pcm), true);
+});
+
+test("WS aligns odd base64 PCM chunks, routes callback/send errors, bounds warmup timeout, and allows >4 MiB by default", async () => {
+  const { EventEmitter } = await import("node:events");
+  const oddChunks = [Buffer.from([1]), Buffer.from([2, 3, 4]), Buffer.from([5, 6])];
+
+  class OddChunkWs extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 0;
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.emit("open");
+      });
+    }
+    send(payload) {
+      const parsed = JSON.parse(payload);
+      if (parsed.text === "") {
+        queueMicrotask(() => {
+          for (const c of oddChunks) {
+            this.emit("message", JSON.stringify({ audio: c.toString("base64") }));
+          }
+          this.emit("message", JSON.stringify({ isFinal: true }));
+        });
+      }
+    }
+    close() {
+      this.readyState = 3;
+      this.emit("close", 1000);
+    }
+  }
+
+  const emitted = [];
+  const wsAdapter = createElevenLabsWsAdapter({
+    apiKey: "el-test-key",
+    voiceId: "voice_capri_01",
+    WebSocketImpl: OddChunkWs,
+  });
+  const meta = await wsAdapter.synthesizeClause({
+    text: "Odd splits",
+    onPcmChunk: (buf) => emitted.push(Buffer.from(buf)),
+  });
+  assert.equal(meta.byteLength, 6);
+  assert.deepEqual(emitted, [Buffer.from([1, 2, 3, 4]), Buffer.from([5, 6])]);
+
+  // Callback throw must reject synthesizeClause instead of escaping as an unhandled exception
+  const cbFailAdapter = createElevenLabsWsAdapter({
+    apiKey: "el-test-key",
+    voiceId: "voice_capri_01",
+    WebSocketImpl: OddChunkWs,
+  });
+  await assert.rejects(
+    () =>
+      cbFailAdapter.synthesizeClause({
+        text: "Throw in callback",
+        onPcmChunk: () => {
+          throw new Error("downstream playback broke");
+        },
+      }),
+    /downstream playback broke/,
+  );
+
+  // ws.send throw must reject synthesizeClause cleanly
+  class SendThrowWs extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 1;
+    }
+    send() {
+      throw new Error("socket send failed");
+    }
+    close() {
+      this.readyState = 3;
+    }
+  }
+  const sendFailAdapter = createElevenLabsWsAdapter({
+    apiKey: "el-test-key",
+    voiceId: "voice_capri_01",
+    WebSocketImpl: SendThrowWs,
+  });
+  await assert.rejects(
+    () => sendFailAdapter.synthesizeClause({ text: "Fail send", onPcmChunk: () => {} }),
+    /socket send failed/,
+  );
+
+  // Stalled warmup socket must reject under timeoutMs
+  class HangWarmupWs extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 0;
+    }
+    close() {
+      this.readyState = 3;
+    }
+  }
+  const warmupTimeoutAdapter = createElevenLabsWsAdapter({
+    apiKey: "el-test-key",
+    voiceId: "voice_capri_01",
+    timeoutMs: 20,
+    WebSocketImpl: HangWarmupWs,
+  });
+  await assert.rejects(() => warmupTimeoutAdapter.warmup(), /timed out|abort/i);
+
+  // Default maxAudioBytes allows 5 MiB (> 4 MiB, <= 16 MiB)
+  const fiveMiB = Buffer.alloc(5 * 1024 * 1024);
+  const httpDefaultAdapter = createElevenLabsHttpStreamAdapter({
+    apiKey: "el-key",
+    voiceId: "voice_capri_01",
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(fiveMiB);
+            c.close();
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  const bigMeta = await httpDefaultAdapter.synthesizeClause({ text: "Long story", onPcmChunk: () => {} });
+  assert.equal(bigMeta.byteLength, 5 * 1024 * 1024);
+});
+
+test("ReactionPool skips symlinks before openSync when O_NOFOLLOW is undefined and stores immutable cloned clips", () => {
+  const openedPaths = [];
+  let closedCount = 0;
+  const pool = new ReactionPool();
+  const loaded = pool.loadFromDirectory("win-root", {
+    fsImpl: {
+      constants: { O_RDONLY: 0 },
+      existsSync: () => true,
+      lstatSync: (p) => {
+        if (p === "win-root") {
+          return { isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false, ino: 1 };
+        }
+        if (p.includes("curious_hmm_symlink")) {
+          return { isSymbolicLink: () => true, isDirectory: () => false, isFile: () => false, ino: 2 };
+        }
+        return { isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true, ino: 3 };
+      },
+      readdirSync: () => ["subtle_breath_ok.pcm", "curious_hmm_symlink.pcm"],
+      openSync: (p) => {
+        openedPaths.push(p);
+        return 42;
+      },
+      fstatSync: () => ({ isSymbolicLink: () => false, isFile: () => true, size: 4, ino: 3 }),
+      readSync: (_fd, target) => {
+        Buffer.from([1, 2, 3, 4]).copy(target);
+        return 4;
+      },
+      closeSync: () => {
+        closedCount += 1;
+      },
+    },
+  });
+  assert.equal(loaded, 1);
+  assert.equal(closedCount, 1);
+  assert.equal(openedPaths.length, 1);
+  assert.equal(openedPaths[0].includes("curious_hmm_symlink"), false);
+
+  // Registered clip must clone and freeze buffers so caller mutations cannot corrupt or inflate storage
+  const rawPcm = Buffer.from([10, 20, 30, 40]);
+  const rawFrames = [Buffer.from([1, 2])];
+  pool.registerClip({
+    id: "playful_scoff_mut",
+    mood: "playful_scoff",
+    pcm24k: rawPcm,
+    frames48kOpus: rawFrames,
+  });
+  rawPcm[0] = 99;
+  rawFrames[0][0] = 88;
+  const stored = pool.pick("Seriously?", { mode: "adaptive", rng: () => 0 });
+  assert.equal(stored.id, "playful_scoff_mut");
+  assert.equal(stored.pcm24k[0], 10);
+  assert.equal(stored.frames48kOpus[0][0], 1);
+  assert.equal(Object.isFrozen(stored), true);
+  assert.equal(Object.isFrozen(stored.frames48kOpus), true);
 });

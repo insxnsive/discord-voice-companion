@@ -94,7 +94,11 @@ export class ReactionPool {
     if (!REACTION_MOODS.includes(mood)) {
       throw new RangeError(`Invalid reaction mood: ${mood}`);
     }
-    const clipBytes = computeClipBytes({ frames48kOpus, pcm24k });
+    const clonedPcm = pcm24k ? Buffer.from(pcm24k) : null;
+    const clonedFrames = Object.freeze(
+      Array.isArray(frames48kOpus) ? frames48kOpus.map((frame) => Buffer.from(frame)) : [],
+    );
+    const clipBytes = computeClipBytes({ frames48kOpus: clonedFrames, pcm24k: clonedPcm });
     if (clipBytes > this.maxFileBytes) {
       throw new RangeError("Reaction clip exceeds maximum file byte limit");
     }
@@ -106,7 +110,10 @@ export class ReactionPool {
     if (nextTotalBytes > this.maxTotalBytes) {
       throw new RangeError("ReactionPool exceeded 8 MiB aggregate byte limit");
     }
-    this.clips.set(id, { id, mood, frames48kOpus, pcm24k });
+    this.clips.set(
+      id,
+      Object.freeze({ id, mood, frames48kOpus: clonedFrames, pcm24k: clonedPcm }),
+    );
     this.totalBytes = nextTotalBytes;
     return true;
   }
@@ -201,6 +208,23 @@ export class ReactionPool {
       if (!match) continue;
 
       const fullPath = path.join(dirPath, entry);
+      let entryLstat = null;
+      if (typeof fsImpl.lstatSync === "function") {
+        try {
+          entryLstat = fsImpl.lstatSync(fullPath);
+        } catch {
+          continue;
+        }
+        if (
+          entryLstat?.isSymbolicLink?.() ||
+          !entryLstat?.isFile?.() ||
+          entryLstat.size <= 0 ||
+          entryLstat.size > effectiveMaxFileBytes
+        ) {
+          continue;
+        }
+      }
+
       let buffer = null;
 
       if (hasDescriptorFs) {
@@ -216,6 +240,15 @@ export class ReactionPool {
             !stat?.isFile?.() ||
             stat.size <= 0 ||
             stat.size > effectiveMaxFileBytes
+          ) {
+            continue;
+          }
+          if (
+            typeof entryLstat?.ino === "number" &&
+            entryLstat.ino > 0 &&
+            typeof stat?.ino === "number" &&
+            stat.ino > 0 &&
+            entryLstat.ino !== stat.ino
           ) {
             continue;
           }
@@ -240,20 +273,7 @@ export class ReactionPool {
           }
         }
       } else {
-        let stat;
-        try {
-          stat = fsImpl.lstatSync(fullPath);
-        } catch {
-          continue;
-        }
-        if (
-          stat?.isSymbolicLink?.() ||
-          !stat?.isFile?.() ||
-          stat.size <= 0 ||
-          stat.size > effectiveMaxFileBytes
-        ) {
-          continue;
-        }
+        if (!entryLstat) continue;
         const raw = fsImpl.readFileSync(fullPath);
         buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
       }
