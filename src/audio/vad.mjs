@@ -182,6 +182,7 @@ export class PerSpeakerVad {
     maxSpeakers = 32,
     idleSpeakerTtlMs = 60000,
     maxPendingFrames = 8,
+    maxInFlightFrames = 64,
     isBotSpeaking = () => false,
     onSpeechStart,
     onSpeechEnd,
@@ -203,6 +204,8 @@ export class PerSpeakerVad {
     this.maxSpeakers = maxSpeakers;
     this.idleSpeakerTtlMs = idleSpeakerTtlMs;
     this.maxPendingFrames = maxPendingFrames;
+    this.maxInFlightFrames = maxInFlightFrames;
+    this.inFlightCount = 0;
     this.isBotSpeaking = isBotSpeaking;
     this.onSpeechStart = onSpeechStart;
     this.onSpeechEnd = onSpeechEnd;
@@ -246,8 +249,12 @@ export class PerSpeakerVad {
     if (state.pendingCount >= this.maxPendingFrames) {
       return { ignored: true, dropped: "backpressure" };
     }
+    if (this.inFlightCount >= this.maxInFlightFrames) {
+      return { ignored: true, dropped: "global_backpressure" };
+    }
 
     state.pendingCount += 1;
+    this.inFlightCount += 1;
     const task = state.queue.then(() => this.#processFrame(state, pcm16kMono, timestampMs));
     state.queue = task.then(
       () => undefined,
@@ -258,6 +265,7 @@ export class PerSpeakerVad {
       return await task;
     } finally {
       state.pendingCount -= 1;
+      this.inFlightCount -= 1;
     }
   }
 
@@ -311,7 +319,10 @@ export class PerSpeakerVad {
     let oldestId = null;
     let oldestSeen = Infinity;
     for (const [userId, candidate] of this.speakers) {
-      if (!candidate.active && candidate.lastSeenAt < oldestSeen) {
+      // Busy speakers have in-flight detector work whose result would be
+      // wasted if their state vanished mid-await.
+      if (candidate.active || candidate.pendingCount > 0) continue;
+      if (candidate.lastSeenAt < oldestSeen) {
         oldestSeen = candidate.lastSeenAt;
         oldestId = userId;
       }
@@ -325,7 +336,11 @@ export class PerSpeakerVad {
 
   #pruneIdle(nowMs) {
     for (const [userId, state] of [...this.speakers]) {
-      if (!state.active && nowMs - state.lastSeenAt >= this.idleSpeakerTtlMs) {
+      // Never touch work that is queued or running; an idle entry (even one
+      // still flagged active because its connection dropped without silence)
+      // can be expired once it has been silent past the TTL.
+      if (state.pendingCount > 0) continue;
+      if (nowMs - state.lastSeenAt >= this.idleSpeakerTtlMs) {
         this.#dropSpeaker(userId);
       }
     }
@@ -339,12 +354,12 @@ export class PerSpeakerVad {
     this.speakers.delete(userId);
   }
 
-  #isCurrent(state, epoch) {
+  #isCurrent(userId, state, epoch) {
     return (
-      this.speakers.get(state.userId) === state &&
+      this.speakers.get(userId) === state &&
       state.epoch === epoch &&
-      !this.ignoredUserIds.has(state.userId) &&
-      state.userId !== this.botUserId
+      !this.ignoredUserIds.has(userId) &&
+      userId !== this.botUserId
     );
   }
 
@@ -352,17 +367,27 @@ export class PerSpeakerVad {
     const { userId } = state;
     const startEpoch = state.epoch;
 
+    // A frame can be queued and then dropped by resetSpeaker, clear, or a mute
+    // before its turn comes. Bail out before creating a detector.
+    if (!this.#isCurrent(userId, state, startEpoch)) {
+      return { ignored: true, dropped: "reset" };
+    }
+
     if (!state.detector) {
       const detector = await this.detectorFactory(userId);
-      if (!this.#isCurrent(state, startEpoch)) {
+      if (!this.#isCurrent(userId, state, startEpoch)) {
         return { ignored: true, dropped: "reset" };
       }
       state.detector = detector;
     }
 
+    if (!this.#isCurrent(userId, state, startEpoch)) {
+      return { ignored: true, dropped: "reset" };
+    }
+
     const samples = pcm16MonoToFloat32(pcm16kMono);
     const probability = await state.detector(samples);
-    if (!this.#isCurrent(state, startEpoch)) {
+    if (!this.#isCurrent(userId, state, startEpoch)) {
       return { ignored: true, dropped: "reset" };
     }
 

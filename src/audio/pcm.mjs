@@ -28,6 +28,14 @@ function assertAudioChunk(input, maxBytes = MAX_AUDIO_CHUNK_BYTES) {
   }
 }
 
+function assertPositiveLimit(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_AUDIO_CHUNK_BYTES) {
+    throw new RangeError(
+      `${label} must be a positive integer <= ${MAX_AUDIO_CHUNK_BYTES}, got ${value}`,
+    );
+  }
+}
+
 /**
  * 48kHz stereo to 16kHz mono by averaging left, right, and the three source
  * frames that collapse into one output sample (12 input bytes -> 2 output
@@ -121,8 +129,12 @@ export function createFrameAccumulator(
   frameBytes = DISCORD_FRAME_BYTES,
   { maxChunkBytes = MAX_AUDIO_CHUNK_BYTES } = {},
 ) {
-  if (!Number.isInteger(frameBytes) || frameBytes <= 0) {
-    throw new RangeError("frameBytes must be a positive integer");
+  assertPositiveLimit(frameBytes, "frameBytes");
+  assertPositiveLimit(maxChunkBytes, "maxChunkBytes");
+  if (frameBytes > maxChunkBytes) {
+    throw new RangeError(
+      `frameBytes (${frameBytes}) must not exceed maxChunkBytes (${maxChunkBytes})`,
+    );
   }
   let pending = Buffer.alloc(0);
 

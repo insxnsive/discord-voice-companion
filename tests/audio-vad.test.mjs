@@ -378,18 +378,56 @@ test("PerSpeakerVad stops an utterance at the byte budget during short pauses", 
   assert.equal(events.ends[0].pcm16kMono.length, 3 * VAD_FRAME_BYTES);
 });
 
-test("PerSpeakerVad bounds the speaker map and evicts idle speakers", async () => {
+test("PerSpeakerVad evicts the oldest idle speaker and admits the newcomer", async () => {
   const bounded = makeVad({ maxSpeakers: 3 }).vad;
   for (let i = 0; i < 5; i += 1) {
     await bounded.pushFrame({ userId: `user-${i}`, pcm16kMono: monoFrame(0), timestampMs: 1000 });
   }
+
   assert.equal(bounded.speakers.size, 3);
+  assert.equal(bounded.speakers.has("user-4"), true);
+  assert.equal(bounded.speakers.has("user-0"), false);
+  assert.equal(bounded.speakers.has("user-1"), false);
+  assert.equal(bounded.speakers.has("user-2"), true);
+  assert.equal(bounded.speakers.has("user-3"), true);
 
   const transient = makeVad({ maxSpeakers: 4, idleSpeakerTtlMs: 100 }).vad;
   for (let i = 0; i < 100; i += 1) {
     await transient.pushFrame({ userId: `transient-${i}`, pcm16kMono: monoFrame(0), timestampMs: i * 1000 });
   }
   assert.ok(transient.speakers.size <= 4);
+});
+
+test("PerSpeakerVad expires an idle speaker at the TTL before evicting", async () => {
+  const vad = makeVad({ maxSpeakers: 2, idleSpeakerTtlMs: 100 }).vad;
+
+  await vad.pushFrame({ userId: "a", pcm16kMono: monoFrame(0), timestampMs: 0 });
+  await vad.pushFrame({ userId: "b", pcm16kMono: monoFrame(0), timestampMs: 60 });
+  assert.equal(vad.speakers.has("a"), true);
+
+  await vad.pushFrame({ userId: "c", pcm16kMono: monoFrame(0), timestampMs: 150 });
+  assert.equal(vad.speakers.has("a"), false);
+  assert.equal(vad.speakers.has("b"), true);
+  assert.equal(vad.speakers.has("c"), true);
+  assert.equal(vad.speakers.size, 2);
+});
+
+test("PerSpeakerVad refuses newcomers when every tracked speaker is active", async () => {
+  const vad = new PerSpeakerVad({
+    maxSpeakers: 2,
+    detectorFactory: () => () => 0.9,
+  });
+
+  await vad.pushFrame({ userId: "active-1", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  await vad.pushFrame({ userId: "active-2", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  assert.equal(vad.speakers.get("active-1").active, true);
+  assert.equal(vad.speakers.get("active-2").active, true);
+
+  const result = await vad.pushFrame({ userId: "newcomer", pcm16kMono: monoFrame(0), timestampMs: 10 });
+  assert.deepEqual(result, { ignored: true, dropped: "max_speakers" });
+  assert.equal(vad.speakers.has("newcomer"), false);
+  assert.equal(vad.speakers.has("active-1"), true);
+  assert.equal(vad.speakers.has("active-2"), true);
 });
 
 test("PerSpeakerVad drops buffered state when muted or reset mid-detection", async () => {
@@ -566,4 +604,140 @@ test("createSileroDetector rebuffers into 512-sample windows and validates its i
 
   await assert.rejects(() => detect(new Float32Array([Number.NaN])), TypeError);
   await assert.rejects(() => detect(new Float32Array([Number.POSITIVE_INFINITY])), TypeError);
+});
+
+test("PerSpeakerVad expires a stalled active speaker past the TTL", async () => {
+  const vad = new PerSpeakerVad({
+    maxSpeakers: 2,
+    idleSpeakerTtlMs: 100,
+    detectorFactory: () => () => 0.9,
+  });
+
+  await vad.pushFrame({ userId: "stalled", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  assert.equal(vad.speakers.get("stalled").active, true);
+  assert.equal(vad.speakers.get("stalled").pendingCount, 0);
+
+  await vad.pushFrame({ userId: "fresh", pcm16kMono: monoFrame(0), timestampMs: 150 });
+  assert.equal(vad.speakers.has("stalled"), false);
+  assert.equal(vad.speakers.has("fresh"), true);
+});
+
+test("PerSpeakerVad cancels queued work when the speaker is dropped first", async () => {
+  let factoryCalls = 0;
+  let detectorCalls = 0;
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => {
+      factoryCalls += 1;
+      return () => {
+        detectorCalls += 1;
+        return 0.9;
+      };
+    },
+  });
+
+  const first = vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  const second = vad.pushFrame({ userId: "u1", pcm16kMono: monoFrame(9000), timestampMs: 20 });
+  vad.resetSpeaker("u1");
+  await Promise.all([first, second]);
+
+  assert.equal(factoryCalls, 0);
+  assert.equal(detectorCalls, 0);
+  assert.equal(vad.speakers.has("u1"), false);
+
+  const clearedFactoryCalls = { count: 0 };
+  const cleared = new PerSpeakerVad({
+    detectorFactory: () => {
+      clearedFactoryCalls.count += 1;
+      return () => 0.9;
+    },
+  });
+  const pending = cleared.pushFrame({ userId: "u2", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  cleared.clear();
+  await pending;
+
+  assert.equal(clearedFactoryCalls.count, 0);
+  assert.equal(cleared.speakers.size, 0);
+});
+
+test("PerSpeakerVad skips busy speakers when evicting", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const vad = new PerSpeakerVad({
+    maxSpeakers: 2,
+    detectorFactory: (userId) => async () => {
+      if (userId === "newcomer") return 0.9;
+      await gate;
+      return 0.9;
+    },
+  });
+
+  const busyA = vad.pushFrame({ userId: "busy-a", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  const busyB = vad.pushFrame({ userId: "busy-b", pcm16kMono: monoFrame(9000), timestampMs: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(vad.speakers.get("busy-a").pendingCount, 1);
+  assert.equal(vad.speakers.get("busy-b").pendingCount, 1);
+
+  const newcomer = await vad.pushFrame({ userId: "newcomer", pcm16kMono: monoFrame(0), timestampMs: 10 });
+
+  release();
+  await Promise.allSettled([busyA, busyB]);
+
+  assert.deepEqual(newcomer, { ignored: true, dropped: "max_speakers" });
+  assert.equal(vad.speakers.has("newcomer"), false);
+  assert.equal(vad.speakers.has("busy-a"), true);
+  assert.equal(vad.speakers.has("busy-b"), true);
+});
+
+test("PerSpeakerVad caps in-flight detections across all speakers", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const vad = new PerSpeakerVad({
+    maxSpeakers: 100,
+    maxPendingFrames: 8,
+    detectorFactory: () => async () => {
+      await gate;
+      return 0.9;
+    },
+  });
+
+  const pushes = [];
+  for (let i = 0; i < 70; i += 1) {
+    pushes.push(vad.pushFrame({ userId: `bulk-${i}`, pcm16kMono: monoFrame(9000), timestampMs: 0 }));
+  }
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const inFlightDuringBurst = vad.inFlightCount;
+
+  release();
+  const results = await Promise.all(pushes);
+
+  assert.ok(inFlightDuringBurst <= 64);
+  const accepted = results.filter((result) => result?.ignored === false);
+  const dropped = results.filter((result) => result?.dropped === "global_backpressure");
+  assert.equal(accepted.length, 64);
+  assert.equal(dropped.length, 6);
+  assert.equal(vad.inFlightCount, 0);
+});
+
+test("createFrameAccumulator rejects invalid frame and chunk limits", () => {
+  for (const invalidFrame of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 2, MAX_AUDIO_CHUNK_BYTES + 2]) {
+    assert.throws(() => createFrameAccumulator(invalidFrame), RangeError);
+  }
+
+  for (const invalidChunk of [0, -1, 1.5, MAX_AUDIO_CHUNK_BYTES + 2]) {
+    assert.throws(
+      () => createFrameAccumulator(DISCORD_FRAME_BYTES, { maxChunkBytes: invalidChunk }),
+      RangeError,
+    );
+  }
+
+  assert.throws(
+    () => createFrameAccumulator(4096, { maxChunkBytes: 2048 }),
+    RangeError,
+  );
+  assert.doesNotThrow(() => createFrameAccumulator(2048, { maxChunkBytes: 2048 }));
 });
