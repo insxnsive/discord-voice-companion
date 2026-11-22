@@ -82,15 +82,18 @@ export function formatStatusReply(status = {}) {
 }
 
 function hasModeratorPermission(interaction) {
-  const permissions = interaction?.member?.permissions;
-  if (!permissions) return true;
-  if (typeof permissions.has === "function") {
-    return MODERATOR_PERMISSIONS.some((name) => permissions.has(name));
+  if (!interaction?.guildId) return false;
+  for (const source of [interaction.memberPermissions, interaction.member?.permissions]) {
+    if (!source) continue;
+    if (typeof source.has === "function") {
+      if (source.has("ManageGuild") || source.has("ModerateMembers")) return true;
+      continue;
+    }
+    if (Array.isArray(source)) {
+      if (source.includes("ManageGuild") || source.includes("ModerateMembers")) return true;
+    }
   }
-  if (Array.isArray(permissions)) {
-    return MODERATOR_PERMISSIONS.some((name) => permissions.includes(name));
-  }
-  return true;
+  return false;
 }
 
 function optionValue(interaction, name) {
@@ -122,6 +125,15 @@ export function createCommandHandler({ orchestrator } = {}) {
 
   async function handleInteraction(interaction = {}) {
     try {
+      const guildId = interaction?.guildId;
+      if (typeof guildId !== "string" || guildId.length === 0) {
+        return await reply(interaction, "This command only works inside a server.");
+      }
+      const status = orchestrator.getStatus?.();
+      if (status?.guildId && status.guildId !== guildId) {
+        return await reply(interaction, "This voice session belongs to another server.");
+      }
+
       const commandName = interaction.commandName;
       const command = SLASH_COMMANDS.find((entry) => entry.name === commandName);
       if (!command) return await reply(interaction, "Unknown command.");
@@ -130,11 +142,14 @@ export function createCommandHandler({ orchestrator } = {}) {
         case "join": {
           const channelId = interaction?.member?.voice?.channelId;
           if (!channelId) return await reply(interaction, "Join a voice channel first.");
-          await orchestrator.joinChannel({ guildId: interaction?.guildId, channelId });
+          const adapterCreator =
+            interaction?.guild?.voiceAdapterCreator ??
+            interaction?.member?.guild?.voiceAdapterCreator;
+          await orchestrator.joinChannel({ guildId, channelId, adapterCreator });
           return await reply(interaction, "Joined your voice channel.");
         }
         case "leave": {
-          await orchestrator.leaveChannel({ guildId: interaction?.guildId });
+          await orchestrator.leaveChannel({ guildId });
           return await reply(interaction, "Left the voice channel.");
         }
         case "mode": {

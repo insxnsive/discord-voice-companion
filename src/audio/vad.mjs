@@ -183,6 +183,7 @@ export class PerSpeakerVad {
     idleSpeakerTtlMs = 60000,
     maxPendingFrames = 8,
     maxInFlightFrames = 64,
+    detectorTimeoutMs = 5000,
     isBotSpeaking = () => false,
     onSpeechStart,
     onSpeechEnd,
@@ -212,6 +213,14 @@ export class PerSpeakerVad {
       throw new RangeError("maxInFlightFrames must be an integer between 1 and 256");
     }
     this.maxInFlightFrames = maxInFlightFrames;
+    if (
+      !Number.isSafeInteger(detectorTimeoutMs) ||
+      detectorTimeoutMs < 1 ||
+      detectorTimeoutMs > 30000
+    ) {
+      throw new RangeError("detectorTimeoutMs must be an integer between 1 and 30000");
+    }
+    this.detectorTimeoutMs = detectorTimeoutMs;
     this.inFlightCount = 0;
     this.isBotSpeaking = isBotSpeaking;
     this.onSpeechStart = onSpeechStart;
@@ -375,6 +384,18 @@ export class PerSpeakerVad {
     );
   }
 
+  async #withDetectorTimeout(task) {
+    let timer;
+    const timeout = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("VAD detector timed out")), this.detectorTimeoutMs);
+    });
+    try {
+      return await Promise.race([Promise.resolve().then(task), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async #processFrame(state, pcm16kMono, timestampMs) {
     const { userId } = state;
     const startEpoch = state.epoch;
@@ -386,7 +407,7 @@ export class PerSpeakerVad {
     }
 
     if (!state.detector) {
-      const detector = await this.detectorFactory(userId);
+      const detector = await this.#withDetectorTimeout(() => this.detectorFactory(userId));
       if (!this.#isCurrent(userId, state, startEpoch)) {
         return { result: { ignored: true, dropped: "reset" } };
       }
@@ -398,7 +419,7 @@ export class PerSpeakerVad {
     }
 
     const samples = pcm16MonoToFloat32(pcm16kMono);
-    const probability = await state.detector(samples);
+    const probability = await this.#withDetectorTimeout(() => state.detector(samples));
     if (!this.#isCurrent(userId, state, startEpoch)) {
       return { result: { ignored: true, dropped: "reset" } };
     }
@@ -424,15 +445,21 @@ export class PerSpeakerVad {
         }
       }
 
-      if (!state.bargeInFired && state.speechMs >= this.bargeInMs && this.isBotSpeaking()) {
-        state.bargeInFired = true;
-        this.onBargeIn?.({
-          userId,
-          displayName: state.displayName,
-          timestampMs,
-        });
+      if (!state.bargeInFired && state.speechMs >= this.bargeInMs) {
+        const botSpeaking = this.isBotSpeaking();
         if (!this.#isCurrent(userId, state, startEpoch)) {
           return { result: { ignored: true, dropped: "reset" } };
+        }
+        if (botSpeaking) {
+          state.bargeInFired = true;
+          this.onBargeIn?.({
+            userId,
+            displayName: state.displayName,
+            timestampMs,
+          });
+          if (!this.#isCurrent(userId, state, startEpoch)) {
+            return { result: { ignored: true, dropped: "reset" } };
+          }
         }
       }
 
@@ -467,6 +494,7 @@ export class PerSpeakerVad {
     const chunks = state.chunks;
     const speechMs = state.speechMs;
     const { userId, displayName } = state;
+    const epoch = state.epoch;
 
     state.active = false;
     state.speechMs = 0;
@@ -479,11 +507,13 @@ export class PerSpeakerVad {
 
     if (speechMs < this.minSpeechMs) {
       return async () => {
+        if (!this.#isCurrent(userId, state, epoch)) return;
         this.onNoiseDrop?.({ userId, displayName, speechMs });
       };
     }
 
     return async () => {
+      if (!this.#isCurrent(userId, state, epoch)) return;
       await this.onSpeechEnd?.({
         userId,
         displayName,

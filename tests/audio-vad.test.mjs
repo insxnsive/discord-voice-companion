@@ -821,4 +821,49 @@ test("maxInFlightFrames must be an integer between 1 and 256", () => {
   }
   assert.doesNotThrow(() => new PerSpeakerVad({ maxInFlightFrames: 1 }));
   assert.doesNotThrow(() => new PerSpeakerVad({ maxInFlightFrames: 256 }));
+
+  for (const invalid of [0, -1, 1.5, 30001]) {
+    assert.throws(() => new PerSpeakerVad({ detectorTimeoutMs: invalid }), RangeError);
+  }
+  assert.doesNotThrow(() => new PerSpeakerVad({ detectorTimeoutMs: 5000 }));
+});
+
+test("resetSpeaker inside isBotSpeaking suppresses barge-in dispatch", async () => {
+  const barges = [];
+  const ends = [];
+  let vad;
+  vad = new PerSpeakerVad({
+    detectorFactory: () => () => 0.9,
+    minSpeechMs: 40,
+    maxUtteranceBytes: 9 * VAD_FRAME_BYTES,
+    isBotSpeaking: () => {
+      vad.resetSpeaker("u3");
+      return true;
+    },
+    onBargeIn: (event) => barges.push(event),
+    onSpeechEnd: (event) => ends.push(event),
+  });
+
+  for (let i = 0; i < 9; i += 1) {
+    await vad.pushFrame({ userId: "u3", pcm16kMono: monoFrame(9000), timestampMs: i * 20 });
+  }
+
+  assert.equal(barges.length, 0);
+  assert.equal(ends.length, 0);
+});
+
+test("a stalled detector times out and frees the in-flight slot", { timeout: 3000 }, async () => {
+  const vad = new PerSpeakerVad({
+    detectorFactory: () => () => new Promise(() => {}),
+    detectorTimeoutMs: 25,
+    maxInFlightFrames: 1,
+  });
+
+  await assert.rejects(
+    () => vad.pushFrame({ userId: "u4", pcm16kMono: monoFrame(9000), timestampMs: 0 }),
+    /timed out/i,
+  );
+
+  assert.equal(vad.inFlightCount, 0);
+  assert.equal(vad.speakers.get("u4").pendingCount, 0);
 });
