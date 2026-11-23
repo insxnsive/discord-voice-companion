@@ -239,6 +239,23 @@ function makeRealVoiceDeps() {
   return { deps, speaking, subscriptions, played, connection, player };
 }
 
+function makeReplacingVoiceDeps() {
+  const shapes = makeRealVoiceDeps();
+  let attached = null;
+  shapes.player.play = (resource) => {
+    if (attached && attached !== resource) {
+      attached.retired = true;
+      attached.stream.destroy();
+    }
+    attached = resource;
+    resource.retired = false;
+    shapes.played.push(resource);
+    return resource;
+  };
+  shapes.player.attached = () => attached;
+  return shapes;
+}
+
 function makeFillerScheduler() {
   const state = { cancelled: false, fired: false, onFire: null, delayMs: null };
   const impl = ({ delayMs, onFire }) => {
@@ -1324,6 +1341,181 @@ test("stale idle state cannot clear a replacement playback owner", async () => {
   orchestrator.muteUser("u3", true);
   assert.equal(shapes.player.stops, beforeIdle);
   await orchestrator.close();
+});
+
+test("pending fillers cannot retire another turn's attached reply resource", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  const gates = [];
+  const gateArgs = [];
+  const fillerCallbacks = [];
+  const llm = {
+    state: { gateArgs },
+    shouldChimeIn(args) {
+      gateArgs.push(args);
+      return new Promise((resolve) => gates.push(resolve));
+    },
+    async streamReply({ onToken }) {
+      onToken("audible reply.");
+      return { fullText: "audible reply." };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+    scheduleReactionFillerImpl: ({ onFire }) => {
+      fillerCallbacks.push(onFire);
+      return { cancel() {} };
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turnA = vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  const turnB = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 2 || fillerCallbacks.length < 2) await tick(0);
+
+  fillerCallbacks[0]();
+  const resourceA = shapes.player.attached();
+  const packetsA = [];
+  resourceA.stream.on("data", (packet) => packetsA.push(Buffer.from(packet)));
+  fillerCallbacks[1]();
+  const bPreservedAResource = shapes.player.attached() === resourceA;
+
+  gates[0]({ shouldReply: true });
+  await turnA;
+  const replyPackets = packetsA.filter((packet) => packet[0] === 0xaa);
+  const replyReachedAttachedResource = replyPackets.length > 0;
+  const replyResourceStayedLive = resourceA.retired === false;
+  gates[1]({ shouldReply: false });
+  await turnB;
+
+  const next = vad.captured.callbacks.onSpeechEnd({ userId: "c", displayName: "C", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 3) await tick(0);
+  const replyCreditGranted = gateArgs[2].lastBotReplyAt > 0;
+  gates[2]({ shouldReply: false });
+  await next;
+  await orchestrator.close();
+  assert.ok(replyReachedAttachedResource, "turn A reply must reach its attached resource");
+  assert.equal(replyResourceStayedLive, true);
+  assert.equal(bPreservedAResource, true, "turn B filler must not replace turn A output");
+  assert.equal(replyCreditGranted, true, "accepted reply frames should grant follow-up credit");
+});
+
+test("a committed reply reattaches output after idle and ignores stale idle", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  let emitClause;
+  let releaseReply;
+  const llm = {
+    async shouldChimeIn() { return { shouldReply: true }; },
+    streamReply({ onClause }) {
+      emitClause = onClause;
+      onClause("first.");
+      return new Promise((resolve) => { releaseReply = () => resolve({ fullText: "first second" }); });
+    },
+  };
+  const tts = makeTts();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    ttsAdapter: tts,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!emitClause || !releaseReply || tts.state.calls.length < 1) await tick(0);
+  const oldResource = shapes.player.attached();
+  assert.ok(oldResource);
+
+  shapes.player.emit("stateChange", { status: "playing", resource: oldResource }, { status: "idle", resource: oldResource });
+  assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+  emitClause("second.");
+  for (let i = 0; i < 100 && tts.state.calls.length < 2; i += 1) await tick(0);
+  const freshResourceCreated = shapes.played.length >= 2;
+  const currentResource = shapes.player.attached();
+  let currentPackets = [];
+  if (freshResourceCreated) {
+    currentResource.stream.on("data", (packet) => currentPackets.push(Buffer.from(packet)));
+    await tick(0);
+  }
+  let staleIdlePreserved = false;
+  let currentIdleCleared = false;
+  if (freshResourceCreated) {
+    shapes.player.emit("stateChange", { status: "playing", resource: oldResource }, { status: "idle", resource: oldResource });
+    staleIdlePreserved = orchestrator.getStatus().isBotSpeaking === true;
+    shapes.player.emit("stateChange", { status: "playing", resource: currentResource }, { status: "idle", resource: currentResource });
+    currentIdleCleared = orchestrator.getStatus().isBotSpeaking === false;
+  }
+  releaseReply();
+  await turn;
+  await orchestrator.close();
+  assert.equal(freshResourceCreated, true, "next clause must use a fresh resource");
+  assert.ok(currentPackets.some((packet) => packet[0] === 0xaa), "new resource must receive the next clause");
+  assert.equal(staleIdlePreserved, true, "late old idle must preserve current output state");
+  assert.equal(currentIdleCleared, true, "genuine current idle must clear speaking state");
+});
+
+test("pending filler preserves a draining reply through denial and acceptance", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  const gates = [];
+  const fillerCallbacks = [];
+  let replyTokens = true;
+  const llm = {
+    async shouldChimeIn() {
+      return await new Promise((resolve) => gates.push(resolve));
+    },
+    async streamReply({ onToken }) {
+      if (replyTokens) onToken("queued reply.");
+      return { fullText: replyTokens ? "queued reply." : "accepted later." };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    scheduleReactionFillerImpl: ({ onFire }) => {
+      fillerCallbacks.push(onFire);
+      return { cancel() {} };
+    },
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const first = vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 1) await tick(0);
+  gates[0]({ shouldReply: true });
+  await first;
+  const drainingResource = shapes.player.attached();
+  assert.ok(drainingResource?.stream.writableEnded, "completed reply should be draining from its ended stream");
+  const drainingPackets = [];
+  drainingResource.stream.on("data", (packet) => drainingPackets.push(Buffer.from(packet)));
+
+  replyTokens = false;
+  const denied = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 2 || fillerCallbacks.length < 2) await tick(0);
+  fillerCallbacks[1]();
+  const denialPreservedResource = shapes.player.attached() === drainingResource;
+  gates[1]({ shouldReply: false });
+  await denied;
+  const denialDidNotRetire = drainingResource.retired === false;
+
+  const accepted = vad.captured.callbacks.onSpeechEnd({ userId: "c", displayName: "C", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 3 || fillerCallbacks.length < 3) await tick(0);
+  fillerCallbacks[2]();
+  const candidatePreservedResource = shapes.player.attached() === drainingResource;
+  replyTokens = true;
+  gates[2]({ shouldReply: true });
+  await accepted;
+  const acceptanceTookOver = shapes.player.attached() !== drainingResource;
+  const acceptedReplyRetiredOldResource = drainingResource.retired === true;
+  await orchestrator.close();
+  assert.equal(denialPreservedResource, true, "pending filler must not replace draining reply output");
+  assert.equal(denialDidNotRetire, true, "denial must leave queued reply resource intact");
+  assert.equal(candidatePreservedResource, true, "candidate filler must preserve old reply until acceptance");
+  assert.equal(acceptanceTookOver, true, "accepted turn may take over at commit");
+  assert.equal(acceptedReplyRetiredOldResource, true);
 });
 
 test("a successful empty reply gives no follow-up credit", async () => {

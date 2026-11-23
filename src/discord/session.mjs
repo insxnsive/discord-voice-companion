@@ -124,6 +124,7 @@ export function createVoiceOrchestrator({
   let activePlaybackUserId = null;
   let activePlaybackTurn = null;
   let activePlaybackResource = null;
+  let activePlaybackStream = null;
   const pendingTurns = new Set();
 
   const speakerBotCache = new Map();
@@ -247,6 +248,7 @@ export function createVoiceOrchestrator({
     activePlaybackUserId = null;
     activePlaybackTurn = null;
     activePlaybackResource = null;
+    activePlaybackStream = null;
     try {
       playerSink?.stop?.();
       playerSink?.clear?.();
@@ -506,6 +508,7 @@ export function createVoiceOrchestrator({
     activePlaybackUserId = null;
     activePlaybackTurn = null;
     activePlaybackResource = null;
+    activePlaybackStream = null;
   }
 
   function clearGuildScopedState() {
@@ -673,7 +676,15 @@ export function createVoiceOrchestrator({
   function ensureTurnStream(turn) {
     if (playerSink?.playOpusFrame) return null;
     if (!voicePlayer) return null;
-    if (turn.outStream) return turn.outStream;
+    if (
+      turn.outStream &&
+      activePlaybackTurn === turn &&
+      activePlaybackStream === turn.outStream &&
+      !turn.outStream.destroyed &&
+      !turn.outStream.writableEnded &&
+      !turn.outStream.writableFinished
+    ) return turn.outStream;
+    if (turn.outStream) finishOutput(turn);
 
     const stream = new PassThrough({ objectMode: true });
     const resource = resolvedVoiceDeps?.createAudioResource
@@ -685,11 +696,13 @@ export function createVoiceOrchestrator({
     activePlaybackUserId = turn.userId;
     activePlaybackTurn = turn;
     activePlaybackResource = resource;
+    activePlaybackStream = stream;
     voicePlayer.play?.(resource);
     return stream;
   }
 
   function playPacket(turn, packet, { isFiller = false } = {}) {
+    if (isFiller && activePlaybackTurn && activePlaybackTurn !== turn) return;
     turn.queuedOpusFrames += 1;
     if (turn.queuedOpusFrames > MAX_QUEUED_OPUS_FRAMES) {
       state.lastError = "turn frame limit exceeded";
@@ -697,7 +710,10 @@ export function createVoiceOrchestrator({
       stopPlayback();
       return;
     }
-    if (activePlaybackTurn !== turn) activePlaybackResource = null;
+    if (activePlaybackTurn !== turn) {
+      activePlaybackResource = null;
+      activePlaybackStream = null;
+    }
     activePlaybackUserId = turn.userId;
     activePlaybackTurn = turn;
     if (playerSink?.playOpusFrame) {
@@ -706,7 +722,7 @@ export function createVoiceOrchestrator({
       return;
     }
     const stream = ensureTurnStream(turn);
-    if (stream?.write) {
+    if (stream?.write && !stream.destroyed && !stream.writableEnded && !stream.writableFinished) {
       const accepted = stream.write(packet);
       if (!isFiller) turn.replyFrameEmitted = true;
       if (!accepted && (stream.readableLength ?? 0) > MAX_QUEUED_OPUS_FRAMES) {
@@ -910,7 +926,13 @@ export function createVoiceOrchestrator({
         delayMs: fillerDelay,
         onFire: () => {
           try {
-            if (!isTurnLive(turn) || (currentTurn && currentTurn !== turn) || turn.gateDenied || turn.ttsMarked) return;
+            if (
+              !isTurnLive(turn) ||
+              (currentTurn && currentTurn !== turn) ||
+              (activePlaybackTurn && activePlaybackTurn !== turn) ||
+              turn.gateDenied ||
+              turn.ttsMarked
+            ) return;
             const clip = reactionPool?.pick(transcript, { mode: state.fillerMode });
             if (!clip) return;
             turn.fillerEmitted = true;
@@ -1276,9 +1298,12 @@ export function createVoiceOrchestrator({
               if (nextState?.status !== "idle" || !activePlaybackTurn || !activePlaybackResource) return;
               const endedResource = nextState?.resource ?? oldState?.resource;
               if (endedResource !== activePlaybackResource) return;
+              const endedTurn = activePlaybackTurn;
+              if (endedTurn?.outStream === activePlaybackStream) finishOutput(endedTurn);
               activePlaybackUserId = null;
               activePlaybackTurn = null;
               activePlaybackResource = null;
+              activePlaybackStream = null;
               state.isBotSpeaking = false;
             };
             voicePlayer?.on?.("stateChange", playerStateListener);
