@@ -247,6 +247,51 @@ test("streamReply parses split SSE chunks, stops on [DONE], omits auth for local
   await assert.rejects(pending, { name: "AbortError" });
 });
 
+test("configured persona is sent with replies, not gates, and does not mutate conversation history", async () => {
+  const conversation = [{ role: "user", content: "That was weird." }];
+  const originalConversation = structuredClone(conversation);
+  const personaPrompt = "Speak with quick curiosity and a little mischief.";
+  const requests = [];
+  const client = createLlmClient({
+    config: {
+      llm: { baseUrl: "http://localhost:11434/v1", replyModel: "mock", gateModel: "gate" },
+      personaPrompt,
+    },
+    fetchImpl: async (_url, init) => {
+      const payload = JSON.parse(init.body);
+      requests.push(payload);
+      return payload.stream
+        ? makeSseResponse(['data: {"choices":[{"delta":{"content":"What was that?"}}]}\n', "data: [DONE]\n"])
+        : new Response(JSON.stringify({ choices: [{ message: { content: "NO" } }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+    },
+  });
+
+  await client.streamReply({ messages: conversation });
+  await client.shouldChimeIn({ transcript: "That was weird?", chimeMode: "smart" });
+
+  assert.deepEqual(requests[0].messages, [
+    { role: "system", content: personaPrompt },
+    ...conversation,
+  ]);
+  assert.equal(requests[1].messages[0].content, "You are a Discord voice-call turn gate. Answer ONLY YES or NO: should the AI companion chime in right now?");
+  assert.equal(requests[1].messages.some((message) => message.content === personaPrompt), false);
+  assert.deepEqual(conversation, originalConversation);
+
+  let directMessages;
+  const directClient = createLlmClient({
+    config: { llm: { baseUrl: "http://localhost:11434/v1", replyModel: "mock" } },
+    fetchImpl: async (_url, init) => {
+      directMessages = JSON.parse(init.body).messages;
+      return makeSseResponse(["data: [DONE]\n"]);
+    },
+  });
+  await directClient.streamReply({ messages: conversation });
+  assert.deepEqual(directMessages, conversation);
+});
+
 test("shouldChimeIn fast-paths aliases and followup window, parses gate YES/NO, and fails closed", async () => {
   const cfg = loadConfig({
     env: {
