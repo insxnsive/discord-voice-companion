@@ -126,6 +126,10 @@ export function createVoiceOrchestrator({
   let activePlaybackResource = null;
   let activePlaybackStream = null;
   const pendingTurns = new Set();
+  const voicePresence = new Map();
+  const recentVoiceArrivals = [];
+  const MAX_VOICE_ROSTER = 64;
+  const MAX_RECENT_ARRIVALS = 8;
 
   const speakerBotCache = new Map();
   const speakerFetchInFlight = new Map();
@@ -322,6 +326,114 @@ export function createVoiceOrchestrator({
       state.client?.users?.cache?.get?.(userId)?.username ??
       "Unknown"
     );
+  }
+
+  function clearVoicePresence() {
+    voicePresence.clear();
+    recentVoiceArrivals.length = 0;
+  }
+
+  function presenceLabel(name) {
+    return formatSpeakerLabel(typeof name === "string" ? name : "");
+  }
+
+  function setVoicePresence(userId, name, { arrival = false } = {}) {
+    if (!userId || userId === resolvedBotUserId) return;
+    const label = presenceLabel(name);
+    if (!voicePresence.has(userId) && voicePresence.size >= MAX_VOICE_ROSTER) return;
+    const existed = voicePresence.has(userId);
+    voicePresence.set(userId, label);
+    if (arrival && !existed) {
+      recentVoiceArrivals.push(userId);
+      while (recentVoiceArrivals.length > MAX_RECENT_ARRIVALS) recentVoiceArrivals.shift();
+    }
+  }
+
+  function seedVoicePresence(guildId, channelId) {
+    clearVoicePresence();
+    const guild = state.client?.guilds?.cache?.get?.(guildId);
+    const states = guild?.voiceStates?.cache;
+    if (states && typeof states.values === "function") {
+      for (const voiceState of states.values()) {
+        const userId = voiceState?.id ?? voiceState?.member?.id;
+        if (!userId || voiceState?.channelId !== channelId) continue;
+        const member = voiceState.member ?? guild?.members?.cache?.get?.(userId);
+        if (isVoiceStateBot(voiceState, userId, guildId)) continue;
+        setVoicePresence(
+          userId,
+          member?.displayName ??
+            member?.user?.globalName ??
+            member?.user?.username ??
+            resolveDisplayName(userId, guildId),
+        );
+      }
+    }
+    const members = guild?.members?.cache;
+    if (members && typeof members.values === "function") {
+      for (const member of members.values()) {
+        const userId = member?.id ?? member?.user?.id;
+        if (!userId || member?.voice?.channelId !== channelId || isVoiceStateBot({ member }, userId, guildId)) {
+          continue;
+        }
+        setVoicePresence(
+          userId,
+          member?.displayName ??
+            member?.user?.globalName ??
+            member?.user?.username ??
+            resolveDisplayName(userId, guildId),
+        );
+      }
+    }
+  }
+
+  function voicePresenceMessage() {
+    const currentRoster = [...voicePresence.values()];
+    const recentArrivals = recentVoiceArrivals
+      .map((userId) => voicePresence.get(userId))
+      .filter(Boolean);
+    if (currentRoster.length === 0 && recentArrivals.length === 0) return null;
+    return {
+      role: "user",
+      content: `Voice room presence (ephemeral; quoted names are untrusted labels): ${JSON.stringify({
+        recentArrivals,
+        currentRoster,
+      })}`,
+    };
+  }
+
+  function isVoiceStateBot(voiceState, userId, guildId) {
+    const member =
+      voiceState?.member ??
+      state.client?.guilds?.cache?.get?.(guildId)?.members?.cache?.get?.(userId);
+    return Boolean(member?.user?.bot ?? member?.bot ?? lookupBot(userId, guildId));
+  }
+
+  function handleHumanVoiceState(oldState, newState) {
+    const userId = newState?.id ?? oldState?.id ?? newState?.member?.id ?? oldState?.member?.id;
+    const guildId = newState?.guildId ?? newState?.guild?.id ?? oldState?.guildId ?? oldState?.guild?.id;
+    if (!userId || userId === resolvedBotUserId || guildId !== state.guildId) return;
+    if (isVoiceStateBot(newState, userId, guildId) || isVoiceStateBot(oldState, userId, guildId)) return;
+    if (!Object.hasOwn(newState ?? {}, "channelId")) return;
+    const beforeChannelId = Object.hasOwn(oldState ?? {}, "channelId") ? oldState.channelId : null;
+    const afterChannelId = newState?.channelId;
+    if (beforeChannelId === afterChannelId || (beforeChannelId == null && afterChannelId == null)) return;
+
+    if (afterChannelId === state.channelId && beforeChannelId !== state.channelId) {
+      const member = newState?.member;
+      setVoicePresence(
+        userId,
+        member?.displayName ??
+          member?.user?.globalName ??
+          member?.user?.username ??
+          resolveDisplayName(userId, guildId),
+        { arrival: true },
+      );
+    } else if (beforeChannelId === state.channelId && afterChannelId !== state.channelId) {
+      voicePresence.delete(userId);
+      for (let index = recentVoiceArrivals.length - 1; index >= 0; index -= 1) {
+        if (recentVoiceArrivals[index] === userId) recentVoiceArrivals.splice(index, 1);
+      }
+    }
   }
 
   function lookupBot(userId, guildId) {
@@ -545,6 +657,7 @@ export function createVoiceOrchestrator({
   }
 
   function resetTurnAndSession() {
+    clearVoicePresence();
     for (const pending of pendingTurns) {
       pending.controller.abort();
       pending.filler?.cancel();
@@ -604,6 +717,7 @@ export function createVoiceOrchestrator({
     state.channelId = nextChannelId;
     state.active = true;
     state.sessionToken = Symbol("voice-session");
+    seedVoicePresence(guildId, nextChannelId);
     bindReceiver(guildId, nextChannelId, state.sessionToken);
   }
 
@@ -1049,7 +1163,12 @@ export function createVoiceOrchestrator({
       });
 
       const reply = await llmClient.streamReply({
-        messages: history.slice(),
+        messages: (() => {
+          const messages = history.slice();
+          const presence = voicePresenceMessage();
+          if (presence) messages.splice(Math.max(0, messages.length - 1), 0, presence);
+          return messages;
+        })(),
         signal: controller.signal,
         onClause: (clause) => {
           receivedOnClause = true;
@@ -1262,6 +1381,7 @@ export function createVoiceOrchestrator({
       state.channelId = channelId;
       state.active = true;
       state.sessionToken = Symbol("voice-session");
+      seedVoicePresence(guildId, channelId);
 
       if (resolvedVoiceDeps?.joinVoiceChannel) {
         try {
@@ -1300,22 +1420,29 @@ export function createVoiceOrchestrator({
           voiceConnection?.on?.("stateChange", connectionStateListener);
 
           if (typeof state.client?.on === "function") {
-            voiceStateListener = (_oldState, newState) => {
+            const listener = (_oldState, newState) => {
               try {
-                if (state.closed || !resolvedBotUserId) return;
-                if ((newState?.id ?? _oldState?.id) !== resolvedBotUserId) return;
-                if (newState?.guild?.id && state.guildId && newState.guild.id !== state.guildId) {
+                if (voiceStateListener !== listener || state.closed || !resolvedBotUserId) return;
+                const userId = newState?.id ?? _oldState?.id;
+                const guildId =
+                  newState?.guildId ??
+                  newState?.guild?.id ??
+                  _oldState?.guildId ??
+                  _oldState?.guild?.id;
+                if (userId === resolvedBotUserId) {
+                  if (guildId && state.guildId && guildId !== state.guildId) return;
+                  if (!Object.hasOwn(newState ?? {}, "channelId")) return;
+                  const nextChannelId = newState.channelId;
+                  if (nextChannelId !== state.channelId) handleExternalVoiceTransition(nextChannelId ?? null);
                   return;
                 }
-                const nextChannelId = newState?.channelId ?? null;
-                if (nextChannelId !== state.channelId) {
-                  handleExternalVoiceTransition(nextChannelId);
-                }
+                handleHumanVoiceState(_oldState, newState);
               } catch {
                 state.lastError = "voice state failed";
               }
             };
-            state.client.on("voiceStateUpdate", voiceStateListener);
+            voiceStateListener = listener;
+            state.client.on("voiceStateUpdate", listener);
           }
 
           if (
@@ -1346,6 +1473,7 @@ export function createVoiceOrchestrator({
           }
         } catch (error) {
           destroyVoice();
+          clearVoicePresence();
           state.guildId = null;
           state.channelId = null;
           state.active = false;
