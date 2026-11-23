@@ -328,6 +328,7 @@ export class PerSpeakerVad {
       bufferedBytes: 0,
       bargeInFired: false,
       startedAt: null,
+      lastVoicedAt: null,
       lastSeenAt: timestampMs,
       epoch: 0,
       queue: Promise.resolve(),
@@ -445,6 +446,7 @@ export class PerSpeakerVad {
     state.silenceMs = 0;
     state.bargeInFired = false;
     state.startedAt = null;
+    state.lastVoicedAt = null;
     state.detector = null;
     state.epoch += 1;
     this.quarantinedUsers.set(state.userId, pending);
@@ -498,6 +500,7 @@ export class PerSpeakerVad {
     if (isSpeech) {
       state.speechMs += frameDurationMs;
       state.silenceMs = 0;
+      state.lastVoicedAt = timestampMs;
       this.#appendChunk(state, pcm16kMono);
 
       if (!state.active) {
@@ -561,6 +564,7 @@ export class PerSpeakerVad {
   #finish(state, timestampMs) {
     const chunks = state.chunks;
     const speechMs = state.speechMs;
+    const lastVoicedAt = state.lastVoicedAt;
     const { userId, displayName } = state;
     const epoch = state.epoch;
 
@@ -571,6 +575,7 @@ export class PerSpeakerVad {
     state.bufferedBytes = 0;
     state.bargeInFired = false;
     state.startedAt = null;
+    state.lastVoicedAt = null;
     state.detector?.reset?.();
 
     if (speechMs < this.minSpeechMs) {
@@ -588,6 +593,7 @@ export class PerSpeakerVad {
         pcm16kMono: Buffer.concat(chunks),
         durationMs: speechMs,
         endedAt: timestampMs,
+        lastVoicedAt,
       });
     };
   }
