@@ -4466,7 +4466,7 @@ function deferredValue() {
   return { promise, resolve, reject };
 }
 
-function makeGateOrderHarness({ streamPlans = {} } = {}) {
+function makeGateOrderHarness({ streamPlans = {}, scheduleReactionFillerImpl, reactionPool, fillerMode = "off" } = {}) {
   const transcripts = new Map();
   let sttIndex = 0;
   const gateQueues = new Map();
@@ -4563,8 +4563,10 @@ function makeGateOrderHarness({ streamPlans = {} } = {}) {
     llmClient: llm,
     ttsAdapter: tts,
     playerSink,
+    reactionPool,
+    scheduleReactionFillerImpl,
     config: {
-      reactions: { mode: "off", fillerDelayMs: 165 },
+      reactions: { mode: fillerMode, fillerDelayMs: 165 },
       chime: { mode: "smart" },
       turnDeadlineMs: 5000,
     },
@@ -4974,6 +4976,90 @@ test("gate order: leave and rejoin clears committed ordering state", async () =>
 
     assert.deepEqual(harness.ttsCalls, ["Before leave.", "After rejoin."]);
   } finally {
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: approved turn plays its filler cue before first clause while older cue stays silent", async () => {
+  const scheduledFillers = [];
+  let pickCount = 0;
+  const replyStarted = deferredValue();
+  const replyHold = deferredValue();
+  const harness = makeGateOrderHarness({
+    fillerMode: "adaptive",
+    scheduleReactionFillerImpl: ({ delayMs, onFire }) => {
+      const entry = { delayMs, onFire, cancelled: false };
+      scheduledFillers.push(entry);
+      return {
+        cancel() {
+          entry.cancelled = true;
+        },
+        get fired() {
+          return false;
+        },
+      };
+    },
+    reactionPool: {
+      pick() {
+        pickCount += 1;
+        return { frames48kOpus: [Buffer.from([0xaa, 0xbb])] };
+      },
+    },
+    streamPlans: {
+      "older-speech": ["Old reply."],
+      "newer-speech": async ({ onClause, signal }) => {
+        replyStarted.resolve();
+        await replyHold.promise;
+        if (signal?.aborted) throw abortError();
+        onClause("New reply.");
+        return { fullText: "New reply." };
+      },
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const older = harness.queueGate("older-speech");
+    const newer = harness.queueGate("newer-speech");
+
+    const olderPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: older.pcm,
+      endedAt: 100,
+    });
+    const newerPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: newer.pcm,
+      endedAt: 200,
+    });
+    await tick(10);
+
+    assert.equal(scheduledFillers.length, 2);
+
+    newer.gate.resolve({ shouldReply: true });
+    await replyStarted.promise;
+
+    scheduledFillers[1].onFire();
+    assert.equal(pickCount, 1, "approved turn should play its filler cue before the first clause");
+    assert.equal(harness.sinkFrames.length, 1, "approved turn filler clip should emit an Opus frame");
+
+    scheduledFillers[0].onFire();
+    assert.equal(pickCount, 1, "older pending cue must stay silent after a newer turn commits");
+    assert.equal(harness.sinkFrames.length, 1);
+
+    replyHold.resolve();
+    await newerPromise;
+    older.gate.resolve({ shouldReply: true });
+    await olderPromise;
+
+    scheduledFillers[0].onFire();
+    assert.equal(pickCount, 1, "older cue must remain silent after the newer turn finishes");
+    assert.deepEqual(harness.ttsCalls, ["New reply."]);
+  } finally {
+    replyHold.resolve();
     await harness.orchestrator.close();
   }
 });

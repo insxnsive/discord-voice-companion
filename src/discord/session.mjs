@@ -227,7 +227,7 @@ export function createVoiceOrchestrator({
     if (turn.endedAt !== committedTurnOrder.endedAt) {
       return turn.endedAt < committedTurnOrder.endedAt;
     }
-    return turn.seq <= committedTurnOrder.seq;
+    return turn.seq < committedTurnOrder.seq;
   }
 
   function isTurnLive(turn) {
