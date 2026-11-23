@@ -1594,15 +1594,17 @@ export function createVoiceOrchestrator({
               const queueDepth = stream?.readableLength ?? null;
               const writableEnded = stream ? Boolean(stream.writableEnded) : null;
               const destroyed = stream ? Boolean(stream.destroyed) : null;
+              const readableEnded = stream ? Boolean(stream.readableEnded) : false;
               let idleObservation = "unknown";
-              if (destroyed && !writableEnded) {
+              if (destroyed && !readableEnded) {
                 idleObservation = "output_destroyed_before_end";
               } else if (writableEnded === false) {
                 idleObservation =
                   (queueDepth ?? 0) === 0 ? "output_open_empty_queue" : "unknown";
+              } else if (writableEnded === true && readableEnded && (queueDepth ?? 0) === 0) {
+                idleObservation = "output_drained";
               } else if (writableEnded === true) {
-                idleObservation =
-                  (queueDepth ?? 0) === 0 ? "output_drained" : "output_ended_with_queue";
+                idleObservation = "output_ended_with_queue";
               }
               try {
                 const idleAt = now();

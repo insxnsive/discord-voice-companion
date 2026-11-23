@@ -3305,6 +3305,7 @@ test("voice timing marks a drained ended output as a normal drain", async () => 
   );
   resource.stream.end();
   while (resource.stream.read() !== null) {}
+  await new Promise((resolve) => resource.stream.once("finish", resolve));
   shapes.player.emit(
     "stateChange",
     { status: "playing", resource },
@@ -3315,6 +3316,7 @@ test("voice timing marks a drained ended output as a normal drain", async () => 
   assert.equal(idle.stopReason, "normal_drain");
   assert.equal(idle.idleObservation, "output_drained");
   assert.equal(idle.writableEnded, true);
+  assert.match(formatStatusReply(orchestrator.getStatus()), /producer ended/);
   assert.equal(typeof idle.playingMs, "number");
   assert.equal(typeof idle.idleAtMs, "number");
 
@@ -3378,6 +3380,63 @@ test("voice timing records a destroyed output as an unknown idle cause", async (
   assert.equal(idle.stopReason, null);
   assert.equal(idle.idleObservation, "output_destroyed_before_end");
   assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+
+  releaseReply();
+  await turn;
+});
+
+test("voice timing does not call a force-destroyed stream a drain", async () => {
+  let clock = 0;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock++,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const resource = shapes.played.at(-1);
+  for (let i = 0; i < 50; i += 1) {
+    if (orchestrator.getStatus().timingLast?.firstAcceptedFrameMs !== null) break;
+    await tick(2);
+  }
+
+  resource.stream.end();
+  resource.stream.destroy();
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource },
+    { status: "idle", resource },
+  );
+
+  const idle = orchestrator.getStatus().timingLast;
+  assert.equal(idle.stopReason, null);
+  assert.equal(idle.idleObservation, "output_destroyed_before_end");
+  assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+  assert.match(formatStatusReply(orchestrator.getStatus()), /producer ended/);
 
   releaseReply();
   await turn;

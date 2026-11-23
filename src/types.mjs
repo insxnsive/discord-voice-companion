@@ -451,7 +451,7 @@ export class TurnTimingTrace {
     if (record.idleAtMs !== null) parts.push(`idle at ${ms(record.idleAtMs)}`);
     if (record.queueDepth !== null) parts.push(`queue ${record.queueDepth}`);
     if (record.writableEnded !== null) {
-      parts.push(record.writableEnded ? "output ended" : "output open");
+      parts.push(record.writableEnded ? "producer ended" : "producer had not ended");
     }
     if (record.sinceLastQueuedFrameMs !== null) {
       parts.push(`last frame gap ${ms(record.sinceLastQueuedFrameMs)}`);
