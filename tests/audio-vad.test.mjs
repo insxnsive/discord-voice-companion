@@ -291,6 +291,34 @@ test("PerSpeakerVad drops sub-250ms blips and emits merged PCM for real utteranc
   assert.equal(utterance.pcm16kMono.length, (15 + 12) * VAD_FRAME_BYTES);
 });
 
+test("voice timing: the speech-end event carries the last voiced frame timestamp", async () => {
+  const { vad, events } = makeVad();
+  let timestampMs = 1000;
+  for (let i = 0; i < 15; i += 1) {
+    timestampMs += 20;
+    await vad.pushFrame({
+      userId: "u1",
+      displayName: "Ana",
+      pcm16kMono: monoFrame(9000),
+      timestampMs,
+    });
+  }
+  const lastVoiced = timestampMs;
+  for (let i = 0; i < 12; i += 1) {
+    timestampMs += 20;
+    await vad.pushFrame({
+      userId: "u1",
+      displayName: "Ana",
+      pcm16kMono: monoFrame(0),
+      timestampMs,
+    });
+  }
+
+  assert.equal(events.ends.length, 1);
+  assert.equal(events.ends[0].endedAt, timestampMs);
+  assert.equal(events.ends[0].lastVoicedAt, lastVoiced);
+});
+
 test("PerSpeakerVad fires barge-in once per utterance and caps long utterances", async () => {
   const { vad, events } = makeVad({
     botUserId: "bot-1",

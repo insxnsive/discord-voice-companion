@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import * as typesModule from "../src/types.mjs";
 import {
   CHIME_MODES,
   FILLER_MODES,
@@ -171,4 +172,72 @@ test("LatencyTracker marks unknown stages as a RangeError and leaves gaps null",
   const metrics = tracker.finishTurn("turn-d");
   assert.equal(metrics.sttMs, null);
   assert.equal(metrics.totalLiveMs, null);
+});
+
+test("timing trace stays bounded, clamps numbers, and stores only allowed fields", () => {
+  const trace = new typesModule.TurnTimingTrace({ limit: 2 });
+  trace.startTurn(1, { lastVoicedAt: 100, endedAt: 340, callbackAt: 342 });
+  trace.mark(1, "sttMs", 120);
+  trace.mark(1, "gateMs", 9_999_999);
+  trace.mark(1, "queueDepth", 0);
+  trace.mark(1, "writableEnded", false);
+  trace.setGateReason(1, "reply");
+  trace.notePlayer(1, {
+    playerState: "idle",
+    queueDepth: 0,
+    writableEnded: false,
+    sinceLastQueuedFrameMs: 12,
+    idleObservation: "output_open_empty_queue",
+  });
+  trace.assignResource(1);
+  trace.setStopReason(1, "normal_drain");
+
+  const first = trace.getLatest();
+  assert.equal(first.turn, 1);
+  assert.equal(first.resource, 1);
+  assert.equal(first.lastVoicedToEndMs, 240);
+  assert.equal(first.endToCallbackMs, 2);
+  assert.equal(first.sttMs, 120);
+  assert.equal(first.gateMs, 600_000);
+  assert.equal(first.gateReason, "reply");
+  assert.equal(first.playerState, "idle");
+  assert.equal(first.idleObservation, "output_open_empty_queue");
+  assert.equal(first.stopReason, "normal_drain");
+
+  assert.throws(() => trace.mark(1, "nickname", "Ana"), RangeError);
+  assert.throws(() => trace.mark(1, "sttMs", -1), RangeError);
+  assert.throws(() => trace.setStopReason(1, "because"), RangeError);
+
+  trace.startTurn(2);
+  trace.startTurn(3);
+  assert.equal(trace.records.length, 2);
+  assert.equal(trace.getLatest().turn, 3);
+  assert.match(trace.formatSummary(), /turn 3/);
+  assert.equal(trace.formatSummary().includes("Ana"), false);
+  assert.equal(trace.formatSummary().includes("guild"), false);
+
+  const keys = Object.keys(first).sort();
+  assert.deepEqual(keys, [
+    "endToCallbackMs",
+    "firstAcceptedFrameMs",
+    "firstClauseMs",
+    "firstContentTokenMs",
+    "firstPcmMs",
+    "frameBackpressure",
+    "gateMs",
+    "gateReason",
+    "idleObservation",
+    "lastVoicedToEndMs",
+    "playerState",
+    "queueDepth",
+    "resource",
+    "sinceLastQueuedFrameMs",
+    "stopReason",
+    "sttMs",
+    "turn",
+    "writableEnded",
+  ]);
+  trace.reset();
+  assert.equal(trace.getLatest(), null);
+  assert.equal(trace.formatSummary(), "No timing trace yet.");
 });

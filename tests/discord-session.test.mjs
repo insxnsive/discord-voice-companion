@@ -2980,6 +2980,155 @@ test("filler audio never counts as the first live reply frame", async () => {
   assert.equal(metrics.totalLiveMs, null);
 });
 
+test("voice timing trace separates gate, token, clause, PCM, and accepted frame", async () => {
+  let clock = 0;
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true };
+    },
+    async streamReply({ onToken, onClause }) {
+      clock += 10;
+      onToken("Hi. ");
+      clock += 10;
+      onClause("Hi. ");
+      return { fullText: "Hi. " };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    llmClient: llm,
+    now: () => clock,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+    lastVoicedAt: -240,
+  });
+
+  const trace = orchestrator.getStatus().timingLast;
+  assert.ok(trace);
+  assert.equal(trace.turn, 1);
+  assert.equal(trace.lastVoicedToEndMs, 240);
+  assert.equal(typeof trace.sttMs, "number");
+  assert.equal(typeof trace.gateMs, "number");
+  assert.equal(trace.gateReason, "reply");
+  assert.equal(typeof trace.firstContentTokenMs, "number");
+  assert.equal(typeof trace.firstClauseMs, "number");
+  assert.equal(typeof trace.firstPcmMs, "number");
+  assert.equal(typeof trace.firstAcceptedFrameMs, "number");
+  assert.ok(trace.firstClauseMs > trace.firstContentTokenMs);
+  assert.ok(trace.firstPcmMs >= trace.firstClauseMs);
+  assert.ok(trace.firstAcceptedFrameMs >= trace.firstPcmMs);
+  assert.equal(trace.frameBackpressure, false);
+  const status = orchestrator.getStatus();
+  assert.match(status.timingSummary, /turn 1/);
+  assert.equal(status.timingSummary.includes("Ana"), false);
+  assert.equal(status.timingSummary.includes("g1"), false);
+  assert.match(formatStatusReply(status), /Timing: turn 1/);
+});
+
+test("voice timing trace records normal drain, an open-output idle, and a retired resource", async () => {
+  let clock = 0;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true };
+    },
+    async streamReply({ onClause }) {
+      clock += 5;
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) {
+    await tick(2);
+  }
+  assert.ok(shapes.played.length >= 1);
+  const resource = shapes.played.at(-1);
+
+  for (let i = 0; i < 50; i += 1) {
+    if (orchestrator.getStatus().timingLast?.firstAcceptedFrameMs !== null) break;
+    await tick(2);
+  }
+
+  while (resource.stream.read() !== null) {}
+
+  const retired = { retired: true };
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource: retired },
+    { status: "idle", resource: retired },
+  );
+  assert.equal(orchestrator.getStatus().timingLast.stopReason, null);
+
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource },
+    { status: "idle", resource },
+  );
+
+  const idle = orchestrator.getStatus().timingLast;
+  assert.equal(idle.playerState, "idle");
+  assert.equal(idle.stopReason, "normal_drain");
+  assert.equal(idle.queueDepth, 0);
+  assert.equal(typeof idle.writableEnded, "boolean");
+  assert.equal(idle.idleObservation, "output_open_empty_queue");
+
+  releaseReply();
+  await turn;
+
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  assert.equal(orchestrator.getStatus().timingLast, null);
+  assert.match(orchestrator.getStatus().timingSummary, /No timing trace yet/);
+});
+
+test("voice timing trace records a same-speaker barge-in stop", async () => {
+  const llm = makeLlm({ blockStream: true });
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await tick(5);
+  vad.captured.callbacks.onBargeIn({ userId: "u1" });
+  await turn;
+
+  assert.equal(orchestrator.getStatus().timingLast.stopReason, "barge_in_same_speaker");
+});
+
 test("a stalled turn is aborted by the turn deadline", { timeout: 3000 }, async () => {
   const llm = makeLlm({ blockGate: true });
   const { orchestrator, vad, filler, playerSink } = buildOrchestrator({

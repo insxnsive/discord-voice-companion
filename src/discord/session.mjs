@@ -4,7 +4,13 @@
 
 import { PassThrough } from "node:stream";
 
-import { CHIME_MODES, FILLER_MODES, LatencyTracker, assertAdapterContract } from "../types.mjs";
+import {
+  CHIME_MODES,
+  FILLER_MODES,
+  LatencyTracker,
+  TurnTimingTrace,
+  assertAdapterContract,
+} from "../types.mjs";
 import {
   createFrameAccumulator,
   createOpusTranscoder,
@@ -134,6 +140,7 @@ export function createVoiceOrchestrator({
   const speakerBotCache = new Map();
   const speakerFetchInFlight = new Map();
   const speakerDecoders = new Map();
+  const timingTrace = new TurnTimingTrace();
 
   const state = {
     active: false,
@@ -642,6 +649,11 @@ export function createVoiceOrchestrator({
   function resetTurnAndSession() {
     clearVoicePresence();
     for (const pending of pendingTurns) {
+      try {
+        timingTrace.setStopReason(pending.seq, "session_reset");
+      } catch {
+        // The trace may already be trimmed.
+      }
       pending.controller.abort();
       pending.filler?.cancel();
       clearTimeout(pending.deadline);
@@ -652,6 +664,13 @@ export function createVoiceOrchestrator({
       }
     }
     clearTimeout(currentTurn?.deadline);
+    if (currentTurn) {
+      try {
+        timingTrace.setStopReason(currentTurn.seq, "session_reset");
+      } catch {
+        // The trace may already be trimmed.
+      }
+    }
     currentTurn?.controller.abort();
     currentTurn?.filler?.cancel();
     finishOutput(currentTurn);
@@ -672,6 +691,7 @@ export function createVoiceOrchestrator({
     }
     speakerDecoders.clear();
     speakerBotCache.clear();
+    timingTrace.reset();
     state.sessionEpoch += 1;
     state.sessionToken = null;
   }
@@ -815,6 +835,7 @@ export function createVoiceOrchestrator({
         })
       : stream;
     turn.outStream = stream;
+    turn.resourceOrdinal = timingTrace.assignResource(turn.seq);
     activePlaybackUserId = turn.userId;
     activePlaybackTurn = turn;
     activePlaybackResource = resource;
@@ -828,6 +849,7 @@ export function createVoiceOrchestrator({
     turn.queuedOpusFrames += 1;
     if (turn.queuedOpusFrames > MAX_QUEUED_OPUS_FRAMES) {
       state.lastError = "turn frame limit exceeded";
+      timingTrace.setStopReason(turn.seq, "frame_cap");
       turn.controller.abort();
       stopPlayback();
       return;
@@ -840,15 +862,32 @@ export function createVoiceOrchestrator({
     activePlaybackTurn = turn;
     if (playerSink?.playOpusFrame) {
       playerSink.playOpusFrame(packet);
-      if (!isFiller) turn.replyFrameEmitted = true;
+      if (!isFiller) {
+        turn.replyFrameEmitted = true;
+        if (!turn.firstAcceptedMarked) {
+          timingTrace.mark(turn.seq, "firstAcceptedFrameMs", Math.max(0, now() - turn.startedAt));
+          timingTrace.mark(turn.seq, "frameBackpressure", false);
+          turn.firstAcceptedMarked = true;
+        }
+        turn.lastQueuedFrameAt = now();
+      }
       return;
     }
     const stream = ensureTurnStream(turn);
     if (stream?.write && !stream.destroyed && !stream.writableEnded && !stream.writableFinished) {
       const accepted = stream.write(packet);
-      if (!isFiller) turn.replyFrameEmitted = true;
+      if (!isFiller) {
+        turn.replyFrameEmitted = true;
+        if (!turn.firstAcceptedMarked) {
+          timingTrace.mark(turn.seq, "firstAcceptedFrameMs", Math.max(0, now() - turn.startedAt));
+          timingTrace.mark(turn.seq, "frameBackpressure", !accepted);
+          turn.firstAcceptedMarked = true;
+        }
+        turn.lastQueuedFrameAt = now();
+      }
       if (!accepted && (stream.readableLength ?? 0) > MAX_QUEUED_OPUS_FRAMES) {
         state.lastError = "turn frame limit exceeded";
+        timingTrace.setStopReason(turn.seq, "frame_cap");
         turn.controller.abort();
         stopPlayback();
       }
@@ -918,11 +957,13 @@ export function createVoiceOrchestrator({
     refreshSinkPlaybackOwner();
     if (typeof event?.userId !== "string" || event.userId.length === 0) return;
     if (currentTurn?.userId === event.userId) {
+      timingTrace.setStopReason(currentTurn.seq, "barge_in_same_speaker");
       abortTurn(currentTurn);
       return;
     }
     const playbackTurn = activePlaybackTurn;
     if (playbackTurn?.userId !== event.userId) return;
+    timingTrace.setStopReason(playbackTurn.seq, "barge_in_same_speaker");
     if (playbackTurn.committed === false) abortTurn(playbackTurn);
     else stopOwnedPlayback(playbackTurn);
   }
@@ -933,9 +974,14 @@ export function createVoiceOrchestrator({
       turn.filler?.cancel();
       turn.fillerCancelled = true;
     }
+    const clauseAt = now();
     if (!turn.llmMarked) {
-      latencyTracker.mark(turn.id, "llmFirstClauseAt", now());
+      latencyTracker.mark(turn.id, "llmFirstClauseAt", clauseAt);
       turn.llmMarked = true;
+    }
+    if (!turn.firstClauseMarked) {
+      timingTrace.mark(turn.seq, "firstClauseMs", Math.max(0, clauseAt - turn.startedAt));
+      turn.firstClauseMarked = true;
     }
 
     await ttsAdapter.synthesizeClause({
@@ -946,12 +992,15 @@ export function createVoiceOrchestrator({
         turn.pcmBytes += Buffer.isBuffer(pcm24) ? pcm24.length : Buffer.byteLength(pcm24);
         if (turn.pcmBytes > MAX_TURN_AUDIO_BYTES) {
           state.lastError = "turn audio limit exceeded";
+          timingTrace.setStopReason(turn.seq, "audio_cap");
           turn.controller.abort();
           stopPlayback();
           return;
         }
         if (!turn.ttsMarked) {
-          latencyTracker.mark(turn.id, "ttsFirstByteAt", now());
+          const pcmAt = now();
+          latencyTracker.mark(turn.id, "ttsFirstByteAt", pcmAt);
+          timingTrace.mark(turn.seq, "firstPcmMs", Math.max(0, pcmAt - turn.startedAt));
           turn.ttsMarked = true;
         }
         state.isBotSpeaking = true;
@@ -962,7 +1011,7 @@ export function createVoiceOrchestrator({
     if (isTurnLive(turn)) flushFrames(turn);
   }
 
-  async function handleSpeechEnd({ userId, displayName, pcm16kMono, endedAt } = {}) {
+  async function handleSpeechEnd({ userId, displayName, pcm16kMono, endedAt, lastVoicedAt } = {}) {
     if (state.closed) return;
     if (pendingTurns.size >= MAX_PENDING_TURNS) return;
     for (const pending of pendingTurns) {
@@ -982,10 +1031,12 @@ export function createVoiceOrchestrator({
     const turnId = `turn-${turnSeq}`;
     const controller = new AbortController();
 
-    const startedAt = endedAt === undefined ? now() : endedAt;
+    const callbackAt = now();
+    const startedAt = endedAt === undefined ? callbackAt : endedAt;
     const turn = {
       id: turnId,
       seq: turnSeq,
+      startedAt,
       endedAt: startedAt,
       userId,
       controller,
@@ -1008,6 +1059,11 @@ export function createVoiceOrchestrator({
     pendingTurns.add(turn);
     turn.committed = false;
     turn.voiceToken = undefined;
+    timingTrace.startTurn(turnSeq, {
+      lastVoicedAt: Number.isFinite(lastVoicedAt) ? lastVoicedAt : null,
+      endedAt: startedAt,
+      callbackAt,
+    });
     latencyTracker.startTurn(turnId, startedAt);
 
     const turnDeadlineMs = Number.isFinite(config?.turnDeadlineMs)
@@ -1015,6 +1071,7 @@ export function createVoiceOrchestrator({
       : 10000;
     turn.deadline = setTimeout(() => {
       if (turn.controller.signal.aborted) return;
+      timingTrace.setStopReason(turn.seq, "deadline");
       turn.controller.abort();
       turn.filler?.cancel();
       finishOutput(turn);
@@ -1049,7 +1106,9 @@ export function createVoiceOrchestrator({
 
       const transcript = await sttAdapter.transcribe(pcm16kMono, { signal: controller.signal });
       if (!isTurnLive(turn)) return;
-      latencyTracker.mark(turnId, "sttDoneAt", now());
+      const sttAt = now();
+      latencyTracker.mark(turnId, "sttDoneAt", sttAt);
+      timingTrace.mark(turnSeq, "sttMs", Math.max(0, sttAt - startedAt));
       if (
         typeof transcript !== "string" ||
         transcript.trim().length === 0 ||
@@ -1098,8 +1157,20 @@ export function createVoiceOrchestrator({
         now,
       });
       if (!isTurnLive(turn)) return;
-      latencyTracker.mark(turnId, "gateDoneAt", now());
+      const gateAt = now();
+      latencyTracker.mark(turnId, "gateDoneAt", gateAt);
+      timingTrace.mark(turnSeq, "gateMs", Math.max(0, gateAt - sttAt));
       const chimeIn = decision?.chimeIn ?? decision?.shouldReply;
+      timingTrace.setGateReason(
+        turnSeq,
+        chimeIn !== true
+          ? chimeIn === false
+            ? "no_reply"
+            : "unknown"
+          : isStaleTurnOrder(turn)
+            ? "no_reply"
+            : "reply",
+      );
       if (chimeIn !== true || isStaleTurnOrder(turn)) {
         turn.gateDenied = true;
         turn.filler?.cancel();
@@ -1111,6 +1182,7 @@ export function createVoiceOrchestrator({
       }
 
       if (currentTurn && currentTurn !== turn) {
+        timingTrace.setStopReason(currentTurn.seq, "newer_turn");
         currentTurn.controller.abort();
         currentTurn.filler?.cancel();
         clearTimeout(currentTurn.deadline);
@@ -1164,9 +1236,13 @@ export function createVoiceOrchestrator({
           enqueueClause(clause);
         },
         onToken: (delta) => {
+          if (!delta) return;
+          if (!turn.firstTokenMarked) {
+            timingTrace.mark(turnSeq, "firstContentTokenMs", Math.max(0, now() - startedAt));
+            turn.firstTokenMarked = true;
+          }
           if (!receivedOnClause) tokenBuffer += delta;
-        },
-      });
+        },      });
       if (!isTurnLive(turn)) return;
 
       if (!receivedOnClause && tokenBuffer) {
@@ -1182,6 +1258,7 @@ export function createVoiceOrchestrator({
       if (!isTurnLive(turn)) return;
       if (ttsError && !controller.signal.aborted) {
         state.lastError = "voice turn failed";
+        timingTrace.setStopReason(turnSeq, "provider_error");
       }
 
       if (typeof reply?.fullText === "string" && reply.fullText.trim().length > 0) {
@@ -1195,6 +1272,8 @@ export function createVoiceOrchestrator({
     } catch (error) {
       if (!controller.signal.aborted && error?.name !== "AbortError") {
         state.lastError = "voice turn failed";
+        timingTrace.setStopReason(turnSeq, "provider_error");
+        if (!turn.committed) timingTrace.setGateReason(turnSeq, "error");
       }
     } finally {
       pendingTurns.delete(turn);
@@ -1443,14 +1522,52 @@ export function createVoiceOrchestrator({
 
             playerErrorListener = () => {
               state.lastError = "voice player error";
+              if (activePlaybackTurn) {
+                timingTrace.setStopReason(activePlaybackTurn.seq, "player_error");
+              }
             };
             voicePlayer?.on?.("error", playerErrorListener);
 
             playerStateListener = (oldState, nextState) => {
-              if (nextState?.status !== "idle" || !activePlaybackTurn || !activePlaybackResource) return;
               const endedResource = nextState?.resource ?? oldState?.resource;
+              if (nextState?.status === "playing") {
+                if (
+                  endedResource === activePlaybackResource &&
+                  activePlaybackTurn &&
+                  activePlaybackTurn.playerState !== "playing"
+                ) {
+                  activePlaybackTurn.playerState = "playing";
+                  timingTrace.notePlayer(activePlaybackTurn.seq, { playerState: "playing" });
+                }
+                return;
+              }
+              if (nextState?.status !== "idle" || !activePlaybackTurn || !activePlaybackResource) return;
               if (endedResource !== activePlaybackResource) return;
               const endedTurn = activePlaybackTurn;
+              const queueDepth = activePlaybackStream?.readableLength ?? null;
+              const writableEnded = activePlaybackStream
+                ? Boolean(activePlaybackStream.writableEnded)
+                : null;
+              const outputOpen = Boolean(
+                activePlaybackStream &&
+                  !activePlaybackStream.destroyed &&
+                  !activePlaybackStream.writableEnded,
+              );
+              const sinceLastQueuedFrameMs =
+                endedTurn.lastQueuedFrameAt === undefined
+                  ? null
+                  : Math.max(0, now() - endedTurn.lastQueuedFrameAt);
+              timingTrace.notePlayer(endedTurn.seq, {
+                playerState: "idle",
+                queueDepth,
+                writableEnded,
+                sinceLastQueuedFrameMs,
+                idleObservation:
+                  outputOpen && (queueDepth ?? 0) === 0
+                    ? "output_open_empty_queue"
+                    : "normal",
+              });
+              timingTrace.setStopReason(endedTurn.seq, "normal_drain", { onlyIfUnset: true });
               if (endedTurn?.outStream === activePlaybackStream) finishOutput(endedTurn);
               activePlaybackUserId = null;
               activePlaybackTurn = null;
@@ -1547,6 +1664,8 @@ export function createVoiceOrchestrator({
       config: redactConfig(config ?? {}),
       latencySummary: latencyTracker.formatSummary(),
       latencyLast: latencyTracker.getLast(),
+      timingSummary: timingTrace.formatSummary(),
+      timingLast: timingTrace.getLatest(),
       lastError: state.lastError,
     };
   }

@@ -152,6 +152,7 @@ export function formatStatusReply(status = {}) {
     `Filler mode: ${status.fillerMode ?? "unknown"}`,
     `DAVE E2EE: ${status.daveReady ? "ready" : "not ready"}`,
     `Latency: ${status.latencySummary ?? "No turns recorded yet."}`,
+    ...(status.timingSummary ? [`Timing: ${status.timingSummary}`] : []),
   ].join("\n");
 }
 

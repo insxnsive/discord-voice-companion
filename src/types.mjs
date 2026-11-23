@@ -189,3 +189,216 @@ export class LatencyTracker {
     );
   }
 }
+
+export const TIMING_STOP_REASONS = Object.freeze([
+  "barge_in_same_speaker",
+  "newer_turn",
+  "deadline",
+  "audio_cap",
+  "frame_cap",
+  "session_reset",
+  "provider_error",
+  "player_error",
+  "normal_drain",
+  "unknown",
+]);
+
+export const TIMING_GATE_REASONS = Object.freeze([
+  "reply",
+  "no_reply",
+  "timeout",
+  "error",
+  "unknown",
+]);
+
+export const TIMING_PLAYER_STATES = Object.freeze(["playing", "idle", "unknown"]);
+
+export const TIMING_IDLE_OBSERVATIONS = Object.freeze([
+  "output_open_empty_queue",
+  "normal",
+  "unknown",
+]);
+
+const TIMING_NUMBER_FIELDS = new Set([
+  "lastVoicedToEndMs",
+  "endToCallbackMs",
+  "sttMs",
+  "gateMs",
+  "firstContentTokenMs",
+  "firstClauseMs",
+  "firstPcmMs",
+  "firstAcceptedFrameMs",
+  "queueDepth",
+  "sinceLastQueuedFrameMs",
+]);
+
+const TIMING_BOOLEAN_FIELDS = new Set(["writableEnded", "frameBackpressure"]);
+const TIMING_ENUM_FIELDS = new Map([
+  ["gateReason", TIMING_GATE_REASONS],
+  ["stopReason", TIMING_STOP_REASONS],
+  ["playerState", TIMING_PLAYER_STATES],
+  ["idleObservation", TIMING_IDLE_OBSERVATIONS],
+]);
+
+const MAX_TIMING_MS = 600_000;
+
+function boundedTimingNumber(value, maxMs) {
+  if (value === null || value === undefined) return null;
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError("timing values must be non-negative finite numbers");
+  }
+  return Math.min(Math.round(value), maxMs);
+}
+
+function boundedTimingDelta(from, to, maxMs) {
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
+  return Math.min(Math.max(0, Math.round(to - from)), maxMs);
+}
+
+/**
+ * Bounded, session-local timing and stop trace. Records carry only local turn
+ * and resource ordinals plus bounded numbers and allowed enums; names, IDs,
+ * transcript text, audio and raw provider errors never enter this model.
+ */
+export class TurnTimingTrace {
+  constructor({ limit = 8, maxMs = MAX_TIMING_MS } = {}) {
+    this.limit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 32) : 8;
+    this.maxMs = Number.isInteger(maxMs) && maxMs > 0 ? maxMs : MAX_TIMING_MS;
+    this.records = [];
+    this.resourceSeq = 0;
+  }
+
+  startTurn(turn, { lastVoicedAt = null, endedAt = null, callbackAt = null } = {}) {
+    const record = {
+      turn,
+      resource: null,
+      lastVoicedToEndMs: null,
+      endToCallbackMs: null,
+      sttMs: null,
+      gateMs: null,
+      gateReason: null,
+      firstContentTokenMs: null,
+      firstClauseMs: null,
+      firstPcmMs: null,
+      firstAcceptedFrameMs: null,
+      playerState: null,
+      queueDepth: null,
+      writableEnded: null,
+      sinceLastQueuedFrameMs: null,
+      frameBackpressure: null,
+      idleObservation: null,
+      stopReason: null,
+    };
+    if (endedAt !== null && lastVoicedAt !== null) {
+      record.lastVoicedToEndMs = boundedTimingDelta(lastVoicedAt, endedAt, this.maxMs);
+    }
+    if (endedAt !== null && callbackAt !== null) {
+      record.endToCallbackMs = boundedTimingDelta(endedAt, callbackAt, this.maxMs);
+    }
+    this.records.push(record);
+    const overflow = this.records.length - this.limit;
+    if (overflow > 0) this.records.splice(0, overflow);
+    return record;
+  }
+
+  #find(turn) {
+    for (let index = this.records.length - 1; index >= 0; index -= 1) {
+      if (this.records[index].turn === turn) return this.records[index];
+    }
+    return null;
+  }
+
+  mark(turn, field, value) {
+    const record = this.#find(turn);
+    if (!record) return null;
+    if (TIMING_NUMBER_FIELDS.has(field)) {
+      record[field] = boundedTimingNumber(value, this.maxMs);
+      return record;
+    }
+    if (TIMING_BOOLEAN_FIELDS.has(field)) {
+      if (typeof value !== "boolean") throw new RangeError(`${field} must be a boolean`);
+      record[field] = value;
+      return record;
+    }
+    throw new RangeError(`Unknown timing field: ${field}`);
+  }
+
+  setReason(turn, field, value, { onlyIfUnset = false } = {}) {
+    const allowed = TIMING_ENUM_FIELDS.get(field);
+    if (!allowed) throw new RangeError(`Unknown timing reason field: ${field}`);
+    if (!allowed.includes(value)) throw new RangeError(`Invalid ${field}: ${value}`);
+    const record = this.#find(turn);
+    if (!record) return null;
+    if (onlyIfUnset && record[field]) return record;
+    record[field] = value;
+    return record;
+  }
+
+  setGateReason(turn, value, options) {
+    return this.setReason(turn, "gateReason", value, options);
+  }
+
+  setStopReason(turn, value, options) {
+    return this.setReason(turn, "stopReason", value, options);
+  }
+
+  notePlayer(turn, { playerState, queueDepth, writableEnded, sinceLastQueuedFrameMs, idleObservation }) {
+    const record = this.#find(turn);
+    if (!record) return null;
+    if (playerState !== undefined) this.setReason(turn, "playerState", playerState);
+    if (idleObservation !== undefined) this.setReason(turn, "idleObservation", idleObservation);
+    if (queueDepth !== undefined) this.mark(turn, "queueDepth", queueDepth);
+    if (writableEnded !== undefined) this.mark(turn, "writableEnded", writableEnded);
+    if (sinceLastQueuedFrameMs !== undefined) {
+      this.mark(turn, "sinceLastQueuedFrameMs", sinceLastQueuedFrameMs);
+    }
+    return record;
+  }
+
+  assignResource(turn) {
+    const record = this.#find(turn);
+    if (!record) return null;
+    this.resourceSeq += 1;
+    record.resource = this.resourceSeq;
+    return this.resourceSeq;
+  }
+
+  getLatest() {
+    return this.records.length > 0 ? this.records[this.records.length - 1] : null;
+  }
+
+  reset() {
+    this.records = [];
+    this.resourceSeq = 0;
+  }
+
+  formatSummary(record = this.getLatest()) {
+    if (!record) return "No timing trace yet.";
+    const ms = (value) => (typeof value === "number" ? `${value}ms` : "n/a");
+    const parts = [`turn ${record.turn}`];
+    if (record.resource !== null) parts.push(`resource ${record.resource}`);
+    if (record.stopReason) parts.push(`stop ${record.stopReason}`);
+    else parts.push("stop unknown");
+    if (record.lastVoicedToEndMs !== null) parts.push(`voice to end ${ms(record.lastVoicedToEndMs)}`);
+    if (record.endToCallbackMs !== null) parts.push(`end to callback ${ms(record.endToCallbackMs)}`);
+    if (record.sttMs !== null) parts.push(`STT ${ms(record.sttMs)}`);
+    if (record.gateMs !== null) {
+      parts.push(`gate ${ms(record.gateMs)}${record.gateReason ? ` (${record.gateReason})` : ""}`);
+    }
+    if (record.firstContentTokenMs !== null) parts.push(`token ${ms(record.firstContentTokenMs)}`);
+    if (record.firstClauseMs !== null) parts.push(`clause ${ms(record.firstClauseMs)}`);
+    if (record.firstPcmMs !== null) parts.push(`PCM ${ms(record.firstPcmMs)}`);
+    if (record.firstAcceptedFrameMs !== null) {
+      parts.push(`frame ${ms(record.firstAcceptedFrameMs)}`);
+    }
+    if (record.frameBackpressure === true) parts.push("write backpressure");
+    if (record.playerState) parts.push(`player ${record.playerState}`);
+    if (record.queueDepth !== null) parts.push(`queue ${record.queueDepth}`);
+    if (record.idleObservation === "output_open_empty_queue") {
+      parts.push("idle with output open and queue empty");
+    } else if (record.idleObservation === "normal") {
+      parts.push("idle drained");
+    }
+    return parts.join(" | ");
+  }
+}
