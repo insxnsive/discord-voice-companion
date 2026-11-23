@@ -319,12 +319,16 @@ export function loadConfig({
         : "eleven_flash_v2_5"
       : "";
 
-  const ttsFallbackKey =
+  // One resolved ElevenLabs credential serves both listing and synthesis.
+  const explicitElevenlabsKey = pickNonEmpty(
+    getEnv("ELEVENLABS_API_KEY"),
+    configJson.tts?.elevenlabsApiKey,
+  );
+  const elevenlabsApiKey =
     ttsProvider === "elevenlabs"
-      ? getEnv("ELEVENLABS_API_KEY")
-      : ttsProvider === "openai"
-        ? getEnv("OPENAI_API_KEY")
-        : "";
+      ? pickNonEmpty(explicitElevenlabsKey, getEnv("TTS_API_KEY"), configJson.tts?.apiKey)
+      : explicitElevenlabsKey;
+  const ttsFallbackKey = ttsProvider === "openai" ? getEnv("OPENAI_API_KEY") : "";
 
   return {
     personaPrompt,
@@ -384,7 +388,11 @@ export function loadConfig({
     },
     tts: {
       provider: ttsProvider,
-      apiKey: pickNonEmpty(getEnv("TTS_API_KEY"), ttsFallbackKey, configJson.tts?.apiKey),
+      apiKey:
+        ttsProvider === "elevenlabs"
+          ? elevenlabsApiKey
+          : pickNonEmpty(getEnv("TTS_API_KEY"), ttsFallbackKey, configJson.tts?.apiKey),
+      elevenlabsApiKey,
       baseUrl: validateEndpointUrl(
         pickNonEmpty(getEnv("TTS_BASE_URL"), configJson.tts?.baseUrl),
         "tts.baseUrl",

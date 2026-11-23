@@ -200,6 +200,16 @@ export async function createCompanionApp({
   }
 
   let commandHandler = null;
+  const createVoiceChooserForTts = async () => {
+    if (config?.tts?.provider !== "elevenlabs") return null;
+    const commandsMod = await loadOptionalModule("./discord/commands.mjs");
+    if (typeof commandsMod?.createVoiceChooser !== "function") return null;
+    return commandsMod.createVoiceChooser({
+      adapter: ttsAdapter,
+      apiKey: config?.tts?.elevenlabsApiKey,
+      provider: config.tts.provider,
+    });
+  };
   let resolvedSlashCommands = Array.isArray(providedSlashCommands) ? providedSlashCommands : null;
   if (typeof createCommandHandlerImpl === "function") {
     commandHandler = createCommandHandlerImpl({
@@ -208,6 +218,7 @@ export async function createCompanionApp({
       latencyTracker,
       orchestrator,
       client: resolvedClient,
+      voiceChooser: await createVoiceChooserForTts(),
     });
     if (!resolvedSlashCommands && Array.isArray(commandHandler?.commands)) {
       resolvedSlashCommands = commandHandler.commands;
@@ -221,6 +232,15 @@ export async function createCompanionApp({
         latencyTracker,
         orchestrator,
         client: resolvedClient,
+        voiceChooser:
+          config?.tts?.provider === "elevenlabs" &&
+          typeof commandMod.createVoiceChooser === "function"
+            ? commandMod.createVoiceChooser({
+                adapter: ttsAdapter,
+                apiKey: config?.tts?.elevenlabsApiKey,
+                provider: config.tts.provider,
+              })
+            : null,
       });
       if (!resolvedSlashCommands && Array.isArray(commandMod.SLASH_COMMANDS)) {
         resolvedSlashCommands = commandMod.SLASH_COMMANDS;
@@ -239,7 +259,15 @@ export async function createCompanionApp({
     commandHandler &&
     typeof commandHandler.handleInteraction === "function"
   ) {
-    interactionListener = (interaction) => commandHandler.handleInteraction(interaction);
+    interactionListener = (interaction) => {
+      if (typeof interaction?.isAutocomplete === "function" && interaction.isAutocomplete()) {
+        if (typeof commandHandler.handleAutocomplete === "function") {
+          return commandHandler.handleAutocomplete(interaction);
+        }
+        return undefined;
+      }
+      return commandHandler.handleInteraction(interaction);
+    };
     resolvedClient.on("interactionCreate", interactionListener);
   }
 
