@@ -271,6 +271,7 @@ export function createLlmClient({
   const validatedBaseUrl = validateEndpointUrl(llm.baseUrl, "llm.baseUrl");
   const endpoint = `${validatedBaseUrl}/chat/completions`;
   const expressiveTags = Boolean(config?.tts?.expressiveTags);
+  const personaPrompt = typeof config?.personaPrompt === "string" ? config.personaPrompt.trim() : "";
   const defaultChime = config?.chime ?? {};
   const replyTimeoutMs = llm.replyTimeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS;
 
@@ -313,7 +314,7 @@ export function createLlmClient({
         endpoint,
         buildRequestInit({
           model: llm.replyModel,
-          messages,
+          messages: personaPrompt ? [{ role: "system", content: personaPrompt }, ...messages] : messages,
           stream: true,
           maxTokens: llm.maxTokens ?? 140,
           signal: streamSignal,
