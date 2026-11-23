@@ -3,6 +3,7 @@
 // trace can never reach Discord.
 
 import { CHIME_MODES, FILLER_MODES } from "../types.mjs";
+import { fetchElevenLabsVoices } from "../tts/adapters.mjs";
 
 const MODERATOR_PERMISSIONS = Object.freeze(["ManageGuild", "ModerateMembers"]);
 
@@ -67,7 +68,80 @@ export const SLASH_COMMANDS = Object.freeze([
       },
     ],
   }),
+  freezeCommand({
+    name: "choose-voice",
+    description: "Pick the bot's voice from the voices on this account.",
+    options: [
+      {
+        name: "voice",
+        description: "Voice name, searched live from your ElevenLabs account.",
+        type: "STRING",
+        required: true,
+        autocomplete: true,
+      },
+    ],
+  }),
 ]);
+
+const VOICES_CACHE_TTL_MS = 60_000;
+const VOICES_CACHE_MAX_TTL_MS = 300_000;
+
+// List voices on demand and apply a pick to the live adapter. Picks target the
+// elevenlabs WS adapter, which can reopen its socket on the new voice; the
+// HTTP-stream adapter has no setVoiceId and fails cleanly. The cache keeps
+// autocomplete typing from firing one provider request per keystroke, and a
+// single in-flight promise collapses concurrent refreshes.
+export function createVoiceChooser({
+  adapter,
+  apiKey,
+  provider = "elevenlabs",
+  fetchImpl = fetch,
+  ttlMs = VOICES_CACHE_TTL_MS,
+  now = () => Date.now(),
+} = {}) {
+  const safeTtl =
+    Number.isFinite(ttlMs) && ttlMs > 0
+      ? Math.min(ttlMs, VOICES_CACHE_MAX_TTL_MS)
+      : VOICES_CACHE_TTL_MS;
+  let cache = null;
+  let inFlight = null;
+
+  function refresh() {
+    if (provider !== "elevenlabs") {
+      return Promise.reject(new Error("voice switching requires the ElevenLabs provider"));
+    }
+    if (inFlight) return inFlight;
+    inFlight = (async () => {
+      const voices = await fetchElevenLabsVoices({ apiKey, fetchImpl });
+      cache = { voices, at: now() };
+      return voices;
+    })().finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  }
+
+  return {
+    async list() {
+      if (cache && now() - cache.at < safeTtl) return cache.voices;
+      return await refresh();
+    },
+    select(voiceId) {
+      if (typeof voiceId !== "string" || voiceId.length === 0) {
+        throw new Error("voice is required");
+      }
+      if (!cache) throw new Error("voices have not been listed yet");
+      if (!cache.voices.some((voice) => voice.voiceId === voiceId)) {
+        throw new Error("unknown voice");
+      }
+      if (typeof adapter?.setVoiceId !== "function") {
+        throw new Error("live voice switching is unavailable");
+      }
+      adapter.setVoiceId(voiceId);
+      return true;
+    },
+  };
+}
 
 /** One compact ephemeral status block with no secrets. */
 export function formatStatusReply(status = {}) {
@@ -112,7 +186,7 @@ function optionValue(interaction, name) {
   return options[name];
 }
 
-export function createCommandHandler({ orchestrator } = {}) {
+export function createCommandHandler({ orchestrator, voiceChooser = null } = {}) {
   if (!orchestrator) {
     throw new TypeError("createCommandHandler requires an orchestrator");
   }
@@ -219,6 +293,24 @@ export function createCommandHandler({ orchestrator } = {}) {
           orchestrator.muteUser(userId, muted === undefined ? true : Boolean(muted));
           return await reply(interaction, "Mute state updated.");
         }
+        case "choose-voice": {
+          if (!status?.active || status?.guildId !== guildId) {
+            return await reply(interaction, "No active voice session in this server.");
+          }
+          if (!voiceChooser || typeof voiceChooser.select !== "function") {
+            return await reply(interaction, "Voice switching is not configured.");
+          }
+          const voiceId = optionValue(interaction, "voice");
+          if (typeof voiceId !== "string" || voiceId.length === 0) {
+            return await reply(interaction, "Choose a voice from the list.");
+          }
+          try {
+            await voiceChooser.select(voiceId);
+            return await reply(interaction, "Voice updated.");
+          } catch {
+            return await reply(interaction, "Could not change the voice right now.");
+          }
+        }
         default:
           return await reply(interaction, "Unknown command.");
       }
@@ -227,5 +319,50 @@ export function createCommandHandler({ orchestrator } = {}) {
     }
   }
 
-  return { handleInteraction };
+  async function respondAutocomplete(interaction, results) {
+    if (typeof interaction?.respond === "function") {
+      try {
+        await interaction.respond(results);
+      } catch {
+        // The interaction may already be closed; the returned list still stands.
+      }
+    }
+    return results;
+  }
+
+  async function handleAutocomplete(interaction = {}) {
+    try {
+      if (interaction.commandName !== "choose-voice") {
+        return await respondAutocomplete(interaction, []);
+      }
+      const guildId = interaction?.guildId;
+      const status = orchestrator.getStatus?.();
+      if (
+        typeof guildId !== "string" ||
+        guildId.length === 0 ||
+        !status?.active ||
+        status?.guildId !== guildId
+      ) {
+        return await respondAutocomplete(interaction, []);
+      }
+      if (!voiceChooser || typeof voiceChooser.list !== "function") {
+        return await respondAutocomplete(interaction, []);
+      }
+      const focused = String(interaction.options?.getFocused?.() ?? "").toLowerCase();
+      const voices = await voiceChooser.list();
+      const after = orchestrator.getStatus?.();
+      if (!after?.active || after.guildId !== guildId) {
+        return await respondAutocomplete(interaction, []);
+      }
+      const results = voices
+        .filter((voice) => voice.name.toLowerCase().includes(focused))
+        .slice(0, 25)
+        .map((voice) => ({ name: voice.name.slice(0, 100), value: voice.voiceId }));
+      return await respondAutocomplete(interaction, results);
+    } catch {
+      return await respondAutocomplete(interaction, []);
+    }
+  }
+
+  return { handleInteraction, handleAutocomplete };
 }

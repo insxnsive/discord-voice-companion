@@ -8,6 +8,7 @@ import { createCompanionApp } from "../src/index.mjs";
 import {
   createElevenLabsHttpStreamAdapter,
   createElevenLabsWsAdapter,
+  fetchElevenLabsVoices,
   createOpenAiTtsAdapter,
   createTtsAdapter,
   stripWavHeaderIfPresent,
@@ -2424,4 +2425,399 @@ test("C5 rework 3: a backing store that shrinks after the extent is saved fails 
   );
   assert.equal(pool.size, 0);
   assert.equal(pool.totalBytes, 0);
+});
+
+test("fetchElevenLabsVoices keeps the key in the header and returns account voices", async () => {
+  const calls = [];
+  const voices = await fetchElevenLabsVoices({
+    apiKey: "el_secret_key",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      return new Response(
+        JSON.stringify({
+          voices: [
+            { voice_id: "v1", name: "Rachel" },
+            { voice_id: "", name: "broken" },
+            { voice_id: "v2", name: "Antoni" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  });
+
+  assert.equal(calls[0].url, "https://api.elevenlabs.io/v1/voices");
+  assert.equal(calls[0].url.includes("el_secret_key"), false);
+  assert.equal(calls[0].init.headers["xi-api-key"], "el_secret_key");
+  assert.deepEqual(voices, [
+    { voiceId: "v1", name: "Rachel" },
+    { voiceId: "v2", name: "Antoni" },
+  ]);
+});
+
+test("fetchElevenLabsVoices fails cleanly without leaking the key", async () => {
+  await assert.rejects(
+    () =>
+      fetchElevenLabsVoices({
+        apiKey: "el_secret_key",
+        fetchImpl: async () => new Response("denied", { status: 401 }),
+      }),
+    (error) => {
+      assert.match(error.message, /401/);
+      assert.equal(error.message.includes("el_secret_key"), false);
+      return true;
+    },
+  );
+});
+
+test("fetchElevenLabsVoices turns arbitrary upstream errors into a fixed owned message", async () => {
+  await assert.rejects(
+    () =>
+      fetchElevenLabsVoices({
+        apiKey: "el_key",
+        fetchImpl: async () => {
+          throw new Error("ElevenLabs upstream rejected sk-live-secret at gateway");
+        },
+      }),
+    (error) => {
+      assert.equal(error.message, "ElevenLabs voices request failed");
+      assert.equal(error.message.includes("sk-live-secret"), false);
+      assert.equal(error.message.includes("gateway"), false);
+      return true;
+    },
+  );
+});
+
+test("fetchElevenLabsVoices rejects an over-cap stream without buffering the whole body", async () => {
+  let cancelled = false;
+  let pulls = 0;
+  const chunk = new Uint8Array(8 * 1024);
+  const stream = new ReadableStream({
+    pull(controller) {
+      pulls += 1;
+      if (pulls > 4) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const response = {
+    ok: true,
+    body: stream,
+    arrayBuffer() {
+      throw new Error("arrayBuffer must not be called for a bounded read");
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      fetchElevenLabsVoices({
+        apiKey: "el_key",
+        fetchImpl: async () => response,
+        maxResponseBytes: 16 * 1024,
+      }),
+    /size limit/,
+  );
+  assert.equal(cancelled, true);
+  assert.equal(pulls < 5, true);
+});
+
+test("the ElevenLabs WS adapter switches voice id without a restart", async () => {
+  const instances = [];
+  class TrackingWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.closed = false;
+      this._listeners = new Map();
+      instances.push(this);
+      queueMicrotask(() => {
+        if (this.closed) return;
+        this.readyState = 1;
+        this._emit("open");
+      });
+    }
+    on(event, fn) {
+      if (!this._listeners.has(event)) this._listeners.set(event, []);
+      this._listeners.get(event).push(fn);
+    }
+    removeListener(event, fn) {
+      const list = this._listeners.get(event);
+      const index = list?.indexOf(fn) ?? -1;
+      if (index >= 0) list.splice(index, 1);
+    }
+    _emit(event, ...args) {
+      for (const fn of [...(this._listeners.get(event) ?? [])]) fn(...args);
+    }
+    send() {}
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.readyState = 3;
+      this._emit("close", 1000);
+    }
+  }
+
+  const adapter = createElevenLabsWsAdapter({
+    apiKey: "k",
+    voiceId: "oldvoice",
+    WebSocketImpl: TrackingWebSocket,
+  });
+  await adapter.warmup();
+  assert.equal(instances.length, 1);
+  assert.equal(instances[0].url.includes("oldvoice"), true);
+
+  assert.equal(adapter.getVoiceId(), "oldvoice");
+  assert.equal(adapter.setVoiceId("newvoice"), true);
+  assert.equal(adapter.getVoiceId(), "newvoice");
+  assert.equal(instances[0].closed, true);
+
+  await adapter.warmup();
+  assert.equal(instances.length, 2);
+  assert.equal(instances[1].url.includes("newvoice"), true);
+  assert.equal(instances[1].url.includes("oldvoice"), false);
+
+  assert.equal(adapter.setVoiceId("newvoice"), false);
+  assert.throws(() => adapter.setVoiceId("bad voice id"), /tts.voiceId/);
+  adapter.close();
+});
+
+test("warmup discards a socket opened for the old voice after a switch", async () => {
+  const instances = [];
+  class DelayedWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.closed = false;
+      this._listeners = new Map();
+      instances.push(this);
+      if (instances.length > 1) queueMicrotask(() => this._open());
+    }
+    _open() {
+      if (this.closed) return;
+      this.readyState = 1;
+      this._emit("open");
+    }
+    _emit(event, ...args) {
+      for (const fn of [...(this._listeners.get(event) ?? [])]) fn(...args);
+    }
+    on(event, fn) {
+      if (!this._listeners.has(event)) this._listeners.set(event, []);
+      this._listeners.get(event).push(fn);
+    }
+    removeListener(event, fn) {
+      const list = this._listeners.get(event);
+      const index = list?.indexOf(fn) ?? -1;
+      if (index >= 0) list.splice(index, 1);
+    }
+    send(payload) {
+      const message = JSON.parse(payload);
+      if (message.text !== "") return;
+      queueMicrotask(() => {
+        if (this.closed) return;
+        this._emit("message", JSON.stringify({ audio: Buffer.from([1, 2]).toString("base64") }));
+        this._emit("message", JSON.stringify({ isFinal: true }));
+      });
+    }
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.readyState = 3;
+      this._emit("close", 1000);
+    }
+  }
+
+  const adapter = createElevenLabsWsAdapter({
+    apiKey: "k",
+    voiceId: "oldvoice",
+    WebSocketImpl: DelayedWebSocket,
+    timeoutMs: 1000,
+  });
+  const warmupPromise = adapter.warmup();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(instances.length, 1);
+  assert.equal(instances[0].url.includes("oldvoice"), true);
+
+  adapter.setVoiceId("newvoice");
+  instances[0]._open();
+  await warmupPromise;
+
+  assert.equal(instances.length, 2);
+  assert.equal(instances[0].closed, true);
+  assert.equal(instances[1].url.includes("newvoice"), true);
+
+  await adapter.synthesizeClause({ text: "hello", onPcmChunk() {} });
+  assert.equal(instances.length, 2);
+  adapter.close();
+});
+
+test("a mid-turn switch defers to the next turn and never closes the active socket", async () => {
+  const instances = [];
+  let adapter;
+  class ManualWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.closed = false;
+      this.closedAfterSwitch = null;
+      this._listeners = new Map();
+      instances.push(this);
+      queueMicrotask(() => {
+        if (this.closed) return;
+        this.readyState = 1;
+        this._emit("open");
+      });
+    }
+    _emit(event, ...args) {
+      for (const fn of [...(this._listeners.get(event) ?? [])]) fn(...args);
+    }
+    on(event, fn) {
+      if (!this._listeners.has(event)) this._listeners.set(event, []);
+      this._listeners.get(event).push(fn);
+    }
+    removeListener(event, fn) {
+      const list = this._listeners.get(event);
+      const index = list?.indexOf(fn) ?? -1;
+      if (index >= 0) list.splice(index, 1);
+    }
+    send(payload) {
+      const message = JSON.parse(payload);
+      if (message.text === "") {
+        queueMicrotask(() => {
+          if (this.closed) return;
+          this._emit("message", JSON.stringify({ audio: Buffer.from([1, 2]).toString("base64") }));
+          this._emit("message", JSON.stringify({ isFinal: true }));
+        });
+        return;
+      }
+      if (message.text.trim() === "first") {
+        adapter.setVoiceId("newvoice");
+        this.closedAfterSwitch = this.closed;
+      }
+    }
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.readyState = 3;
+      this._emit("close", 1000);
+    }
+  }
+
+  adapter = createElevenLabsWsAdapter({
+    apiKey: "k",
+    voiceId: "oldvoice",
+    WebSocketImpl: ManualWebSocket,
+    timeoutMs: 500,
+  });
+  const token = adapter.beginTurn();
+  await adapter.synthesizeClause({ text: "first", onPcmChunk() {} });
+
+  assert.equal(instances[0].closedAfterSwitch, false);
+  assert.equal(adapter.getVoiceId(), "oldvoice");
+  assert.equal(instances[0].url.includes("oldvoice"), true);
+
+  await adapter.synthesizeClause({ text: "second", onPcmChunk() {} });
+  assert.equal(instances.length, 2);
+  assert.equal(instances[1].url.includes("oldvoice"), true);
+
+  assert.equal(adapter.endTurn(token), true);
+  assert.equal(adapter.getVoiceId(), "newvoice");
+  adapter.close();
+});
+
+test("a selection queued during a turn applies to the next turn and a stale endTurn cannot affect it", () => {
+  const adapter = createElevenLabsWsAdapter({ apiKey: "k", voiceId: "voice-a" });
+
+  const tokenA = adapter.beginTurn();
+  adapter.setVoiceId("voice-b");
+  assert.equal(adapter.getVoiceId(), "voice-a");
+
+  const tokenB = adapter.beginTurn();
+  assert.equal(adapter.getVoiceId(), "voice-b");
+
+  adapter.setVoiceId("voice-c");
+  assert.equal(adapter.endTurn(tokenA), false);
+  assert.equal(adapter.getVoiceId(), "voice-b");
+
+  assert.equal(adapter.endTurn(tokenB), true);
+  assert.equal(adapter.getVoiceId(), "voice-c");
+  adapter.close();
+});
+
+test("one ElevenLabs credential drives both voice listing and synthesis", async () => {
+  const config = loadConfig({
+    env: {
+      TTS_PROVIDER: "elevenlabs",
+      ELEVENLABS_API_KEY: "key-b",
+      TTS_API_KEY: "key-a",
+      ELEVENLABS_VOICE_ID: "voice-1",
+    },
+    fsImpl: makeMemoryFs(),
+  });
+
+  assert.equal(config.tts.apiKey, "key-b");
+  assert.equal(config.tts.elevenlabsApiKey, "key-b");
+
+  const { FakeWebSocket, urls } = makeFakeWsFactory();
+  const adapter = createTtsAdapter(config, { WebSocketImpl: FakeWebSocket });
+  await adapter.warmup();
+  assert.equal(urls[0].options.headers["xi-api-key"], "key-b");
+
+  let listedHeader = null;
+  await fetchElevenLabsVoices({
+    apiKey: config.tts.elevenlabsApiKey,
+    fetchImpl: async (url, init) => {
+      listedHeader = init.headers["xi-api-key"];
+      return new Response(JSON.stringify({ voices: [] }), { status: 200 });
+    },
+  });
+  assert.equal(listedHeader, "key-b");
+  adapter.close();
+});
+
+test("fetchElevenLabsVoices rejects a bodyless response without allocating it", async () => {
+  let arrayBufferCalls = 0;
+  const response = {
+    ok: true,
+    arrayBuffer() {
+      arrayBufferCalls += 1;
+      return new ArrayBuffer(8);
+    },
+  };
+
+  await assert.rejects(
+    () => fetchElevenLabsVoices({ apiKey: "el_key", fetchImpl: async () => response }),
+    /voices request failed/,
+  );
+  assert.equal(arrayBufferCalls, 0);
+});
+
+test("fetchElevenLabsVoices never trusts a stream chunk's declared byteLength", async () => {
+  class LyingBytes extends Uint8Array {
+    get byteLength() {
+      return 1;
+    }
+  }
+  const record = JSON.stringify({ voices: [{ voice_id: "v1", name: "Rachel" }] });
+  const lying = new LyingBytes(new TextEncoder().encode(record));
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(lying);
+      controller.close();
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      fetchElevenLabsVoices({
+        apiKey: "el_key",
+        fetchImpl: async () => new Response(stream),
+        maxResponseBytes: 1,
+      }),
+    /size limit/,
+  );
 });

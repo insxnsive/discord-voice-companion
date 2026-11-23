@@ -1144,3 +1144,220 @@ test("redactConfig strips credentials, query strings, and fragments from endpoin
   assert.equal(redacted.tts.baseUrl, "https://tts.example.com");
   assert.equal(redacted.extraBroken.baseUrl, "[REDACTED]");
 });
+
+function seedVoiceAppRoot(name, envLines) {
+  const mockFs = createMockSetupFs();
+  const root = path.resolve(REPO_ROOT, name);
+  const cacheDir = path.resolve(root, ".cache", "reactions");
+  mockFs.dirs.add(root);
+  mockFs.dirs.add(path.resolve(root, ".cache"));
+  mockFs.dirs.add(cacheDir);
+  mockFs.files.set(path.join(root, ".env"), envLines.join("\n"));
+  return { mockFs, root };
+}
+
+function makeVoiceAppClient() {
+  const listeners = new Map();
+  return {
+    listeners,
+    client: {
+      on(event, fn) {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event).push(fn);
+      },
+      off() {},
+      application: { commands: { set: async () => {} } },
+    },
+  };
+}
+
+test("createCompanionApp dispatches autocomplete and selection through the real interaction listener", async () => {
+  const { mockFs, root } = seedVoiceAppRoot("app-root-voice", [
+    "DISCORD_BOT_TOKEN=secret-bot-token",
+    "DISCORD_APP_ID=app-1",
+    "LLM_PROVIDER=deepseek",
+    "LLM_API_KEY=secret-llm",
+    "STT_PROVIDER=deepgram",
+    "DEEPGRAM_API_KEY=secret-dg",
+    "TTS_PROVIDER=elevenlabs",
+    "TTS_API_KEY=generic-tts-key",
+    "ELEVENLABS_API_KEY=secret-el",
+    "ELEVENLABS_VOICE_ID=voice-1",
+    "REACTION_CACHE_DIR=.cache/reactions",
+  ]);
+
+  const fetchCalls = [];
+  const applied = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url: String(url), init });
+    return new Response(
+      JSON.stringify({
+        voices: [
+          { voice_id: "v1", name: "Rachel" },
+          { voice_id: "v2", name: "Antoni" },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  try {
+    const { client, listeners } = makeVoiceAppClient();
+    const app = await createCompanionApp({
+      env: {},
+      envPath: path.join(root, ".env"),
+      configPath: path.join(root, "config.json"),
+      soulPath: path.join(root, "SOUL.md"),
+      trustedRootDir: root,
+      fsImpl: mockFs,
+      client,
+      createLlmClientImpl: () => ({
+        streamReply: async () => {},
+        shouldChimeIn: async () => false,
+      }),
+      createTtsAdapterImpl: () => ({
+        name: () => "elevenlabs-ws",
+        async warmup() {},
+        async synthesizeClause() {},
+        close() {},
+        setVoiceId(voiceId) {
+          applied.push(voiceId);
+        },
+      }),
+      createSttAdapterImpl: () => ({
+        name: () => "deepgram",
+        async transcribe() {},
+        close() {},
+      }),
+      createVoiceOrchestratorImpl: () => ({
+        getStatus: () => ({ active: true, guildId: "g1" }),
+        async start() {},
+        close() {},
+      }),
+    });
+
+    const dispatch = listeners.get("interactionCreate")[0];
+    assert.equal(typeof dispatch, "function");
+
+    const autocompleteInteraction = {
+      commandName: "choose-voice",
+      guildId: "g1",
+      isAutocomplete: () => true,
+      options: { getFocused: () => "ant" },
+      responded: null,
+      async respond(results) {
+        this.responded = results;
+      },
+    };
+    await dispatch(autocompleteInteraction);
+    assert.deepEqual(autocompleteInteraction.responded, [{ name: "Antoni", value: "v2" }]);
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(fetchCalls[0].url, "https://api.elevenlabs.io/v1/voices");
+    assert.equal(fetchCalls[0].init.headers["xi-api-key"], "secret-el");
+
+    const replies = [];
+    await dispatch({
+      commandName: "choose-voice",
+      guildId: "g1",
+      isAutocomplete: () => false,
+      options: { get: (name) => ({ value: name === "voice" ? "v2" : undefined }) },
+      async reply(payload) {
+        replies.push(payload);
+        return payload;
+      },
+    });
+    assert.deepEqual(applied, ["v2"]);
+    assert.equal(replies[0].content, "Voice updated.");
+    await app.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a non-Elevenlabs tts provider gets no voices fetch and a fixed refusal", async () => {
+  const { mockFs, root } = seedVoiceAppRoot("app-root-openai-tts", [
+    "DISCORD_BOT_TOKEN=secret-bot-token",
+    "DISCORD_APP_ID=app-1",
+    "LLM_PROVIDER=deepseek",
+    "LLM_API_KEY=secret-llm",
+    "STT_PROVIDER=deepgram",
+    "DEEPGRAM_API_KEY=secret-dg",
+    "TTS_PROVIDER=openai",
+    "OPENAI_API_KEY=sk-openai-secret",
+    "REACTION_CACHE_DIR=.cache/reactions",
+  ]);
+
+  const fetchCalls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url: String(url), init });
+    return new Response(JSON.stringify({ voices: [] }), { status: 200 });
+  };
+
+  try {
+    const { client, listeners } = makeVoiceAppClient();
+    const app = await createCompanionApp({
+      env: {},
+      envPath: path.join(root, ".env"),
+      configPath: path.join(root, "config.json"),
+      soulPath: path.join(root, "SOUL.md"),
+      trustedRootDir: root,
+      fsImpl: mockFs,
+      client,
+      createLlmClientImpl: () => ({
+        streamReply: async () => {},
+        shouldChimeIn: async () => false,
+      }),
+      createTtsAdapterImpl: () => ({
+        name: () => "openai-tts",
+        async warmup() {},
+        async synthesizeClause() {},
+        close() {},
+        setVoiceId() {},
+      }),
+      createSttAdapterImpl: () => ({
+        name: () => "deepgram",
+        async transcribe() {},
+        close() {},
+      }),
+      createVoiceOrchestratorImpl: () => ({
+        getStatus: () => ({ active: true, guildId: "g1" }),
+        async start() {},
+        close() {},
+      }),
+    });
+
+    const dispatch = listeners.get("interactionCreate")[0];
+    const autocompleteInteraction = {
+      commandName: "choose-voice",
+      guildId: "g1",
+      isAutocomplete: () => true,
+      options: { getFocused: () => "" },
+      responded: null,
+      async respond(results) {
+        this.responded = results;
+      },
+    };
+    await dispatch(autocompleteInteraction);
+    assert.deepEqual(autocompleteInteraction.responded, []);
+    assert.equal(fetchCalls.length, 0);
+
+    const replies = [];
+    await dispatch({
+      commandName: "choose-voice",
+      guildId: "g1",
+      isAutocomplete: () => false,
+      options: { get: (name) => ({ value: name === "voice" ? "v1" : undefined }) },
+      async reply(payload) {
+        replies.push(payload);
+        return payload;
+      },
+    });
+    assert.equal(replies[0].content, "Voice switching is not configured.");
+    assert.equal(fetchCalls.length, 0);
+    await app.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

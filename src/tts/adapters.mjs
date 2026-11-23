@@ -283,18 +283,43 @@ export function createElevenLabsWsAdapter({
     MAX_WS_PAYLOAD_BYTES,
     Math.ceil((safeMaxAudioBytes * 4) / 3) + 65536,
   );
-  const safeVoiceId = assertSafeIdentifier(voiceId, "tts.voiceId");
+  let currentVoiceId = assertSafeIdentifier(voiceId, "tts.voiceId");
   const safeModelId = assertSafeIdentifier(modelId, "tts.model");
-  const wsUrl =
-    `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(safeVoiceId)}` +
+  const buildWsUrl = (vid) =>
+    `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(vid)}` +
     `/stream-input?model_id=${encodeURIComponent(safeModelId)}&output_format=pcm_24000`;
 
   let idleSocket = null;
+  let idleVoiceId = null;
   let activeSocket = null;
   let activeAbortController = null;
   let warmupControllers = new Set();
   let warmupPromise = null;
   let closed = false;
+  let turnToken = null;
+  let turnVoiceId = null;
+  let pendingVoiceId = null;
+
+  function effectiveVoiceId() {
+    return turnToken ? turnVoiceId : currentVoiceId;
+  }
+
+  function closeIdleSocket() {
+    if (idleSocket) {
+      try {
+        closeSocket(idleSocket);
+      } catch {
+        // The idle socket is discarded either way.
+      }
+      idleSocket = null;
+    }
+    idleVoiceId = null;
+  }
+
+  function applyVoiceId(nextVoiceId) {
+    currentVoiceId = nextVoiceId;
+    closeIdleSocket();
+  }
 
   function attachErrorTrap(ws) {
     const onErrorTrap = () => {};
@@ -321,12 +346,12 @@ export function createElevenLabsWsAdapter({
     }
   }
 
-  async function openSocket(signal) {
+  async function openSocket(signal, voiceId = effectiveVoiceId()) {
     if (signal?.aborted) throw createAbortError(signal);
     const WsClass = await resolveWebSocketClass(WebSocketImpl);
     if (signal?.aborted) throw createAbortError(signal);
 
-    const ws = new WsClass(wsUrl, {
+    const ws = new WsClass(buildWsUrl(voiceId), {
       headers: { "xi-api-key": apiKey },
       maxPayload,
     });
@@ -370,7 +395,9 @@ export function createElevenLabsWsAdapter({
     if (closed) {
       return Promise.reject(new Error("TTS WebSocket adapter is closed"));
     }
-    if (idleSocket && idleSocket.readyState === 1) return Promise.resolve();
+    if (idleSocket && idleSocket.readyState === 1 && idleVoiceId === currentVoiceId) {
+      return Promise.resolve();
+    }
     if (warmupPromise) return warmupPromise;
     warmupPromise = runWarmup().finally(() => {
       warmupPromise = null;
@@ -384,30 +411,46 @@ export function createElevenLabsWsAdapter({
     warmupControllers.add(warmupCloseController);
     const warmupSignal = combineSignals(deadline.signal, warmupCloseController.signal);
     try {
-      const ws = await openSocket(warmupSignal);
-      if (closed) {
-        closeSocket(ws);
-        throw new Error("TTS WebSocket adapter is closed");
-      }
-      if (idleSocket && idleSocket !== ws) {
-        if (idleSocket.readyState === 1) {
+      for (;;) {
+        const voiceForWarmup = currentVoiceId;
+        const ws = await openSocket(warmupSignal, voiceForWarmup);
+        if (closed) {
           closeSocket(ws);
-          return;
+          throw new Error("TTS WebSocket adapter is closed");
         }
-        closeSocket(idleSocket);
-        idleSocket = null;
+        if (currentVoiceId !== voiceForWarmup) {
+          closeSocket(ws);
+          continue;
+        }
+        if (idleSocket && idleSocket !== ws) {
+          if (idleSocket.readyState === 1) {
+            closeSocket(ws);
+            return;
+          }
+          closeSocket(idleSocket);
+          idleSocket = null;
+          idleVoiceId = null;
+        }
+        idleSocket = ws;
+        idleVoiceId = voiceForWarmup;
+        const clearIdle = attachSocketListeners(ws, {
+          close() {
+            if (idleSocket === ws) {
+              idleSocket = null;
+              idleVoiceId = null;
+            }
+            clearIdle();
+          },
+          error() {
+            if (idleSocket === ws) {
+              idleSocket = null;
+              idleVoiceId = null;
+            }
+            clearIdle();
+          },
+        });
+        return;
       }
-      idleSocket = ws;
-      const clearIdle = attachSocketListeners(ws, {
-        close() {
-          if (idleSocket === ws) idleSocket = null;
-          clearIdle();
-        },
-        error() {
-          if (idleSocket === ws) idleSocket = null;
-          clearIdle();
-        },
-      });
     } finally {
       warmupControllers.delete(warmupCloseController);
       deadline.clear();
@@ -426,16 +469,19 @@ export function createElevenLabsWsAdapter({
     const combinedSignal = combineSignals(combineSignals(signal, deadline.signal), closeController.signal);
     let ws = null;
 
+    const voiceForClause = effectiveVoiceId();
     try {
-      if (idleSocket && idleSocket.readyState === 1) {
+      if (idleSocket && idleSocket.readyState === 1 && idleVoiceId === voiceForClause) {
         ws = idleSocket;
         idleSocket = null;
+        idleVoiceId = null;
       } else {
         if (idleSocket) {
           closeSocket(idleSocket);
           idleSocket = null;
+          idleVoiceId = null;
         }
-        ws = await openSocket(combinedSignal);
+        ws = await openSocket(combinedSignal, voiceForClause);
         if (closed) {
           closeSocket(ws);
           throw new Error("TTS WebSocket adapter is closed");
@@ -581,8 +627,12 @@ export function createElevenLabsWsAdapter({
     }
     closeSocket(idleSocket);
     idleSocket = null;
+    idleVoiceId = null;
     closeSocket(activeSocket);
     activeSocket = null;
+    turnToken = null;
+    turnVoiceId = null;
+    pendingVoiceId = null;
   }
 
   const adapter = {
@@ -590,6 +640,48 @@ export function createElevenLabsWsAdapter({
     synthesizeClause,
     warmup,
     close,
+    beginTurn() {
+      // A selection made during a turn is queued, not applied. The next
+      // beginTurn adopts it as that turn's pin, and a stale endTurn token can
+      // neither clear the current turn nor consume its queued selection.
+      const token = {};
+      if (turnToken && pendingVoiceId && pendingVoiceId !== currentVoiceId) {
+        applyVoiceId(pendingVoiceId);
+      }
+      pendingVoiceId = null;
+      turnToken = token;
+      turnVoiceId = currentVoiceId;
+      return token;
+    },
+    endTurn(token) {
+      if (!token || token !== turnToken) return false;
+      turnToken = null;
+      turnVoiceId = null;
+      const pending = pendingVoiceId;
+      pendingVoiceId = null;
+      if (pending && pending !== currentVoiceId) {
+        applyVoiceId(pending);
+        return true;
+      }
+      return false;
+    },
+    setVoiceId(nextVoiceId) {
+      const safe = assertSafeIdentifier(nextVoiceId, "tts.voiceId");
+      if (!turnToken) {
+        if (safe === currentVoiceId) return false;
+        applyVoiceId(safe);
+        return true;
+      }
+      if (safe === turnVoiceId) {
+        pendingVoiceId = null;
+        return false;
+      }
+      pendingVoiceId = safe;
+      return true;
+    },
+    getVoiceId() {
+      return turnToken ? turnVoiceId : currentVoiceId;
+    },
   };
   assertAdapterContract(adapter, ["name", "synthesizeClause", "warmup", "close"], "tts adapter");
   return adapter;
@@ -946,4 +1038,134 @@ export function createTtsAdapter(config, deps = {}) {
 
   assertAdapterContract(adapter, ["name", "synthesizeClause", "warmup", "close"], "tts adapter");
   return adapter;
+}
+
+class VoicesRequestError extends Error {}
+
+// Intrinsic typed-array accessors. A chunk can shadow byteLength, length,
+// buffer and byteOffset, so the real extent is read from %TypedArray%.prototype.
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const INTRINSIC_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteLength",
+).get;
+const INTRINSIC_BYTE_OFFSET = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+).get;
+const INTRINSIC_BUFFER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "buffer").get;
+
+function measureStreamChunk(value) {
+  if (!ArrayBuffer.isView(value)) return null;
+  try {
+    return {
+      buffer: Reflect.apply(INTRINSIC_BUFFER, value, []),
+      offset: Reflect.apply(INTRINSIC_BYTE_OFFSET, value, []),
+      extent: Reflect.apply(INTRINSIC_BYTE_LENGTH, value, []),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readBoundedText(res, maxBytes) {
+  const body = res?.body;
+  if (!body || typeof body.getReader !== "function") {
+    throw new VoicesRequestError("ElevenLabs voices request failed");
+  }
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const measured = measureStreamChunk(value);
+      if (!measured || !Number.isInteger(measured.extent) || measured.extent < 0) {
+        throw new VoicesRequestError("ElevenLabs voices request failed");
+      }
+      if (total + measured.extent > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Cancellation is best effort; the owned limit error still stands.
+        }
+        throw new VoicesRequestError("ElevenLabs voices response exceeded the size limit");
+      }
+      if (measured.extent === 0) continue;
+
+      // Copy exactly the intrinsic extent, never the caller-visible metadata.
+      const source = Buffer.from(measured.buffer, measured.offset, measured.extent);
+      const chunk = Buffer.allocUnsafe(measured.extent);
+      const copied = source.copy(chunk, 0, 0, measured.extent);
+      if (copied !== measured.extent) {
+        throw new VoicesRequestError("ElevenLabs voices request failed");
+      }
+      total += copied;
+      if (total > maxBytes) {
+        throw new VoicesRequestError("ElevenLabs voices response exceeded the size limit");
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    try {
+      reader.releaseLock?.();
+    } catch {
+      // Releasing a cancelled reader is best effort.
+    }
+  }
+  return Buffer.concat(chunks, total).toString("utf8");
+}
+
+/** List the account's ElevenLabs voices. The key stays in the header only. */
+export async function fetchElevenLabsVoices({
+  apiKey = "",
+  fetchImpl = fetch,
+  timeoutMs = 8000,
+  maxResponseBytes = 256 * 1024,
+} = {}) {
+  if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
+    throw new VoicesRequestError("ElevenLabs API key is required to list voices");
+  }
+  if (/[\r\n\0]/.test(apiKey)) {
+    throw new VoicesRequestError("ElevenLabs API key contains invalid characters");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl("https://api.elevenlabs.io/v1/voices", {
+      method: "GET",
+      headers: { "xi-api-key": apiKey, accept: "application/json" },
+      signal: controller.signal,
+      redirect: "error",
+    });
+    if (!res.ok) {
+      try {
+        await res.body?.cancel?.();
+      } catch {
+        // Best effort.
+      }
+      throw new VoicesRequestError(`ElevenLabs voices request failed with status ${res.status}`);
+    }
+    const payload = JSON.parse(await readBoundedText(res, maxResponseBytes));
+    const voices = Array.isArray(payload?.voices) ? payload.voices : [];
+    return voices
+      .filter((voice) => voice && typeof voice.voice_id === "string" && voice.voice_id.length > 0)
+      .map((voice) => ({
+        voiceId: voice.voice_id,
+        name:
+          typeof voice.name === "string" && voice.name.trim().length > 0
+            ? voice.name.trim()
+            : voice.voice_id,
+      }));
+  } catch (error) {
+    if (error instanceof VoicesRequestError) throw error;
+    if (error?.name === "AbortError") {
+      throw new VoicesRequestError("ElevenLabs voices request timed out");
+    }
+    throw new VoicesRequestError("ElevenLabs voices request failed");
+  } finally {
+    clearTimeout(timer);
+  }
 }

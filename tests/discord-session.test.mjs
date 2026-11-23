@@ -13,11 +13,13 @@ import {
 import {
   SLASH_COMMANDS,
   createCommandHandler,
+  createVoiceChooser,
   formatStatusReply,
 } from "../src/discord/commands.mjs";
 
 import { LatencyTracker } from "../src/types.mjs";
 import { createClauseSplitter } from "../src/llm/client.mjs";
+import { createElevenLabsWsAdapter } from "../src/tts/adapters.mjs";
 
 const PCM16K = Buffer.alloc(640, 4);
 const PCM24K = Buffer.alloc(960, 6);
@@ -511,7 +513,7 @@ test("close is idempotent and stops further work", async () => {
 
 test("slash commands expose the expected shape", () => {
   const names = SLASH_COMMANDS.map((command) => command.name);
-  assert.deepEqual(names, ["join", "leave", "mode", "status", "mute-user"]);
+  assert.deepEqual(names, ["join", "leave", "mode", "status", "mute-user", "choose-voice"]);
 
   const mode = SLASH_COMMANDS.find((command) => command.name === "mode");
   const chime = mode.options.find((option) => option.name === "chime");
@@ -2776,4 +2778,426 @@ test("a superseded turn's deadline handle is canceled before its STT finishes", 
     globalThis.setTimeout = realSetTimeout;
     globalThis.clearTimeout = realClearTimeout;
   }
+});
+
+test("choose-voice autocomplete lists and filters the account voices", async () => {
+  const listCalls = [];
+  const handler = createCommandHandler({
+    orchestrator: { getStatus: () => ({ guildId: "g1", active: true }) },
+    voiceChooser: {
+      async list() {
+        listCalls.push(true);
+        return [
+          { voiceId: "v1", name: "Rachel" },
+          { voiceId: "v2", name: "Antoni" },
+          { voiceId: "v3", name: "Rachel Warm" },
+        ];
+      },
+      select() {},
+    },
+  });
+
+  const all = await handler.handleAutocomplete({
+    commandName: "choose-voice",
+    guildId: "g1",
+    options: { getFocused: () => "" },
+  });
+  assert.equal(listCalls.length, 1);
+  assert.deepEqual(all.map((entry) => entry.value), ["v1", "v2", "v3"]);
+
+  const filtered = await handler.handleAutocomplete({
+    commandName: "choose-voice",
+    guildId: "g1",
+    options: { getFocused: () => "rac" },
+  });
+  assert.deepEqual(filtered, [
+    { name: "Rachel", value: "v1" },
+    { name: "Rachel Warm", value: "v3" },
+  ]);
+});
+
+test("choose-voice applies a selection and reports failures safely", async () => {
+  const selected = [];
+  let failNext = false;
+  const replies = [];
+  const handler = createCommandHandler({
+    orchestrator: { getStatus: () => ({ guildId: "g1", active: true }) },
+    voiceChooser: {
+      async list() {
+        return [{ voiceId: "v1", name: "Rachel" }];
+      },
+      select(voiceId) {
+        if (failNext) throw new Error("voices down");
+        selected.push(voiceId);
+      },
+    },
+  });
+
+  const interaction = (voiceId) => ({
+    commandName: "choose-voice",
+    guildId: "g1",
+    memberPermissions: { has: () => true },
+    options: { get: (name) => ({ value: name === "voice" ? voiceId : undefined }) },
+    async reply(payload) {
+      replies.push(payload);
+      return payload;
+    },
+  });
+
+  await handler.handleInteraction(interaction("v1"));
+  assert.deepEqual(selected, ["v1"]);
+  assert.match(replies.at(-1).content, /voice updated/i);
+
+  failNext = true;
+  await handler.handleInteraction(interaction("v1"));
+  assert.match(replies.at(-1).content, /could not change the voice/i);
+  assert.deepEqual(selected, ["v1"]);
+});
+
+test("createVoiceChooser rejects a pick outside the listed account voices", async () => {
+  const applied = [];
+  const chooser = createVoiceChooser({
+    adapter: {
+      setVoiceId(voiceId) {
+        applied.push(voiceId);
+      },
+    },
+    apiKey: "el_key",
+    fetchImpl: async () =>
+      new Response(JSON.stringify({ voices: [{ voice_id: "v1", name: "Rachel" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  });
+
+  assert.throws(() => chooser.select("v1"), /have not been listed/);
+  assert.deepEqual(await chooser.list(), [{ voiceId: "v1", name: "Rachel" }]);
+
+  assert.throws(() => chooser.select("ghost"), /unknown voice/);
+  assert.deepEqual(applied, []);
+
+  assert.equal(chooser.select("v1"), true);
+  assert.deepEqual(applied, ["v1"]);
+});
+
+test("choose-voice autocomplete enforces the active same-guild session", async () => {
+  let lists = 0;
+  let responded = null;
+  const handler = createCommandHandler({
+    orchestrator: { getStatus: () => ({ guildId: "g1", active: true }) },
+    voiceChooser: {
+      async list() {
+        lists += 1;
+        return [{ voiceId: "v1", name: "Rachel" }];
+      },
+      select() {},
+    },
+  });
+
+  const noGuild = await handler.handleAutocomplete({
+    commandName: "choose-voice",
+    options: { getFocused: () => "" },
+    async respond(results) {
+      responded = results;
+    },
+  });
+  assert.deepEqual(noGuild, []);
+  assert.deepEqual(responded, []);
+
+  const otherGuild = await handler.handleAutocomplete({
+    commandName: "choose-voice",
+    guildId: "g2",
+    options: { getFocused: () => "" },
+    async respond(results) {
+      responded = results;
+    },
+  });
+  assert.deepEqual(otherGuild, []);
+  assert.deepEqual(responded, []);
+  assert.equal(lists, 0);
+
+  const active = await handler.handleAutocomplete({
+    commandName: "choose-voice",
+    guildId: "g1",
+    options: { getFocused: () => "" },
+    async respond(results) {
+      responded = results;
+    },
+  });
+  assert.deepEqual(active, [{ name: "Rachel", value: "v1" }]);
+  assert.deepEqual(responded, active);
+  assert.equal(lists, 1);
+});
+
+test("createVoiceChooser refuses a non-Elevenlabs provider without fetching", async () => {
+  let fetched = 0;
+  const chooser = createVoiceChooser({
+    provider: "openai",
+    apiKey: "sk-openai",
+    adapter: { setVoiceId() {} },
+    fetchImpl: async () => {
+      fetched += 1;
+      return new Response(JSON.stringify({ voices: [] }), { status: 200 });
+    },
+  });
+
+  await assert.rejects(() => chooser.list(), /ElevenLabs provider/);
+  assert.equal(fetched, 0);
+});
+
+test("createVoiceChooser caches voices and collapses concurrent refreshes", async () => {
+  let clock = 1_000;
+  let calls = 0;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const chooser = createVoiceChooser({
+    apiKey: "el_key",
+    ttlMs: 60_000,
+    now: () => clock,
+    adapter: { setVoiceId() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      await gate;
+      return new Response(JSON.stringify({ voices: [{ voice_id: "v1", name: "Rachel" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const first = chooser.list();
+  const second = chooser.list();
+  assert.equal(calls, 1);
+  release();
+  assert.deepEqual(await first, [{ voiceId: "v1", name: "Rachel" }]);
+  assert.deepEqual(await second, [{ voiceId: "v1", name: "Rachel" }]);
+
+  clock += 59_999;
+  await chooser.list();
+  assert.equal(calls, 1);
+
+  clock += 1;
+  await chooser.list();
+  assert.equal(calls, 2);
+});
+
+test("a throwing endTurn hook cannot skip deadline clearing or latency finalization", async () => {
+  const tts = makeTts();
+  tts.beginTurn = () => ({});
+  tts.endTurn = () => {
+    throw new Error("hook boom");
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    ttsAdapter: tts,
+    config: {
+      reactions: { mode: "adaptive", fillerDelayMs: 165 },
+      chime: { mode: "smart" },
+      turnDeadlineMs: 5000,
+    },
+  });
+  await orchestrator.start();
+
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const scheduled = new Map();
+  let nextTimerId = 1;
+  globalThis.setTimeout = (fn) => {
+    const id = nextTimerId;
+    nextTimerId += 1;
+    scheduled.set(id, fn);
+    return id;
+  };
+  globalThis.clearTimeout = (id) => {
+    scheduled.delete(id);
+  };
+
+  try {
+    await vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "Ana",
+      pcm16kMono: PCM16K,
+      durationMs: 300,
+      endedAt: 0,
+    });
+    assert.equal(scheduled.size, 0);
+    assert.ok(orchestrator.getStatus().latencyLast);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    await orchestrator.close();
+  }
+});
+
+test("a throwing beginTurn hook cannot skip the turn or its cleanup", async () => {
+  const tts = makeTts();
+  tts.beginTurn = () => {
+    throw new Error("hook boom");
+  };
+  tts.endTurn = () => {};
+  const { orchestrator, vad } = buildOrchestrator({
+    ttsAdapter: tts,
+    config: {
+      reactions: { mode: "adaptive", fillerDelayMs: 165 },
+      chime: { mode: "smart" },
+      turnDeadlineMs: 5000,
+    },
+  });
+  await orchestrator.start();
+
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const scheduled = new Map();
+  let nextTimerId = 1;
+  globalThis.setTimeout = (fn) => {
+    const id = nextTimerId;
+    nextTimerId += 1;
+    scheduled.set(id, fn);
+    return id;
+  };
+  globalThis.clearTimeout = (id) => {
+    scheduled.delete(id);
+  };
+
+  try {
+    await vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "Ana",
+      pcm16kMono: PCM16K,
+      durationMs: 300,
+      endedAt: 0,
+    });
+    assert.equal(tts.state.calls.length >= 1, true);
+    assert.equal(scheduled.size, 0);
+    assert.ok(orchestrator.getStatus().latencyLast);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    await orchestrator.close();
+  }
+});
+
+test("choose-voice autocomplete drops results when the session ends during the fetch", async () => {
+  let status = { guildId: "g1", active: true };
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let responded = "unset";
+  const handler = createCommandHandler({
+    orchestrator: { getStatus: () => status },
+    voiceChooser: {
+      async list() {
+        await gate;
+        return [{ voiceId: "v1", name: "Rachel" }];
+      },
+      select() {},
+    },
+  });
+
+  const pending = handler.handleAutocomplete({
+    commandName: "choose-voice",
+    guildId: "g1",
+    options: { getFocused: () => "" },
+    async respond(results) {
+      responded = results;
+    },
+  });
+
+  status = { guildId: "g1", active: false };
+  release();
+  const result = await pending;
+
+  assert.deepEqual(result, []);
+  assert.deepEqual(responded, []);
+});
+
+test("a turn pins one voice even when the chooser switches mid-reply", async () => {
+  const urls = [];
+  let adapter;
+  let switched = false;
+  class VoiceWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.closed = false;
+      this._listeners = new Map();
+      urls.push(url);
+      queueMicrotask(() => {
+        if (this.closed) return;
+        this.readyState = 1;
+        this._emit("open");
+      });
+    }
+    _emit(event, ...args) {
+      for (const fn of [...(this._listeners.get(event) ?? [])]) fn(...args);
+    }
+    on(event, fn) {
+      if (!this._listeners.has(event)) this._listeners.set(event, []);
+      this._listeners.get(event).push(fn);
+    }
+    removeListener(event, fn) {
+      const list = this._listeners.get(event);
+      const index = list?.indexOf(fn) ?? -1;
+      if (index >= 0) list.splice(index, 1);
+    }
+    send(payload) {
+      const message = JSON.parse(payload);
+      if (message.text === "") {
+        queueMicrotask(() => {
+          if (this.closed) return;
+          this._emit("message", JSON.stringify({ audio: Buffer.from([1, 2]).toString("base64") }));
+          this._emit("message", JSON.stringify({ isFinal: true }));
+        });
+        return;
+      }
+      if (message.text.trim().length > 0 && !switched) {
+        switched = true;
+        adapter.setVoiceId("newvoice");
+      }
+    }
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.readyState = 3;
+      this._emit("close", 1000);
+    }
+  }
+
+  adapter = createElevenLabsWsAdapter({
+    apiKey: "k",
+    voiceId: "oldvoice",
+    WebSocketImpl: VoiceWebSocket,
+    timeoutMs: 1000,
+  });
+  const { orchestrator, vad } = buildOrchestrator({
+    ttsAdapter: adapter,
+    llmClient: {
+      async shouldChimeIn() {
+        return { shouldReply: true };
+      },
+      async streamReply({ onClause }) {
+        onClause("Hi. ");
+        onClause("There.");
+        return { fullText: "Hi. There." };
+      },
+    },
+  });
+  await orchestrator.start();
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  assert.equal(urls.length >= 2, true);
+  assert.equal(urls.every((url) => url.includes("oldvoice")), true);
+  assert.equal(adapter.getVoiceId(), "newvoice");
+
+  adapter.close();
+  await orchestrator.close();
 });

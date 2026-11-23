@@ -803,6 +803,12 @@ export function createVoiceOrchestrator({
       channelId: state.channelId,
     };
     currentTurn = turn;
+    try {
+      turn.voiceToken = ttsAdapter.beginTurn?.();
+    } catch {
+      // A voice hook must never block the turn or its cleanup.
+      turn.voiceToken = undefined;
+    }
     latencyTracker.startTurn(turnId, startedAt);
 
     const turnDeadlineMs = Number.isFinite(config?.turnDeadlineMs)
@@ -932,6 +938,11 @@ export function createVoiceOrchestrator({
         state.lastError = "voice turn failed";
       }
     } finally {
+      try {
+        ttsAdapter.endTurn?.(turn.voiceToken);
+      } catch {
+        // A voice hook must never skip deadline clearing or latency finalization.
+      }
       if (currentTurn === turn) {
         currentTurn = null;
         state.isBotSpeaking = false;
