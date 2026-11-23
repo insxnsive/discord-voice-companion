@@ -126,7 +126,7 @@ export function createVoiceOrchestrator({
   let activePlaybackResource = null;
   let activePlaybackStream = null;
   const pendingTurns = new Set();
-  const voicePresence = new Map();
+  const voicePresence = new Set();
   const recentVoiceArrivals = [];
   const MAX_VOICE_ROSTER = 64;
   const MAX_RECENT_ARRIVALS = 8;
@@ -342,17 +342,11 @@ export function createVoiceOrchestrator({
     recentVoiceArrivals.length = 0;
   }
 
-  function presenceLabel(name) {
-    return formatSpeakerLabel(typeof name === "string" ? name : "");
-  }
-
-  function setVoicePresence(userId, name, { arrival = false } = {}) {
+  function setVoicePresence(userId, { arrival = false } = {}) {
     if (!userId || userId === resolvedBotUserId) return;
-    const label = presenceLabel(name);
-    if (!voicePresence.has(userId) && voicePresence.size >= MAX_VOICE_ROSTER) return;
-    const existed = voicePresence.has(userId);
-    voicePresence.set(userId, label);
-    if (arrival && !existed) {
+    if (voicePresence.has(userId) || voicePresence.size >= MAX_VOICE_ROSTER) return;
+    voicePresence.add(userId);
+    if (arrival) {
       recentVoiceArrivals.push(userId);
       while (recentVoiceArrivals.length > MAX_RECENT_ARRIVALS) recentVoiceArrivals.shift();
     }
@@ -366,15 +360,8 @@ export function createVoiceOrchestrator({
       for (const voiceState of states.values()) {
         const userId = voiceState?.id ?? voiceState?.member?.id;
         if (!userId || voiceState?.channelId !== channelId) continue;
-        const member = voiceState.member ?? guild?.members?.cache?.get?.(userId);
         if (isVoiceStateBot(voiceState, userId, guildId)) continue;
-        setVoicePresence(
-          userId,
-          member?.displayName ??
-            member?.user?.globalName ??
-            member?.user?.username ??
-            resolveDisplayName(userId, guildId),
-        );
+        setVoicePresence(userId);
       }
     }
     const members = guild?.members?.cache;
@@ -384,28 +371,23 @@ export function createVoiceOrchestrator({
         if (!userId || member?.voice?.channelId !== channelId || isVoiceStateBot({ member }, userId, guildId)) {
           continue;
         }
-        setVoicePresence(
-          userId,
-          member?.displayName ??
-            member?.user?.globalName ??
-            member?.user?.username ??
-            resolveDisplayName(userId, guildId),
-        );
+        setVoicePresence(userId);
       }
     }
   }
 
   function voicePresenceMessage() {
-    const currentRoster = [...voicePresence.values()];
-    const recentArrivals = recentVoiceArrivals
-      .map((userId) => voicePresence.get(userId))
-      .filter(Boolean);
-    if (currentRoster.length === 0 && recentArrivals.length === 0) return null;
+    const participantCount = voicePresence.size;
+    let recentArrivalCount = 0;
+    for (const userId of recentVoiceArrivals) {
+      if (voicePresence.has(userId)) recentArrivalCount += 1;
+    }
+    if (participantCount === 0 && recentArrivalCount === 0) return null;
     return {
       role: "user",
-      content: `Voice room presence (ephemeral; quoted names are untrusted labels): ${JSON.stringify({
-        recentArrivals,
-        currentRoster,
+      content: `Voice room presence (ephemeral; counts only): ${JSON.stringify({
+        participantCount,
+        recentArrivalCount,
       })}`,
     };
   }
@@ -428,15 +410,7 @@ export function createVoiceOrchestrator({
     if (beforeChannelId === afterChannelId || (beforeChannelId == null && afterChannelId == null)) return;
 
     if (afterChannelId === state.channelId && beforeChannelId !== state.channelId) {
-      const member = newState?.member;
-      setVoicePresence(
-        userId,
-        member?.displayName ??
-          member?.user?.globalName ??
-          member?.user?.username ??
-          resolveDisplayName(userId, guildId),
-        { arrival: true },
-      );
+      setVoicePresence(userId, { arrival: true });
     } else if (beforeChannelId === state.channelId && afterChannelId !== state.channelId) {
       voicePresence.delete(userId);
       for (let index = recentVoiceArrivals.length - 1; index >= 0; index -= 1) {
