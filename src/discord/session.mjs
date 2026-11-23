@@ -13,7 +13,7 @@ import {
 } from "../audio/pcm.mjs";
 import { PerSpeakerVad, createRmsSpeechDetector } from "../audio/vad.mjs";
 import { isWhisperHallucination } from "../stt/adapters.mjs";
-import { createClauseSplitter } from "../llm/client.mjs";
+import { createClauseSplitter, formatSpeakerLabel } from "../llm/client.mjs";
 import { scheduleReactionFiller } from "../tts/reactions.mjs";
 import { redactConfig } from "../config/config.mjs";
 
@@ -30,6 +30,7 @@ const MAX_PCM_CHUNK_BYTES = 245760;
 const MAX_CLAUSES_PER_TURN = 24;
 const MAX_TURN_AUDIO_BYTES = 16 * 1024 * 1024;
 const MAX_QUEUED_OPUS_FRAMES = 1500;
+const MAX_PENDING_TURNS = 8;
 
 function parseNodeVersion(version) {
   const [major = 0, minor = 0] = String(version)
@@ -121,6 +122,7 @@ export function createVoiceOrchestrator({
   let joinNonce = 0;
   let pendingGuildId = null;
   let activePlaybackUserId = null;
+  const pendingTurns = new Set();
 
   const speakerBotCache = new Map();
   const speakerFetchInFlight = new Map();
@@ -138,6 +140,7 @@ export function createVoiceOrchestrator({
     mutedUsers: new Set(),
     isBotSpeaking: false,
     lastBotReplyAt: null,
+    lastBotReplyUserId: null,
     lastError: null,
     sessionEpoch: 0,
     sessionToken: null,
@@ -220,7 +223,7 @@ export function createVoiceOrchestrator({
         state.sessionEpoch === turn.sessionEpoch &&
         state.guildId === turn.guildId &&
         state.channelId === turn.channelId &&
-        currentTurn === turn &&
+        (turn.committed === false || currentTurn === turn) &&
         !turn.controller.signal.aborted &&
         !state.mutedUsers.has(turn.userId),
     );
@@ -500,6 +503,17 @@ export function createVoiceOrchestrator({
   }
 
   function resetTurnAndSession() {
+    for (const pending of pendingTurns) {
+      pending.controller.abort();
+      pending.filler?.cancel();
+      clearTimeout(pending.deadline);
+      finishOutput(pending);
+      if (!pending.committed && pending.fillerEmitted && currentTurn === null && activePlaybackUserId === pending.userId) {
+        state.isBotSpeaking = false;
+        stopPlayback();
+      }
+    }
+    pendingTurns.clear();
     clearTimeout(currentTurn?.deadline);
     currentTurn?.controller.abort();
     currentTurn?.filler?.cancel();
@@ -510,6 +524,7 @@ export function createVoiceOrchestrator({
     vad.clear?.();
     history = [];
     state.lastBotReplyAt = null;
+    state.lastBotReplyUserId = null;
     for (const decoder of speakerDecoders.values()) {
       try {
         decoder?.close?.();
@@ -731,7 +746,9 @@ export function createVoiceOrchestrator({
     stopPlayback();
   }
 
-  function handleBargeIn() {
+  function handleBargeIn(event) {
+    const ownerUserId = currentTurn?.userId ?? activePlaybackUserId;
+    if (ownerUserId && (!event?.userId || event.userId !== ownerUserId)) return;
     abortTurn();
   }
 
@@ -772,16 +789,19 @@ export function createVoiceOrchestrator({
 
   async function handleSpeechEnd({ userId, displayName, pcm16kMono, endedAt } = {}) {
     if (state.closed) return;
+    for (const pending of pendingTurns) {
+      if (pending.committed === false && pending.userId === userId) {
+        pending.controller.abort();
+        pending.filler?.cancel();
+        clearTimeout(pending.deadline);
+        finishOutput(pending);
+        pendingTurns.delete(pending);
+      }
+    }
+    if (pendingTurns.size >= MAX_PENDING_TURNS) return;
 
     const turnId = `turn-${(turnCounter += 1)}`;
     const controller = new AbortController();
-    if (currentTurn) {
-      currentTurn.controller.abort();
-      currentTurn.filler?.cancel();
-      clearTimeout(currentTurn.deadline);
-      finishOutput(currentTurn);
-      stopPlayback();
-    }
 
     const startedAt = endedAt === undefined ? now() : endedAt;
     const turn = {
@@ -801,25 +821,35 @@ export function createVoiceOrchestrator({
       sessionEpoch: state.sessionEpoch,
       guildId: state.guildId,
       channelId: state.channelId,
+      fillerEmitted: false,
     };
-    currentTurn = turn;
-    try {
-      turn.voiceToken = ttsAdapter.beginTurn?.();
-    } catch {
-      // A voice hook must never block the turn or its cleanup.
-      turn.voiceToken = undefined;
-    }
+    pendingTurns.add(turn);
+    turn.committed = false;
+    turn.voiceToken = undefined;
     latencyTracker.startTurn(turnId, startedAt);
 
     const turnDeadlineMs = Number.isFinite(config?.turnDeadlineMs)
       ? config.turnDeadlineMs
       : 10000;
     turn.deadline = setTimeout(() => {
-      if (!turn.controller.signal.aborted) {
+      if (turn.controller.signal.aborted) return;
+      turn.controller.abort();
+      turn.filler?.cancel();
+      finishOutput(turn);
+      if (
+        state.closed || !state.active || state.sessionEpoch !== turn.sessionEpoch ||
+        state.guildId !== turn.guildId || state.channelId !== turn.channelId
+      ) return;
+      if (currentTurn === turn) {
         state.lastError = "turn deadline exceeded";
-        turn.controller.abort();
-        turn.filler?.cancel();
+        state.isBotSpeaking = false;
         stopPlayback();
+      } else if (currentTurn === null) {
+        state.lastError = "turn deadline exceeded";
+        if (turn.fillerEmitted && (activePlaybackUserId === null || activePlaybackUserId === turn.userId)) {
+          state.isBotSpeaking = false;
+          stopPlayback();
+        }
       }
     }, turnDeadlineMs);
 
@@ -846,9 +876,10 @@ export function createVoiceOrchestrator({
         delayMs: fillerDelay,
         onFire: () => {
           try {
-            if (!isTurnLive(turn) || turn.gateDenied || turn.ttsMarked) return;
+            if (!isTurnLive(turn) || (currentTurn && currentTurn !== turn) || turn.gateDenied || turn.ttsMarked) return;
             const clip = reactionPool?.pick(transcript, { mode: state.fillerMode });
             if (!clip) return;
+            turn.fillerEmitted = true;
             latencyTracker.mark(turnId, "fillerFiredAt", now());
             state.isBotSpeaking = true;
             emitClip(clip, turn);
@@ -862,8 +893,10 @@ export function createVoiceOrchestrator({
         transcript,
         chimeMode: state.chimeMode,
         speakerName: displayName,
+        userId,
         botAliases: config?.chime?.botAliases,
         lastBotReplyAt: state.lastBotReplyAt,
+        lastBotReplyUserId: state.lastBotReplyUserId,
         followUpWindowMs: config?.chime?.followUpWindowMs,
         gateTimeoutMs: config?.chime?.gateTimeoutMs,
         signal: controller.signal,
@@ -875,10 +908,32 @@ export function createVoiceOrchestrator({
       if (chimeIn !== true) {
         turn.gateDenied = true;
         turn.filler?.cancel();
+        if (!turn.committed && turn.fillerEmitted && currentTurn === null) {
+          state.isBotSpeaking = false;
+          if (activePlaybackUserId === turn.userId) stopPlayback();
+        }
         return;
       }
 
-      history.push({ role: "user", content: transcript });
+      if (currentTurn && currentTurn !== turn) {
+        currentTurn.controller.abort();
+        currentTurn.filler?.cancel();
+        clearTimeout(currentTurn.deadline);
+        finishOutput(currentTurn);
+        stopPlayback();
+      }
+      currentTurn = turn;
+      turn.committed = true;
+      pendingTurns.delete(turn);
+      try {
+        turn.voiceToken = ttsAdapter.beginTurn?.();
+      } catch {
+        // A voice hook must never block the turn or its cleanup.
+        turn.voiceToken = undefined;
+      }
+
+      const speakerLabel = formatSpeakerLabel(displayName);
+      history.push({ role: "user", content: `[${speakerLabel}]: ${transcript}` });
       boundedHistory(history, maxHistoryTurns);
 
       let receivedOnClause = false;
@@ -932,12 +987,20 @@ export function createVoiceOrchestrator({
         history.push({ role: "assistant", content: reply.fullText });
         boundedHistory(history, maxHistoryTurns);
       }
-      state.lastBotReplyAt = now();
+      if (!ttsError) {
+        state.lastBotReplyAt = now();
+        state.lastBotReplyUserId = userId ?? null;
+      }
     } catch (error) {
       if (!controller.signal.aborted && error?.name !== "AbortError") {
         state.lastError = "voice turn failed";
       }
     } finally {
+      pendingTurns.delete(turn);
+      if (!turn.committed && turn.fillerEmitted && currentTurn === null) {
+        state.isBotSpeaking = false;
+        if (activePlaybackUserId === turn.userId) stopPlayback();
+      }
       try {
         ttsAdapter.endTurn?.(turn.voiceToken);
       } catch {

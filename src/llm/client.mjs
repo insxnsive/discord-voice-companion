@@ -22,6 +22,14 @@ export function stripAudioTags(text) {
     .trim();
 }
 
+export function formatSpeakerLabel(name) {
+  const cleaned =
+    typeof name === "string"
+      ? name.replace(/[\r\n\t[\]:]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 32)
+      : "";
+  return cleaned || "Speaker";
+}
+
 function countWords(text) {
   const speakable = stripAudioTags(text);
   return speakable ? speakable.split(/\s+/).length : 0;
@@ -437,6 +445,8 @@ export function createLlmClient({
     speakerName = "Speaker",
     botAliases = defaultChime.botAliases ?? [],
     lastBotReplyAt = null,
+    userId = null,
+    lastBotReplyUserId = null,
     followUpWindowMs = defaultChime.followUpWindowMs ?? 12000,
     chimeMode = defaultChime.mode ?? "smart",
     gateTimeoutMs = defaultChime.gateTimeoutMs ?? 350,
@@ -444,6 +454,7 @@ export function createLlmClient({
     now: clock = () => Date.now(),
   } = {}) {
     const cleanTranscript = typeof transcript === "string" ? transcript.trim() : "";
+    const speakerLabel = formatSpeakerLabel(speakerName);
     if (!cleanTranscript) {
       return { shouldReply: false, reason: "empty", usedGateModel: false };
     }
@@ -459,6 +470,8 @@ export function createLlmClient({
     if (
       lastBotReplyAt !== null &&
       lastBotReplyAt !== undefined &&
+      Boolean(userId) &&
+      userId === lastBotReplyUserId &&
       clock() - lastBotReplyAt <= followUpWindowMs
     ) {
       return { shouldReply: true, reason: "followup_window", usedGateModel: false };
@@ -480,7 +493,7 @@ export function createLlmClient({
             },
             {
               role: "user",
-              content: `[${speakerName}]: ${cleanTranscript}`,
+              content: `[${speakerLabel}]: ${cleanTranscript}`,
             },
           ],
           stream: false,
