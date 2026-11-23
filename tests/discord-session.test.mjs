@@ -1722,6 +1722,55 @@ test("muting current B does not stop A's draining resource", async () => {
   assert.equal(aWasNotStopped, true, "muting B must preserve A's separate draining resource");
 });
 
+test("a status-only sink cannot clear the native draining resource owner", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  const gateArgs = [];
+  let releaseSecondGate;
+  const llm = {
+    shouldChimeIn(args) {
+      gateArgs.push(args);
+      if (gateArgs.length === 1) return { shouldReply: true };
+      return new Promise((resolve) => { releaseSecondGate = resolve; });
+    },
+    async streamReply({ onToken }) {
+      onToken("native reply.");
+      return { fullText: "native reply." };
+    },
+  };
+  const fillerCallbacks = [];
+  const statusOnlySink = { isPlaying: () => false };
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: statusOnlySink,
+    llmClient: llm,
+    scheduleReactionFillerImpl: ({ onFire }) => {
+      fillerCallbacks.push(onFire);
+      return { cancel() {} };
+    },
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  const replyResource = shapes.player.attached();
+  const queuedFrames = replyResource.stream.readableLength;
+  assert.ok(queuedFrames > 0, "reply frames should remain unread in the native resource");
+
+  const candidate = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!releaseSecondGate || fillerCallbacks.length < 2) await tick(0);
+  fillerCallbacks[1]();
+  const originalResourcePreserved = shapes.player.attached() === replyResource;
+  const originalFramesPreserved = replyResource.stream.readableLength === queuedFrames;
+  const replyResourceWasNotRetired = replyResource.retired === false;
+
+  releaseSecondGate({ shouldReply: false });
+  await candidate;
+  await orchestrator.close();
+  assert.equal(originalResourcePreserved, true, "status-only sink must not replace native playback");
+  assert.equal(originalFramesPreserved, true, "pending filler must preserve the unread reply packets");
+  assert.equal(replyResourceWasNotRetired, true);
+});
+
 test("a successful empty reply gives no follow-up credit", async () => {
   const llm = makeLlm();
   llm.streamReply = async () => ({ fullText: "" });

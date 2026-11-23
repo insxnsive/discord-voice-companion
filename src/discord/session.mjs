@@ -272,7 +272,7 @@ export function createVoiceOrchestrator({
   }
 
   function refreshSinkPlaybackOwner() {
-    if (typeof playerSink?.isPlaying !== "function") return false;
+    if (typeof playerSink?.playOpusFrame !== "function" || typeof playerSink?.isPlaying !== "function") return false;
     let playing;
     try {
       playing = playerSink.isPlaying();
