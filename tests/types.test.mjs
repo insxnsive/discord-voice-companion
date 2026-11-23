@@ -246,6 +246,19 @@ test("timing trace stays bounded, clamps numbers, and stores only allowed fields
   assert.equal(trace.formatSummary(), "No timing trace yet.");
 });
 
+test("voice timing formats a known gate reason without a duration", () => {
+  const trace = new typesModule.TurnTimingTrace();
+  trace.startTurn(1);
+  trace.setGateReason(1, "gate_error");
+  assert.match(trace.formatSummary(), /gate reason gate_error/);
+
+  trace.mark(1, "gateMs", 5);
+  assert.match(trace.formatSummary(), /gate 5ms \(gate_error\)/);
+
+  trace.startTurn(2);
+  assert.equal(trace.formatSummary().includes("gate "), false);
+});
+
 test("timing trace snapshots cannot mutate the stored record", () => {
   const trace = new typesModule.TurnTimingTrace();
   trace.startTurn(1);

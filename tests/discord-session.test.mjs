@@ -3698,6 +3698,7 @@ test("voice timing records gate_error for a rejected gate call", async () => {
   const trace = orchestrator.getStatus().timingLast;
   assert.equal(trace.gateReason, "gate_error");
   assert.equal(trace.stopReason, "provider_error");
+  assert.match(formatStatusReply(orchestrator.getStatus()), /gate reason gate_error/);
 });
 
 test("a throwing clock cannot escape the playing callback", async () => {

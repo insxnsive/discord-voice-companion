@@ -434,6 +434,8 @@ export class TurnTimingTrace {
     if (record.sttMs !== null) parts.push(`STT ${ms(record.sttMs)}`);
     if (record.gateMs !== null) {
       parts.push(`gate ${ms(record.gateMs)}${record.gateReason ? ` (${record.gateReason})` : ""}`);
+    } else if (record.gateReason) {
+      parts.push(`gate reason ${record.gateReason}`);
     }
     if (record.firstContentTokenMs !== null) parts.push(`token ${ms(record.firstContentTokenMs)}`);
     if (record.firstClauseMs !== null) parts.push(`clause ${ms(record.firstClauseMs)}`);
