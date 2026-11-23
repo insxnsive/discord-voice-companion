@@ -3094,6 +3094,7 @@ test("voice timing allowlists fixed gate reasons and keeps stale approval separa
   assert.equal(reasonFor({ reason: "gate_http_error" }, false, false), "gate_http_error");
   assert.equal(reasonFor({ reason: "gate_error" }, false, false), "gate_error");
   assert.equal(reasonFor({ reason: "gate_yes" }, true, true), "stale_approval");
+  assert.equal(reasonFor({ reason: "gate_no" }, false, true), "gate_no");
   assert.equal(reasonFor({ reason: "raw secret detail" }, true, false), "unknown");
 });
 

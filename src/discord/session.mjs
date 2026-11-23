@@ -49,7 +49,7 @@ const TIMING_GATE_REASON_ALLOWLIST = new Set([
 
 /** Map the client's fixed gate reasons to the bounded timing allowlist. */
 export function timingGateReason(decision, chimeIn, stale = false) {
-  if (stale) return "stale_approval";
+  if (stale && chimeIn === true) return "stale_approval";
   const reason = decision?.reason;
   return typeof reason === "string" && TIMING_GATE_REASON_ALLOWLIST.has(reason)
     ? reason
