@@ -29,11 +29,17 @@ function deepFreeze(value) {
  * Frozen provider presets for OpenAI-compatible chat and turn-gate models.
  */
 export const LLM_PRESETS = deepFreeze({
+  // The same OpenCode key authorizes two doors: Zen (pay-per-use, zen/v1) and
+  // Go (subscription, zen/go/v1). This preset targets the Go subscription door;
+  // Zen users can override llm.baseUrl through config.
   opencode: {
-    baseUrl: "https://opencode.ai/zen/v1",
+    baseUrl: "https://opencode.ai/zen/go/v1",
     replyModel: "deepseek-v4.1-flash",
     gateModel: "deepseek-v4.1-flash",
-    headers: { "x-opencode-client": "discord-voice-companion" },
+    headers: {
+      "x-opencode-client": "discord-voice-companion",
+      "x-opencode-session": "discord-voice-companion",
+    },
     extraBody: {},
   },
   deepseek: {
