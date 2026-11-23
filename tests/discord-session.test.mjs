@@ -4455,3 +4455,611 @@ test("a turn pins one voice even when the chooser switches mid-reply", async () 
   adapter.close();
   await orchestrator.close();
 });
+
+function deferredValue() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function makeGateOrderHarness({ streamPlans = {}, scheduleReactionFillerImpl, reactionPool, fillerMode = "off" } = {}) {
+  const transcripts = new Map();
+  let sttIndex = 0;
+  const gateQueues = new Map();
+  const gateArgs = [];
+  const streamSignals = [];
+  const messagesLog = [];
+  const ttsCalls = [];
+  let sinkStops = 0;
+  let sinkPlaying = false;
+  const sinkFrames = [];
+
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe(pcm) {
+      sttIndex += 1;
+      const key = transcripts.get(pcm) ?? `utt-${sttIndex}`;
+      return key;
+    },
+  };
+
+  const llm = {
+    async shouldChimeIn(args) {
+      gateArgs.push(args);
+      const queue = gateQueues.get(args.transcript) ?? [];
+      if (queue.length === 0) return { shouldReply: false };
+      const deferred = queue.shift();
+      return await new Promise((resolve, reject) => {
+        if (args.signal?.aborted) {
+          reject(abortError());
+          return;
+        }
+        args.signal?.addEventListener("abort", () => reject(abortError()), { once: true });
+        deferred.promise.then(resolve, reject);
+      });
+    },
+    async streamReply({ messages, onClause, signal }) {
+      streamSignals.push(signal);
+      messagesLog.push(Array.isArray(messages) ? [...messages] : []);
+      const lastUser = messages.at(-1)?.content ?? "";
+      const match = /]:\s*(.+)$/.exec(lastUser);
+      const key = match ? match[1] : "";
+      const plan = streamPlans[key];
+      if (typeof plan === "function") {
+        return await plan({ onClause, signal });
+      }
+      const clauses = plan ?? [`Reply to ${key}.`];
+      for (const clause of clauses) {
+        if (signal?.aborted) throw abortError();
+        onClause(clause);
+      }
+      return { fullText: clauses.join("") };
+    },
+  };
+
+  const tts = {
+    name: () => "mock-tts",
+    close() {},
+    async synthesizeClause({ text, signal, onPcmChunk }) {
+      ttsCalls.push(text);
+      if (signal?.aborted) throw abortError();
+      onPcmChunk?.(PCM24K);
+      return { firstByteAt: 1, byteLength: PCM24K.length };
+    },
+  };
+
+  const playerSink = {
+    frames: sinkFrames,
+    isPlaying: () => sinkPlaying,
+    playOpusFrame(packet) {
+      sinkPlaying = true;
+      sinkFrames.push(Buffer.from(packet));
+    },
+    stop() {
+      sinkStops += 1;
+      sinkPlaying = false;
+    },
+    clear() {
+      sinkPlaying = false;
+    },
+  };
+
+  function queueGate(label) {
+    const pcm = Buffer.alloc(640, transcripts.size + 10);
+    transcripts.set(pcm, label);
+    const gate = deferredValue();
+    if (!gateQueues.has(label)) gateQueues.set(label, []);
+    gateQueues.get(label).push(gate);
+    return { pcm, gate };
+  }
+
+  const built = buildOrchestrator({
+    sttAdapter: stt,
+    llmClient: llm,
+    ttsAdapter: tts,
+    playerSink,
+    reactionPool,
+    scheduleReactionFillerImpl,
+    config: {
+      reactions: { mode: fillerMode, fillerDelayMs: 165 },
+      chime: { mode: "smart" },
+      turnDeadlineMs: 5000,
+    },
+  });
+
+  return {
+    ...built,
+    queueGate,
+    gateArgs,
+    streamSignals,
+    messagesLog,
+    ttsCalls,
+    sinkFrames,
+    getSinkStops: () => sinkStops,
+  };
+}
+
+test("gate order: older YES leaves newer reply playing and preserves its audio tail", async () => {
+  const tailGate = deferredValue();
+  const startedFirstClause = deferredValue();
+  const harness = makeGateOrderHarness({
+    streamPlans: {
+      "older-speech": ["Old reply."],
+      "newer-speech": async ({ onClause, signal }) => {
+        onClause("New head. ");
+        startedFirstClause.resolve();
+        await tailGate.promise;
+        if (signal?.aborted) throw abortError();
+        onClause("New tail.");
+        return { fullText: "New head. New tail." };
+      },
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const older = harness.queueGate("older-speech");
+    const newer = harness.queueGate("newer-speech");
+
+    const olderPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: older.pcm,
+      endedAt: 100,
+    });
+    const newerPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: newer.pcm,
+      endedAt: 200,
+    });
+    await tick(10);
+
+    newer.gate.resolve({ shouldReply: true });
+    await startedFirstClause.promise;
+    await tick(10);
+    const framesBeforeTail = harness.sinkFrames.length;
+    const stopsBeforeOlder = harness.getSinkStops();
+    assert.ok(framesBeforeTail >= 1, "newer head audio should already be playing");
+
+    older.gate.resolve({ shouldReply: true });
+    await olderPromise;
+
+    assert.equal(harness.streamSignals[0].aborted, false, "older YES must not abort newer reply");
+    assert.equal(harness.getSinkStops(), stopsBeforeOlder, "older YES must not stop newer reply playback");
+
+    tailGate.resolve();
+    await newerPromise;
+
+    assert.deepEqual(harness.ttsCalls, ["New head. ", "New tail."]);
+    assert.ok(harness.sinkFrames.length > framesBeforeTail, "newer audio tail must still play");
+    assert.equal(harness.messagesLog.length, 1);
+  } finally {
+    tailGate.resolve();
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: older YES is ignored after newer reply finishes", async () => {
+  const harness = makeGateOrderHarness({
+    streamPlans: {
+      "older-speech": ["Old reply."],
+      "newer-speech": ["New reply."],
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const older = harness.queueGate("older-speech");
+    const newer = harness.queueGate("newer-speech");
+
+    const olderPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: older.pcm,
+      endedAt: 100,
+    });
+    const newerPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: newer.pcm,
+      endedAt: 200,
+    });
+    await tick(10);
+
+    newer.gate.resolve({ shouldReply: true });
+    await newerPromise;
+
+    older.gate.resolve({ shouldReply: true });
+    await olderPromise;
+
+    assert.deepEqual(harness.ttsCalls, ["New reply."]);
+    assert.equal(harness.messagesLog.length, 1);
+
+    const followUp = harness.queueGate("follow-up");
+    const followUpPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u3",
+      displayName: "Three",
+      pcm16kMono: followUp.pcm,
+      endedAt: 300,
+    });
+    await tick(10);
+    followUp.gate.resolve({ shouldReply: false });
+    await followUpPromise;
+    assert.equal(harness.gateArgs.at(-1).lastBotReplyUserId, "u2");
+  } finally {
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: genuinely newer YES takes over from older playing reply", async () => {
+  const holdOlder = deferredValue();
+  const olderStarted = deferredValue();
+  const harness = makeGateOrderHarness({
+    streamPlans: {
+      "older-speech": async ({ onClause, signal }) => {
+        onClause("Old head. ");
+        olderStarted.resolve();
+        await holdOlder.promise;
+        if (signal?.aborted) throw abortError();
+        onClause("Old tail.");
+        return { fullText: "Old head. Old tail." };
+      },
+      "newer-speech": ["New takeover."],
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const older = harness.queueGate("older-speech");
+    const newer = harness.queueGate("newer-speech");
+
+    const olderPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: older.pcm,
+      endedAt: 100,
+    });
+    const newerPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: newer.pcm,
+      endedAt: 200,
+    });
+    await tick(10);
+
+    older.gate.resolve({ shouldReply: true });
+    await olderStarted.promise;
+    await tick(10);
+
+    newer.gate.resolve({ shouldReply: true });
+    await newerPromise;
+    holdOlder.resolve();
+    await olderPromise;
+
+    assert.equal(harness.streamSignals[0].aborted, true, "newer YES must abort older active reply");
+    assert.ok(harness.getSinkStops() >= 1);
+    assert.deepEqual(harness.ttsCalls, ["Old head. ", "New takeover."]);
+  } finally {
+    holdOlder.resolve();
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: newer NO leaves prior owner alone and does not advance committed order", async () => {
+  const holdOlder = deferredValue();
+  const olderStarted = deferredValue();
+  const harness = makeGateOrderHarness({
+    streamPlans: {
+      "older-speech": async ({ onClause, signal }) => {
+        onClause("Old head. ");
+        olderStarted.resolve();
+        await holdOlder.promise;
+        if (signal?.aborted) throw abortError();
+        onClause("Old tail.");
+        return { fullText: "Old head. Old tail." };
+      },
+      "earlier-pending": ["Earlier still speaks."],
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const older = harness.queueGate("older-speech");
+    const newerNo = harness.queueGate("newer-no");
+
+    const olderPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: older.pcm,
+      endedAt: 100,
+    });
+    const newerPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: newerNo.pcm,
+      endedAt: 200,
+    });
+    await tick(10);
+
+    older.gate.resolve({ shouldReply: true });
+    await olderStarted.promise;
+    await tick(10);
+    const stopsBeforeNo = harness.getSinkStops();
+
+    newerNo.gate.resolve({ shouldReply: false });
+    await newerPromise;
+
+    assert.equal(harness.streamSignals[0].aborted, false);
+    assert.equal(harness.getSinkStops(), stopsBeforeNo);
+    holdOlder.resolve();
+    await olderPromise;
+    assert.deepEqual(harness.ttsCalls, ["Old head. ", "Old tail."]);
+
+    await harness.orchestrator.leaveChannel({ guildId: "g1" });
+    await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+    const earlier = harness.queueGate("earlier-pending");
+    const laterNo = harness.queueGate("later-no");
+    const earlierPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: earlier.pcm,
+      endedAt: 300,
+    });
+    const laterNoPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: laterNo.pcm,
+      endedAt: 400,
+    });
+    await tick(10);
+
+    laterNo.gate.resolve({ shouldReply: false });
+    await laterNoPromise;
+    earlier.gate.resolve({ shouldReply: true });
+    await earlierPromise;
+
+    assert.deepEqual(harness.ttsCalls, ["Old head. ", "Old tail.", "Earlier still speaks."]);
+  } finally {
+    holdOlder.resolve();
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: equal end times break ties by turn sequence", async () => {
+  const harness = makeGateOrderHarness({
+    streamPlans: {
+      "tie-first": ["Tie first."],
+      "tie-second": ["Tie second."],
+      "tie-third": ["Tie third."],
+      "tie-fourth": ["Tie fourth."],
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const first = harness.queueGate("tie-first");
+    const second = harness.queueGate("tie-second");
+    const firstPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: first.pcm,
+      endedAt: 500,
+    });
+    const secondPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: second.pcm,
+      endedAt: 500,
+    });
+    await tick(10);
+
+    second.gate.resolve({ shouldReply: true });
+    await secondPromise;
+    first.gate.resolve({ shouldReply: true });
+    await firstPromise;
+
+    assert.deepEqual(harness.ttsCalls, ["Tie second."]);
+
+    const third = harness.queueGate("tie-third");
+    const fourth = harness.queueGate("tie-fourth");
+    const thirdPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: third.pcm,
+      endedAt: 600,
+    });
+    const fourthPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: fourth.pcm,
+      endedAt: 600,
+    });
+    await tick(10);
+
+    third.gate.resolve({ shouldReply: true });
+    await thirdPromise;
+    fourth.gate.resolve({ shouldReply: true });
+    await fourthPromise;
+
+    assert.deepEqual(harness.ttsCalls, ["Tie second.", "Tie third.", "Tie fourth."]);
+  } finally {
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: out-of-order speech-end callbacks order by speech end time rather than arrival order", async () => {
+  const harness = makeGateOrderHarness({
+    streamPlans: {
+      "later-speech-first-callback": ["Newer speech."],
+      "earlier-speech-second-callback": ["Older speech."],
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const newerSpeech = harness.queueGate("later-speech-first-callback");
+    const olderSpeech = harness.queueGate("earlier-speech-second-callback");
+
+    const newerPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: newerSpeech.pcm,
+      endedAt: 200,
+    });
+    const olderPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: olderSpeech.pcm,
+      endedAt: 100,
+    });
+    await tick(10);
+
+    newerSpeech.gate.resolve({ shouldReply: true });
+    await newerPromise;
+    olderSpeech.gate.resolve({ shouldReply: true });
+    await olderPromise;
+
+    assert.deepEqual(harness.ttsCalls, ["Newer speech."]);
+  } finally {
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: leave and rejoin clears committed ordering state", async () => {
+  const harness = makeGateOrderHarness({
+    streamPlans: {
+      "before-leave": ["Before leave."],
+      "after-rejoin": ["After rejoin."],
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const before = harness.queueGate("before-leave");
+    const beforePromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: before.pcm,
+      endedAt: 1000,
+    });
+    await tick(10);
+    before.gate.resolve({ shouldReply: true });
+    await beforePromise;
+
+    await harness.orchestrator.leaveChannel({ guildId: "g1" });
+    await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+    const after = harness.queueGate("after-rejoin");
+    const afterPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: after.pcm,
+      endedAt: 500,
+    });
+    await tick(10);
+    after.gate.resolve({ shouldReply: true });
+    await afterPromise;
+
+    assert.deepEqual(harness.ttsCalls, ["Before leave.", "After rejoin."]);
+  } finally {
+    await harness.orchestrator.close();
+  }
+});
+
+test("gate order: approved turn plays its filler cue before first clause while older cue stays silent", async () => {
+  const scheduledFillers = [];
+  let pickCount = 0;
+  const replyStarted = deferredValue();
+  const replyHold = deferredValue();
+  const harness = makeGateOrderHarness({
+    fillerMode: "adaptive",
+    scheduleReactionFillerImpl: ({ delayMs, onFire }) => {
+      const entry = { delayMs, onFire, cancelled: false };
+      scheduledFillers.push(entry);
+      return {
+        cancel() {
+          entry.cancelled = true;
+        },
+        get fired() {
+          return false;
+        },
+      };
+    },
+    reactionPool: {
+      pick() {
+        pickCount += 1;
+        return { frames48kOpus: [Buffer.from([0xaa, 0xbb])] };
+      },
+    },
+    streamPlans: {
+      "older-speech": ["Old reply."],
+      "newer-speech": async ({ onClause, signal }) => {
+        replyStarted.resolve();
+        await replyHold.promise;
+        if (signal?.aborted) throw abortError();
+        onClause("New reply.");
+        return { fullText: "New reply." };
+      },
+    },
+  });
+  await harness.orchestrator.start();
+  await harness.orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  try {
+    const older = harness.queueGate("older-speech");
+    const newer = harness.queueGate("newer-speech");
+
+    const olderPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u1",
+      displayName: "One",
+      pcm16kMono: older.pcm,
+      endedAt: 100,
+    });
+    const newerPromise = harness.vad.captured.callbacks.onSpeechEnd({
+      userId: "u2",
+      displayName: "Two",
+      pcm16kMono: newer.pcm,
+      endedAt: 200,
+    });
+    await tick(10);
+
+    assert.equal(scheduledFillers.length, 2);
+
+    newer.gate.resolve({ shouldReply: true });
+    await replyStarted.promise;
+
+    scheduledFillers[1].onFire();
+    assert.equal(pickCount, 1, "approved turn should play its filler cue before the first clause");
+    assert.equal(harness.sinkFrames.length, 1, "approved turn filler clip should emit an Opus frame");
+
+    scheduledFillers[0].onFire();
+    assert.equal(pickCount, 1, "older pending cue must stay silent after a newer turn commits");
+    assert.equal(harness.sinkFrames.length, 1);
+
+    replyHold.resolve();
+    await newerPromise;
+    older.gate.resolve({ shouldReply: true });
+    await olderPromise;
+
+    scheduledFillers[0].onFire();
+    assert.equal(pickCount, 1, "older cue must remain silent after the newer turn finishes");
+    assert.deepEqual(harness.ttsCalls, ["New reply."]);
+  } finally {
+    replyHold.resolve();
+    await harness.orchestrator.close();
+  }
+});

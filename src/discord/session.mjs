@@ -157,6 +157,7 @@ export function createVoiceOrchestrator({
 
   let history = [];
   let currentTurn = null;
+  let committedTurnOrder = null;
   let turnCounter = 0;
   let voiceConnection = null;
   let voicePlayer = null;
@@ -219,6 +220,14 @@ export function createVoiceOrchestrator({
         state.channelId === snap.channelId &&
         verifyLiveChannelBinding(),
     );
+  }
+
+  function isStaleTurnOrder(turn) {
+    if (!committedTurnOrder) return false;
+    if (turn.endedAt !== committedTurnOrder.endedAt) {
+      return turn.endedAt < committedTurnOrder.endedAt;
+    }
+    return turn.seq < committedTurnOrder.seq;
   }
 
   function isTurnLive(turn) {
@@ -673,6 +682,7 @@ export function createVoiceOrchestrator({
     currentTurn?.filler?.cancel();
     finishOutput(currentTurn);
     currentTurn = null;
+    committedTurnOrder = null;
     state.isBotSpeaking = false;
     stopPlayback();
     vad.clear?.();
@@ -994,12 +1004,15 @@ export function createVoiceOrchestrator({
       }
     }
 
-    const turnId = `turn-${(turnCounter += 1)}`;
+    const turnSeq = (turnCounter += 1);
+    const turnId = `turn-${turnSeq}`;
     const controller = new AbortController();
 
     const startedAt = endedAt === undefined ? now() : endedAt;
     const turn = {
       id: turnId,
+      seq: turnSeq,
+      endedAt: startedAt,
       userId,
       controller,
       filler: null,
@@ -1078,6 +1091,7 @@ export function createVoiceOrchestrator({
             refreshSinkPlaybackOwner();
             if (
               !isTurnLive(turn) ||
+              isStaleTurnOrder(turn) ||
               (currentTurn && currentTurn !== turn) ||
               (activePlaybackTurn && activePlaybackTurn !== turn) ||
               turn.gateDenied ||
@@ -1112,7 +1126,7 @@ export function createVoiceOrchestrator({
       if (!isTurnLive(turn)) return;
       latencyTracker.mark(turnId, "gateDoneAt", now());
       const chimeIn = decision?.chimeIn ?? decision?.shouldReply;
-      if (chimeIn !== true) {
+      if (chimeIn !== true || isStaleTurnOrder(turn)) {
         turn.gateDenied = true;
         turn.filler?.cancel();
         if (!turn.committed && turn.fillerEmitted && currentTurn === null && isPlaybackOwner(turn)) {
@@ -1129,6 +1143,7 @@ export function createVoiceOrchestrator({
         finishOutput(currentTurn);
         stopPlayback();
       }
+      committedTurnOrder = { endedAt: turn.endedAt, seq: turn.seq };
       currentTurn = turn;
       turn.committed = true;
       pendingTurns.delete(turn);
