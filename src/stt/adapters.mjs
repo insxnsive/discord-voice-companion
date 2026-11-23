@@ -552,7 +552,7 @@ export function createScribeSttAdapter({
 
 export function createFasterWhisperAdapter({
   baseUrl = "http://127.0.0.1:4373",
-  language = "en",
+  language = "",
   prompt = "",
   maxPcmBytes = DEFAULT_MAX_PCM_BYTES,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
@@ -576,8 +576,8 @@ export function createFasterWhisperAdapter({
     const headers = {
       "content-type": "application/octet-stream",
       "x-sample-rate": "16000",
-      "x-language": language,
     };
+    if (language) headers["x-language"] = language;
     if (prompt) headers["x-prompt"] = prompt;
 
     const primary = await runHttpRequest({

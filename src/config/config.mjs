@@ -40,7 +40,9 @@ export const LLM_PRESETS = deepFreeze({
       "x-opencode-client": "discord-voice-companion",
       "x-opencode-session": "discord-voice-companion",
     },
-    extraBody: {},
+    // Reasoning models spend the gate's 2-token budget on reasoning_content.
+    // Disabled by default; re-enable through config if you need thinking.
+    extraBody: { thinking: { type: "disabled" } },
   },
   deepseek: {
     baseUrl: "https://api.deepseek.com/v1",
@@ -378,6 +380,7 @@ export function loadConfig({
         pickNonEmpty(getEnv("LOCAL_STT_URL"), configJson.stt?.localUrl, "http://127.0.0.1:4373"),
         "stt.localUrl",
       ),
+      language: pickNonEmpty(getEnv("STT_LANGUAGE"), configJson.stt?.language),
     },
     tts: {
       provider: ttsProvider,
@@ -432,7 +435,7 @@ export function loadConfig({
       botAliases: parseAliases(getEnv("CHIME_BOT_ALIASES"), configJson.chime?.botAliases),
       gateTimeoutMs: parseNumberSetting(
         getEnv("CHIME_GATE_TIMEOUT_MS") ?? configJson.chime?.gateTimeoutMs,
-        350,
+        1500,
         { min: 1, integer: true, label: "chime.gateTimeoutMs" },
       ),
     },

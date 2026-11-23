@@ -173,7 +173,7 @@ test("createFasterWhisperAdapter posts raw PCM, falls back to multipart, and bou
   assert.equal(calls[0].options.redirect, "error");
   assert.equal(calls[0].options.headers["content-type"], "application/octet-stream");
   assert.equal(calls[0].options.headers["x-sample-rate"], "16000");
-  assert.equal(calls[0].options.headers["x-language"], "en");
+  assert.equal(calls[0].options.headers["x-language"], undefined);
   assert.ok(Buffer.from(calls[0].options.body).equals(PCM));
 
   const fallbackCalls = [];
@@ -756,4 +756,29 @@ test("REST adapters cancel the error body before reporting a status failure", as
 
   await assert.rejects(() => adapter.transcribe(PCM), /401/);
   assert.equal(cancelled, true);
+});
+
+test("faster-whisper omits language by default and sends a configured one", async () => {
+  const autoCalls = [];
+  const auto = createFasterWhisperAdapter({
+    baseUrl: "http://127.0.0.1:4373",
+    fetchImpl: async (url, options) => {
+      autoCalls.push({ url: String(url), options });
+      return jsonResponse({ text: "ok" });
+    },
+  });
+  await auto.transcribe(PCM);
+  assert.equal(autoCalls[0].options.headers["x-language"], undefined);
+
+  const ptCalls = [];
+  const portuguese = createFasterWhisperAdapter({
+    baseUrl: "http://127.0.0.1:4373",
+    language: "pt",
+    fetchImpl: async (url, options) => {
+      ptCalls.push({ url: String(url), options });
+      return jsonResponse({ text: "ok" });
+    },
+  });
+  await portuguese.transcribe(PCM);
+  assert.equal(ptCalls[0].options.headers["x-language"], "pt");
 });
