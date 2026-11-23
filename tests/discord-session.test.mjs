@@ -9,6 +9,7 @@ import {
   createVoiceOrchestrator,
   verifyDavePrerequisites,
 } from "../src/discord/session.mjs";
+import * as sessionModule from "../src/discord/session.mjs";
 
 import {
   SLASH_COMMANDS,
@@ -2984,7 +2985,7 @@ test("voice timing trace separates gate, token, clause, PCM, and accepted frame"
   let clock = 0;
   const llm = {
     async shouldChimeIn() {
-      return { chimeIn: true };
+      return { chimeIn: true, reason: "gate_yes" };
     },
     async streamReply({ onToken, onClause }) {
       clock += 10;
@@ -3016,7 +3017,7 @@ test("voice timing trace separates gate, token, clause, PCM, and accepted frame"
   assert.equal(trace.lastVoicedToEndMs, 240);
   assert.equal(typeof trace.sttMs, "number");
   assert.equal(typeof trace.gateMs, "number");
-  assert.equal(trace.gateReason, "reply");
+  assert.equal(trace.gateReason, "gate_yes");
   assert.equal(typeof trace.firstContentTokenMs, "number");
   assert.equal(typeof trace.firstClauseMs, "number");
   assert.equal(typeof trace.firstPcmMs, "number");
@@ -3032,6 +3033,68 @@ test("voice timing trace separates gate, token, clause, PCM, and accepted frame"
   assert.match(formatStatusReply(status), /Timing: turn 1/);
   status.timingLast.turn = 99;
   assert.equal(orchestrator.getStatus().timingLast.turn, 1);
+});
+
+test("voice timing measures STT and gate around their own calls", async () => {
+  let clock = 10;
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe() {
+      clock += 20;
+      return "hello";
+    },
+  };
+  const llm = {
+    async shouldChimeIn() {
+      clock += 5;
+      return { shouldReply: true, reason: "gate_yes" };
+    },
+    async streamReply() {
+      return { fullText: "" };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    sttAdapter: stt,
+    llmClient: llm,
+    now: () => clock,
+    scheduleReactionFillerImpl: () => {
+      clock += 7;
+      return { cancel() {}, fired: false };
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+    lastVoicedAt: -240,
+  });
+
+  const trace = orchestrator.getStatus().timingLast;
+  assert.equal(trace.sttMs, 20);
+  assert.equal(trace.gateMs, 5);
+  assert.equal(trace.fillerScheduleMs, 7);
+  assert.equal(trace.gateReason, "gate_yes");
+  assert.equal(trace.endToCallbackMs, 10);
+  assert.equal(typeof trace.transcoderMs, "number");
+});
+
+test("voice timing allowlists fixed gate reasons and keeps stale approval separate", () => {
+  const reasonFor = sessionModule.timingGateReason;
+  assert.equal(typeof reasonFor, "function");
+  assert.equal(reasonFor({ reason: "addressed" }, true, false), "addressed");
+  assert.equal(reasonFor({ reason: "followup_window" }, true, false), "followup_window");
+  assert.equal(reasonFor({ reason: "gate_yes" }, true, false), "gate_yes");
+  assert.equal(reasonFor({ reason: "gate_no" }, false, false), "gate_no");
+  assert.equal(reasonFor({ reason: "gate_http_error" }, false, false), "gate_http_error");
+  assert.equal(reasonFor({ reason: "gate_error" }, false, false), "gate_error");
+  assert.equal(reasonFor({ reason: "gate_yes" }, true, true), "stale_approval");
+  assert.equal(reasonFor({ reason: "raw secret detail" }, true, false), "unknown");
 });
 
 test("voice timing trace records normal drain, an open-output idle, and a retired resource", async () => {
@@ -3098,7 +3161,7 @@ test("voice timing trace records normal drain, an open-output idle, and a retire
 
   const idle = orchestrator.getStatus().timingLast;
   assert.equal(idle.playerState, "idle");
-  assert.equal(idle.stopReason, "normal_drain");
+  assert.equal(idle.stopReason, null);
   assert.equal(idle.queueDepth, 0);
   assert.equal(typeof idle.writableEnded, "boolean");
   assert.equal(idle.idleObservation, "output_open_empty_queue");
@@ -3192,6 +3255,337 @@ test("a non-finite idle sample cannot block player cleanup or bypass the retired
 
   releaseReply();
   await turn;
+});
+
+test("voice timing marks a drained ended output as a normal drain", async () => {
+  let clock = 0;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock++,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const resource = shapes.played.at(-1);
+  for (let i = 0; i < 50; i += 1) {
+    if (orchestrator.getStatus().timingLast?.firstAcceptedFrameMs !== null) break;
+    await tick(2);
+  }
+
+  shapes.player.emit(
+    "stateChange",
+    { status: "loaded", resource },
+    { status: "playing", resource },
+  );
+  resource.stream.end();
+  while (resource.stream.read() !== null) {}
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource },
+    { status: "idle", resource },
+  );
+
+  const idle = orchestrator.getStatus().timingLast;
+  assert.equal(idle.stopReason, "normal_drain");
+  assert.equal(idle.idleObservation, "output_drained");
+  assert.equal(idle.writableEnded, true);
+  assert.equal(typeof idle.playingMs, "number");
+  assert.equal(typeof idle.idleAtMs, "number");
+
+  releaseReply();
+  await turn;
+});
+
+test("voice timing records a destroyed output as an unknown idle cause", async () => {
+  let clock = 0;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock++,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const resource = shapes.played.at(-1);
+  for (let i = 0; i < 50; i += 1) {
+    if (orchestrator.getStatus().timingLast?.firstAcceptedFrameMs !== null) break;
+    await tick(2);
+  }
+
+  shapes.player.emit(
+    "stateChange",
+    { status: "loaded", resource },
+    { status: "playing", resource },
+  );
+  resource.stream.destroy();
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource },
+    { status: "idle", resource },
+  );
+
+  const idle = orchestrator.getStatus().timingLast;
+  assert.equal(idle.stopReason, null);
+  assert.equal(idle.idleObservation, "output_destroyed_before_end");
+  assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+
+  releaseReply();
+  await turn;
+});
+
+test("voice timing attributes player errors only to the matching resource", async () => {
+  let clock = 0;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock++,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const resource = shapes.played.at(-1);
+
+  shapes.player.emit("error", { resource: { retired: true } });
+  assert.equal(orchestrator.getStatus().timingLast.stopReason, null);
+  shapes.player.emit("error", { resource });
+  assert.equal(orchestrator.getStatus().timingLast.stopReason, "player_error");
+
+  releaseReply();
+  await turn;
+});
+
+test("voice timing keeps backpressure after an earlier accepted reply write", async () => {
+  let clock = 0;
+  let releaseSecond;
+  const secondGate = new Promise((resolve) => {
+    releaseSecond = resolve;
+  });
+  let clauses = 0;
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      clauses += 1;
+      onClause("Hi.");
+      await secondGate;
+      onClause("There.");
+      return { fullText: "Hi. There." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock++,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  for (let i = 0; i < 50; i += 1) {
+    if (orchestrator.getStatus().timingLast?.firstAcceptedFrameMs !== null) break;
+    await tick(2);
+  }
+  const resource = shapes.played.at(-1);
+  assert.equal(orchestrator.getStatus().timingLast.frameBackpressure, false);
+  resource.stream.write = () => false;
+  releaseSecond();
+  await turn;
+
+  assert.equal(clauses, 1);
+  assert.equal(orchestrator.getStatus().timingLast.frameBackpressure, true);
+});
+
+test("voice timing keeps the last playback trace beside a newer denied turn", async () => {
+  let gateCalls = 0;
+  const llm = {
+    async shouldChimeIn() {
+      gateCalls += 1;
+      return gateCalls === 1
+        ? { shouldReply: true, reason: "gate_yes" }
+        : { shouldReply: false, reason: "gate_no" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      return { fullText: "Hi." };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 10,
+  });
+
+  const status = orchestrator.getStatus();
+  assert.equal(status.timingLast.turn, 2);
+  assert.equal(status.timingLast.gateReason, "gate_no");
+  assert.match(status.timingPlaybackSummary, /turn 1/);
+  const text = formatStatusReply(status);
+  assert.match(text, /Timing: turn 2/);
+  assert.match(text, /Playback: turn 1/);
+});
+
+test("voice timing gives a reattached resource its own player state", async () => {
+  let clock = 0;
+  let releaseSecond;
+  const secondGate = new Promise((resolve) => {
+    releaseSecond = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await secondGate;
+      onClause("There.");
+      return { fullText: "Hi. There." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock++,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const firstResource = shapes.played.at(-1);
+  for (let i = 0; i < 50; i += 1) {
+    if (orchestrator.getStatus().timingLast?.firstAcceptedFrameMs !== null) break;
+    await tick(2);
+  }
+
+  shapes.player.emit(
+    "stateChange",
+    { status: "loaded", resource: firstResource },
+    { status: "playing", resource: firstResource },
+  );
+  firstResource.stream.end();
+  releaseSecond();
+  await turn;
+
+  assert.ok(shapes.played.length >= 2);
+  const secondResource = shapes.played.at(-1);
+  assert.notEqual(secondResource, firstResource);
+  assert.equal(orchestrator.getStatus().timingLast.resource, 2);
+
+  shapes.player.emit(
+    "stateChange",
+    { status: "loaded", resource: secondResource },
+    { status: "playing", resource: secondResource },
+  );
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource: secondResource },
+    { status: "idle", resource: secondResource },
+  );
+  const idle = orchestrator.getStatus().timingLast;
+  assert.equal(idle.resource, 2);
+  assert.equal(idle.playerState, "idle");
+  assert.equal(typeof idle.playingMs, "number");
 });
 
 test("voice timing trace records a same-speaker barge-in stop", async () => {

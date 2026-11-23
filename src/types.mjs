@@ -204,25 +204,35 @@ export const TIMING_STOP_REASONS = Object.freeze([
 ]);
 
 export const TIMING_GATE_REASONS = Object.freeze([
-  "reply",
-  "no_reply",
-  "timeout",
-  "error",
+  "empty",
+  "always",
+  "addressed",
+  "mention_only",
+  "followup_window",
+  "gate_http_error",
+  "gate_yes",
+  "gate_no",
+  "gate_error",
+  "stale_approval",
   "unknown",
 ]);
 
 export const TIMING_PLAYER_STATES = Object.freeze(["playing", "idle", "unknown"]);
 
 export const TIMING_IDLE_OBSERVATIONS = Object.freeze([
+  "output_drained",
   "output_open_empty_queue",
-  "normal",
+  "output_destroyed_before_end",
+  "output_ended_with_queue",
   "unknown",
 ]);
 
 const TIMING_NUMBER_FIELDS = new Set([
   "lastVoicedToEndMs",
   "endToCallbackMs",
+  "transcoderMs",
   "sttMs",
+  "fillerScheduleMs",
   "gateMs",
   "firstContentTokenMs",
   "firstClauseMs",
@@ -230,6 +240,8 @@ const TIMING_NUMBER_FIELDS = new Set([
   "firstAcceptedFrameMs",
   "queueDepth",
   "sinceLastQueuedFrameMs",
+  "playingMs",
+  "idleAtMs",
 ]);
 
 const TIMING_BOOLEAN_FIELDS = new Set(["writableEnded", "frameBackpressure"]);
@@ -274,7 +286,9 @@ export class TurnTimingTrace {
       resource: null,
       lastVoicedToEndMs: null,
       endToCallbackMs: null,
+      transcoderMs: null,
       sttMs: null,
+      fillerScheduleMs: null,
       gateMs: null,
       gateReason: null,
       firstContentTokenMs: null,
@@ -285,6 +299,8 @@ export class TurnTimingTrace {
       queueDepth: null,
       writableEnded: null,
       sinceLastQueuedFrameMs: null,
+      playingMs: null,
+      idleAtMs: null,
       frameBackpressure: null,
       idleObservation: null,
       stopReason: null,
@@ -342,7 +358,7 @@ export class TurnTimingTrace {
     return this.setReason(turn, "stopReason", value, options);
   }
 
-  notePlayer(turn, { playerState, queueDepth, writableEnded, sinceLastQueuedFrameMs, idleObservation }) {
+  notePlayer(turn, { playerState, queueDepth, writableEnded, sinceLastQueuedFrameMs, playingMs, idleAtMs, idleObservation }) {
     const record = this.#find(turn);
     if (!record) return null;
     if (playerState !== undefined) this.setReason(turn, "playerState", playerState);
@@ -352,7 +368,26 @@ export class TurnTimingTrace {
     if (sinceLastQueuedFrameMs !== undefined) {
       this.mark(turn, "sinceLastQueuedFrameMs", sinceLastQueuedFrameMs);
     }
+    if (playingMs !== undefined) this.mark(turn, "playingMs", playingMs);
+    if (idleAtMs !== undefined) this.mark(turn, "idleAtMs", idleAtMs);
     return record;
+  }
+
+  beginResource(turn) {
+    const record = this.#find(turn);
+    if (!record) return null;
+    this.resourceSeq += 1;
+    record.resource = this.resourceSeq;
+    record.playerState = null;
+    record.queueDepth = null;
+    record.writableEnded = null;
+    record.sinceLastQueuedFrameMs = null;
+    record.playingMs = null;
+    record.idleAtMs = null;
+    record.frameBackpressure = null;
+    record.idleObservation = null;
+    record.stopReason = null;
+    return this.resourceSeq;
   }
 
   assignResource(turn) {
@@ -366,6 +401,20 @@ export class TurnTimingTrace {
   getLatest() {
     if (this.records.length === 0) return null;
     return { ...this.records[this.records.length - 1] };
+  }
+
+  getLatestPlayback() {
+    for (let index = this.records.length - 1; index >= 0; index -= 1) {
+      const record = this.records[index];
+      if (
+        record.resource !== null ||
+        record.firstAcceptedFrameMs !== null ||
+        record.playerState !== null
+      ) {
+        return { ...record };
+      }
+    }
+    return null;
   }
 
   reset() {
@@ -392,13 +441,29 @@ export class TurnTimingTrace {
     if (record.firstAcceptedFrameMs !== null) {
       parts.push(`frame ${ms(record.firstAcceptedFrameMs)}`);
     }
+    if (record.transcoderMs !== null) parts.push(`transcoder ${ms(record.transcoderMs)}`);
+    if (record.fillerScheduleMs !== null) {
+      parts.push(`filler setup ${ms(record.fillerScheduleMs)}`);
+    }
     if (record.frameBackpressure === true) parts.push("write backpressure");
     if (record.playerState) parts.push(`player ${record.playerState}`);
+    if (record.playingMs !== null) parts.push(`played ${ms(record.playingMs)}`);
+    if (record.idleAtMs !== null) parts.push(`idle at ${ms(record.idleAtMs)}`);
     if (record.queueDepth !== null) parts.push(`queue ${record.queueDepth}`);
+    if (record.writableEnded !== null) {
+      parts.push(record.writableEnded ? "output ended" : "output open");
+    }
+    if (record.sinceLastQueuedFrameMs !== null) {
+      parts.push(`last frame gap ${ms(record.sinceLastQueuedFrameMs)}`);
+    }
     if (record.idleObservation === "output_open_empty_queue") {
       parts.push("idle with output open and queue empty");
-    } else if (record.idleObservation === "normal") {
-      parts.push("idle drained");
+    } else if (record.idleObservation === "output_destroyed_before_end") {
+      parts.push("idle after output was destroyed");
+    } else if (record.idleObservation === "output_ended_with_queue") {
+      parts.push("idle with output ended and queue remaining");
+    } else if (record.idleObservation === "output_drained") {
+      parts.push("idle after a drained output");
     }
     return parts.join(" | ");
   }

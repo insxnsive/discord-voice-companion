@@ -181,7 +181,7 @@ test("timing trace stays bounded, clamps numbers, and stores only allowed fields
   trace.mark(1, "gateMs", 9_999_999);
   trace.mark(1, "queueDepth", 0);
   trace.mark(1, "writableEnded", false);
-  trace.setGateReason(1, "reply");
+  trace.setGateReason(1, "gate_yes");
   trace.notePlayer(1, {
     playerState: "idle",
     queueDepth: 0,
@@ -199,7 +199,7 @@ test("timing trace stays bounded, clamps numbers, and stores only allowed fields
   assert.equal(first.endToCallbackMs, 2);
   assert.equal(first.sttMs, 120);
   assert.equal(first.gateMs, 600_000);
-  assert.equal(first.gateReason, "reply");
+  assert.equal(first.gateReason, "gate_yes");
   assert.equal(first.playerState, "idle");
   assert.equal(first.idleObservation, "output_open_empty_queue");
   assert.equal(first.stopReason, "normal_drain");
@@ -219,6 +219,7 @@ test("timing trace stays bounded, clamps numbers, and stores only allowed fields
   const keys = Object.keys(first).sort();
   assert.deepEqual(keys, [
     "endToCallbackMs",
+    "fillerScheduleMs",
     "firstAcceptedFrameMs",
     "firstClauseMs",
     "firstContentTokenMs",
@@ -226,14 +227,17 @@ test("timing trace stays bounded, clamps numbers, and stores only allowed fields
     "frameBackpressure",
     "gateMs",
     "gateReason",
+    "idleAtMs",
     "idleObservation",
     "lastVoicedToEndMs",
     "playerState",
+    "playingMs",
     "queueDepth",
     "resource",
     "sinceLastQueuedFrameMs",
     "stopReason",
     "sttMs",
+    "transcoderMs",
     "turn",
     "writableEnded",
   ]);
