@@ -58,7 +58,10 @@ test("loadConfig selects elevenlabs default vs expressive model and enforces pro
   assert.equal(fast.tts.model, "eleven_flash_v2_5");
   assert.equal(fast.llm.provider, "opencode");
   assert.equal(fast.llm.baseUrl, LLM_PRESETS.opencode.baseUrl);
-  assert.deepEqual(fast.llm.headers, { "x-opencode-client": "discord-voice-companion" });
+  assert.deepEqual(fast.llm.headers, {
+    "x-opencode-client": "discord-voice-companion",
+    "x-opencode-session": "discord-voice-companion",
+  });
   assert.equal(fast.personaPrompt, "Speak short and punchy.");
   assert.equal(fast.reactions.mode, "adaptive");
   assert.equal(fast.reactions.fillerDelayMs, 165);
@@ -203,7 +206,7 @@ test("streamReply parses split SSE chunks, stops on [DONE], omits auth for local
     onClause: (clause) => streamedClauses.push(clause),
   });
 
-  assert.equal(seenRequest.url, "https://opencode.ai/zen/v1/chat/completions");
+  assert.equal(seenRequest.url, "https://opencode.ai/zen/go/v1/chat/completions");
   assert.equal(seenRequest.init.headers.Authorization, "Bearer oc-key");
   assert.equal(seenRequest.init.headers["x-opencode-client"], "discord-voice-companion");
   assert.equal(result.fullText, "Hey there! How are you?");
@@ -614,4 +617,60 @@ test("C5 diagnostics: custom values of allowlisted header names are reported as 
     }),
   });
   assert.equal(redactConfig(viaLoad).llm.headers["x-opencode-client"], "[REDACTED]");
+});
+
+test("the opencode preset targets the Go gateway with both required headers", async () => {
+  const config = loadConfig({
+    env: { LLM_PROVIDER: "opencode", LLM_API_KEY: "oc_sk_test_key" },
+    fsImpl: makeMemoryFs(),
+  });
+  const calls = [];
+  const client = createLlmClient({
+    config,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: init.headers });
+      return makeSseResponse([
+        'data: {"choices":[{"delta":{"content":"Hi there."}}]}\n\n',
+        "data: [DONE]\n\n",
+      ]);
+    },
+  });
+
+  const clauses = [];
+  await client.streamReply({
+    messages: [{ role: "user", content: "hello" }],
+    onClause: (clause) => clauses.push(clause),
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://opencode.ai/zen/go/v1/chat/completions");
+  assert.equal(calls[0].headers["x-opencode-client"], "discord-voice-companion");
+  assert.equal(calls[0].headers["x-opencode-session"], "discord-voice-companion");
+  assert.deepEqual(clauses, ["Hi there."]);
+});
+
+test("the llm client parses the Go gateway SSE chunk shape", async () => {
+  const config = loadConfig({
+    env: { LLM_PROVIDER: "opencode", LLM_API_KEY: "oc_sk_test_key" },
+    fsImpl: makeMemoryFs(),
+  });
+  const client = createLlmClient({
+    config,
+    fetchImpl: async () =>
+      makeSseResponse([
+        'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"there."},"finish_reason":null}]}\n\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]),
+  });
+
+  const clauses = [];
+  const result = await client.streamReply({
+    messages: [{ role: "user", content: "hello" }],
+    onClause: (clause) => clauses.push(clause),
+  });
+
+  assert.deepEqual(clauses, ["Hello there."]);
+  assert.equal(result.fullText, "Hello there.");
 });
