@@ -3614,6 +3614,32 @@ test("voice timing keeps provider_error when the gate never ran", async () => {
   assert.equal(orchestrator.getStatus().lastError, "voice turn failed");
 });
 
+test("voice timing records gate_error for a rejected gate call", async () => {
+  const llm = {
+    async shouldChimeIn() {
+      throw new Error("gate call rejected");
+    },
+    async streamReply() {
+      return { fullText: "" };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  const trace = orchestrator.getStatus().timingLast;
+  assert.equal(trace.gateReason, "gate_error");
+  assert.equal(trace.stopReason, "provider_error");
+});
+
 test("a throwing clock cannot escape the playing callback", async () => {
   let clock = 0;
   let throwClock = false;

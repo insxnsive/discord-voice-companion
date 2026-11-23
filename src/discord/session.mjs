@@ -1172,19 +1172,31 @@ export function createVoiceOrchestrator({
 
       const gateStartedAt = now();
       timingTrace.mark(turnSeq, "fillerScheduleMs", Math.max(0, gateStartedAt - sttAt));
-      const decision = await llmClient.shouldChimeIn({
-        transcript,
-        chimeMode: state.chimeMode,
-        speakerName: displayName,
-        userId,
-        botAliases: config?.chime?.botAliases,
-        lastBotReplyAt: state.lastBotReplyAt,
-        lastBotReplyUserId: state.lastBotReplyUserId,
-        followUpWindowMs: config?.chime?.followUpWindowMs,
-        gateTimeoutMs: config?.chime?.gateTimeoutMs,
-        signal: controller.signal,
-        now,
-      });
+      let decision;
+      try {
+        decision = await llmClient.shouldChimeIn({
+          transcript,
+          chimeMode: state.chimeMode,
+          speakerName: displayName,
+          userId,
+          botAliases: config?.chime?.botAliases,
+          lastBotReplyAt: state.lastBotReplyAt,
+          lastBotReplyUserId: state.lastBotReplyUserId,
+          followUpWindowMs: config?.chime?.followUpWindowMs,
+          gateTimeoutMs: config?.chime?.gateTimeoutMs,
+          signal: controller.signal,
+          now,
+        });
+      } catch (error) {
+        if (!controller.signal.aborted && error?.name !== "AbortError") {
+          try {
+            timingTrace.setGateReason(turnSeq, "gate_error", { onlyIfUnset: true });
+          } catch {
+            // Timing diagnostics are optional.
+          }
+        }
+        throw error;
+      }
       if (!isTurnLive(turn)) return;
       const gateAt = now();
       latencyTracker.mark(turnId, "gateDoneAt", gateAt);
