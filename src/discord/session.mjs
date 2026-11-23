@@ -1544,30 +1544,36 @@ export function createVoiceOrchestrator({
               if (nextState?.status !== "idle" || !activePlaybackTurn || !activePlaybackResource) return;
               if (endedResource !== activePlaybackResource) return;
               const endedTurn = activePlaybackTurn;
-              const queueDepth = activePlaybackStream?.readableLength ?? null;
-              const writableEnded = activePlaybackStream
-                ? Boolean(activePlaybackStream.writableEnded)
-                : null;
-              const outputOpen = Boolean(
-                activePlaybackStream &&
-                  !activePlaybackStream.destroyed &&
-                  !activePlaybackStream.writableEnded,
-              );
-              const sinceLastQueuedFrameMs =
-                endedTurn.lastQueuedFrameAt === undefined
-                  ? null
-                  : Math.max(0, now() - endedTurn.lastQueuedFrameAt);
-              timingTrace.notePlayer(endedTurn.seq, {
-                playerState: "idle",
-                queueDepth,
-                writableEnded,
-                sinceLastQueuedFrameMs,
-                idleObservation:
-                  outputOpen && (queueDepth ?? 0) === 0
-                    ? "output_open_empty_queue"
-                    : "normal",
-              });
-              timingTrace.setStopReason(endedTurn.seq, "normal_drain", { onlyIfUnset: true });
+              try {
+                const queueDepth = activePlaybackStream?.readableLength ?? null;
+                const writableEnded = activePlaybackStream
+                  ? Boolean(activePlaybackStream.writableEnded)
+                  : null;
+                const outputOpen = Boolean(
+                  activePlaybackStream &&
+                    !activePlaybackStream.destroyed &&
+                    !activePlaybackStream.writableEnded,
+                );
+                const elapsed =
+                  endedTurn.lastQueuedFrameAt === undefined
+                    ? null
+                    : now() - endedTurn.lastQueuedFrameAt;
+                const sinceLastQueuedFrameMs =
+                  Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : null;
+                timingTrace.notePlayer(endedTurn.seq, {
+                  playerState: "idle",
+                  queueDepth,
+                  writableEnded,
+                  sinceLastQueuedFrameMs,
+                  idleObservation:
+                    outputOpen && (queueDepth ?? 0) === 0
+                      ? "output_open_empty_queue"
+                      : "normal",
+                });
+                timingTrace.setStopReason(endedTurn.seq, "normal_drain", { onlyIfUnset: true });
+              } catch {
+                // Timing diagnostics are optional and cannot block cleanup.
+              }
               if (endedTurn?.outStream === activePlaybackStream) finishOutput(endedTurn);
               activePlaybackUserId = null;
               activePlaybackTurn = null;
