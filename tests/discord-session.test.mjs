@@ -3588,6 +3588,32 @@ test("voice timing gives a reattached resource its own player state", async () =
   assert.equal(typeof idle.playingMs, "number");
 });
 
+test("voice timing keeps provider_error when the gate never ran", async () => {
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe() {
+      throw new Error("stt failed");
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({ sttAdapter: stt });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+
+  const trace = orchestrator.getStatus().timingLast;
+  assert.equal(trace.stopReason, "provider_error");
+  assert.equal(trace.gateReason, null);
+  assert.equal(orchestrator.getStatus().lastError, "voice turn failed");
+});
+
 test("voice timing trace records a same-speaker barge-in stop", async () => {
   const llm = makeLlm({ blockStream: true });
   const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });

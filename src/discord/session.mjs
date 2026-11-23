@@ -1296,7 +1296,6 @@ export function createVoiceOrchestrator({
       if (!controller.signal.aborted && error?.name !== "AbortError") {
         state.lastError = "voice turn failed";
         timingTrace.setStopReason(turnSeq, "provider_error");
-        if (!turn.committed) timingTrace.setGateReason(turnSeq, "error");
       }
     } finally {
       pendingTurns.delete(turn);
