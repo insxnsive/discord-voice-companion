@@ -649,7 +649,40 @@ test("the opencode preset targets the Go gateway with both required headers", as
   assert.deepEqual(clauses, ["Hi there."]);
 });
 
-test("the llm client parses the Go gateway SSE chunk shape", async () => {
+test("the opencode preset disables reasoning and the gate timeout default is 1500", async () => {
+  const config = loadConfig({
+    env: { LLM_PROVIDER: "opencode", LLM_API_KEY: "oc_sk_test_key" },
+    fsImpl: makeMemoryFs(),
+  });
+  assert.equal(config.chime.gateTimeoutMs, 1500);
+  assert.deepEqual(config.llm.extraBody, { thinking: { type: "disabled" } });
+
+  const bodies = [];
+  const client = createLlmClient({
+    config,
+    fetchImpl: async (url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "NO" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.shouldChimeIn({ transcript: "hello there", chimeMode: "smart" });
+  assert.ok(bodies.length >= 1);
+  assert.equal(bodies[0].thinking.type, "disabled");
+
+  const auto = loadConfig({ env: {}, fsImpl: makeMemoryFs() });
+  assert.equal(auto.stt.language, "");
+  const portuguese = loadConfig({
+    env: { STT_LANGUAGE: "pt" },
+    fsImpl: makeMemoryFs(),
+  });
+  assert.equal(portuguese.stt.language, "pt");
+});
+
+test("the Go SSE shape speaks only delta.content and ignores role and reasoning deltas", async () => {
   const config = loadConfig({
     env: { LLM_PROVIDER: "opencode", LLM_API_KEY: "oc_sk_test_key" },
     fsImpl: makeMemoryFs(),
@@ -658,8 +691,10 @@ test("the llm client parses the Go gateway SSE chunk shape", async () => {
     config,
     fetchImpl: async () =>
       makeSseResponse([
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+        'data: {"choices":[{"delta":{"reasoning_content":"hidden reasoning"}}]}\n\n',
         'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n',
-        'data: {"choices":[{"delta":{"content":"there."},"finish_reason":null}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"there."}}]}\n\n',
         'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
         "data: [DONE]\n\n",
       ]),
@@ -673,4 +708,5 @@ test("the llm client parses the Go gateway SSE chunk shape", async () => {
 
   assert.deepEqual(clauses, ["Hello there."]);
   assert.equal(result.fullText, "Hello there.");
+  assert.equal(result.fullText.includes("hidden reasoning"), false);
 });
