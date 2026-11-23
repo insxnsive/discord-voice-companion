@@ -3614,6 +3614,131 @@ test("voice timing keeps provider_error when the gate never ran", async () => {
   assert.equal(orchestrator.getStatus().lastError, "voice turn failed");
 });
 
+test("a throwing clock cannot escape the playing callback", async () => {
+  let clock = 0;
+  let throwClock = false;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => {
+      if (throwClock) throw new Error("clock failed");
+      return clock++;
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const resource = shapes.played.at(-1);
+
+  throwClock = true;
+  let threw = false;
+  try {
+    shapes.player.emit(
+      "stateChange",
+      { status: "loaded", resource },
+      { status: "playing", resource },
+    );
+  } catch {
+    threw = true;
+  }
+  throwClock = false;
+  assert.equal(threw, false);
+
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource },
+    { status: "idle", resource },
+  );
+  assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+  releaseReply();
+  await turn;
+});
+
+test("a throwing clock cannot prevent matching idle cleanup", async () => {
+  let clock = 0;
+  let throwClock = false;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => {
+      if (throwClock) throw new Error("clock failed");
+      return clock++;
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const resource = shapes.played.at(-1);
+  shapes.player.emit(
+    "stateChange",
+    { status: "loaded", resource },
+    { status: "playing", resource },
+  );
+
+  throwClock = true;
+  let threw = false;
+  try {
+    shapes.player.emit(
+      "stateChange",
+      { status: "playing", resource },
+      { status: "idle", resource },
+    );
+  } catch {
+    threw = true;
+  }
+  throwClock = false;
+  assert.equal(threw, false);
+  assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+  releaseReply();
+  await turn;
+});
+
 test("voice timing trace records a same-speaker barge-in stop", async () => {
   const llm = makeLlm({ blockStream: true });
   const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });

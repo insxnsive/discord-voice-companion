@@ -1563,9 +1563,11 @@ export function createVoiceOrchestrator({
               const endedResource = nextState?.resource ?? oldState?.resource;
               if (nextState?.status === "playing") {
                 if (endedResource === activePlaybackResource && activePlaybackTurn) {
-                  const playedAt = now();
-                  activePlaybackTurn.playingStartedAt = Number.isFinite(playedAt) ? playedAt : null;
                   try {
+                    const playedAt = now();
+                    activePlaybackTurn.playingStartedAt = Number.isFinite(playedAt)
+                      ? playedAt
+                      : null;
                     timingTrace.notePlayer(activePlaybackTurn.seq, { playerState: "playing" });
                   } catch {
                     // Timing diagnostics are optional.
@@ -1580,7 +1582,6 @@ export function createVoiceOrchestrator({
               const queueDepth = stream?.readableLength ?? null;
               const writableEnded = stream ? Boolean(stream.writableEnded) : null;
               const destroyed = stream ? Boolean(stream.destroyed) : null;
-              const idleAt = now();
               let idleObservation = "unknown";
               if (destroyed && !writableEnded) {
                 idleObservation = "output_destroyed_before_end";
@@ -1591,20 +1592,21 @@ export function createVoiceOrchestrator({
                 idleObservation =
                   (queueDepth ?? 0) === 0 ? "output_drained" : "output_ended_with_queue";
               }
-              const elapsedGap =
-                endedTurn.lastQueuedFrameAt === undefined
-                  ? null
-                  : idleAt - endedTurn.lastQueuedFrameAt;
-              const sinceLastQueuedFrameMs =
-                Number.isFinite(elapsedGap) && elapsedGap >= 0 ? elapsedGap : null;
-              const playingMs =
-                Number.isFinite(idleAt) && Number.isFinite(endedTurn.playingStartedAt)
-                  ? Math.max(0, idleAt - endedTurn.playingStartedAt)
-                  : null;
-              const idleAtMs = Number.isFinite(idleAt)
-                ? Math.max(0, idleAt - endedTurn.startedAt)
-                : null;
               try {
+                const idleAt = now();
+                const elapsedGap =
+                  endedTurn.lastQueuedFrameAt === undefined
+                    ? null
+                    : idleAt - endedTurn.lastQueuedFrameAt;
+                const sinceLastQueuedFrameMs =
+                  Number.isFinite(elapsedGap) && elapsedGap >= 0 ? elapsedGap : null;
+                const playingMs =
+                  Number.isFinite(idleAt) && Number.isFinite(endedTurn.playingStartedAt)
+                    ? Math.max(0, idleAt - endedTurn.playingStartedAt)
+                    : null;
+                const idleAtMs = Number.isFinite(idleAt)
+                  ? Math.max(0, idleAt - endedTurn.startedAt)
+                  : null;
                 timingTrace.notePlayer(endedTurn.seq, {
                   playerState: "idle",
                   queueDepth,
