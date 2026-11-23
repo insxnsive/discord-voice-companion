@@ -364,7 +364,8 @@ export class TurnTimingTrace {
   }
 
   getLatest() {
-    return this.records.length > 0 ? this.records[this.records.length - 1] : null;
+    if (this.records.length === 0) return null;
+    return { ...this.records[this.records.length - 1] };
   }
 
   reset() {

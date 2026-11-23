@@ -241,3 +241,17 @@ test("timing trace stays bounded, clamps numbers, and stores only allowed fields
   assert.equal(trace.getLatest(), null);
   assert.equal(trace.formatSummary(), "No timing trace yet.");
 });
+
+test("timing trace snapshots cannot mutate the stored record", () => {
+  const trace = new typesModule.TurnTimingTrace();
+  trace.startTurn(1);
+  const snapshot = trace.getLatest();
+  snapshot.turn = 99;
+  snapshot.sttMs = 123;
+  snapshot.stopReason = "normal_drain";
+
+  const next = trace.getLatest();
+  assert.equal(next.turn, 1);
+  assert.equal(next.sttMs, null);
+  assert.equal(next.stopReason, null);
+});
