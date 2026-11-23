@@ -2667,6 +2667,52 @@ test("voice presence arrivals exclude cached bots when guild member data is miss
   assert.deepEqual(presenceData.currentRoster, ["CachedHuman"]);
 });
 
+test("voice presence ignores detached voiceStateUpdate callbacks after leave and rejoin", async () => {
+  const shapes = makeRealVoiceDeps();
+  const cached = makePresenceGuild([{ id: "bot-1", channelId: "c1", displayName: "Bot", bot: true }]);
+  const client = new EventEmitter();
+  client.user = { id: "bot-1" };
+  client.guilds = { cache: new Map([["g1", cached.guild]]) };
+  const llm = makeLlm();
+  const { orchestrator, vad } = buildOrchestrator({ client, llmClient: llm, voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const [oldListener] = client.listeners("voiceStateUpdate");
+  assert.equal(typeof oldListener, "function");
+
+  await orchestrator.leaveChannel({ guildId: "g1" });
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  oldListener(
+    presenceVoiceState("ghost-1", null, "Ghost"),
+    presenceVoiceState("ghost-1", "c1", "Ghost"),
+  );
+
+  await vad.captured.callbacks.onSpeechEnd({ userId: "speaker", displayName: "Speaker", pcm16kMono: PCM16K, endedAt: 0 });
+  const afterStale = llm.state.messagesLog.at(-1).find((message) => /room presence/i.test(message.content));
+  assert.equal(afterStale, undefined, "detached callback must not add a ghost arrival");
+
+  client.emit(
+    "voiceStateUpdate",
+    presenceVoiceState("real-1", null, "RealHuman"),
+    presenceVoiceState("real-1", "c1", "RealHuman"),
+  );
+  await vad.captured.callbacks.onSpeechEnd({ userId: "speaker", displayName: "Speaker", pcm16kMono: PCM16K, endedAt: 0 });
+  const afterReal = llm.state.messagesLog.at(-1).find((message) => /room presence/i.test(message.content));
+  assert.ok(afterReal);
+  const presenceData = JSON.parse(afterReal.content.slice(afterReal.content.indexOf(": ") + 2));
+  assert.deepEqual(presenceData.recentArrivals, ["RealHuman"]);
+  assert.deepEqual(presenceData.currentRoster, ["RealHuman"]);
+
+  client.emit(
+    "voiceStateUpdate",
+    { id: "bot-1", channelId: "c1", guild: { id: "g1" } },
+    { id: "bot-1", channelId: "c2", guild: { id: "g1" } },
+  );
+  assert.equal(orchestrator.getStatus().channelId, "c2");
+});
+
 test("connection stateChange follows joinConfig and disconnects cleanly", async () => {
   const shapes = makeRealVoiceDeps();
   const { orchestrator } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null });

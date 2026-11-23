@@ -1420,9 +1420,9 @@ export function createVoiceOrchestrator({
           voiceConnection?.on?.("stateChange", connectionStateListener);
 
           if (typeof state.client?.on === "function") {
-            voiceStateListener = (_oldState, newState) => {
+            const listener = (_oldState, newState) => {
               try {
-                if (state.closed || !resolvedBotUserId) return;
+                if (voiceStateListener !== listener || state.closed || !resolvedBotUserId) return;
                 const userId = newState?.id ?? _oldState?.id;
                 const guildId =
                   newState?.guildId ??
@@ -1441,7 +1441,8 @@ export function createVoiceOrchestrator({
                 state.lastError = "voice state failed";
               }
             };
-            state.client.on("voiceStateUpdate", voiceStateListener);
+            voiceStateListener = listener;
+            state.client.on("voiceStateUpdate", listener);
           }
 
           if (
