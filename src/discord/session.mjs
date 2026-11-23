@@ -358,7 +358,7 @@ export function createVoiceOrchestrator({
         const userId = voiceState?.id ?? voiceState?.member?.id;
         if (!userId || voiceState?.channelId !== channelId) continue;
         const member = voiceState.member ?? guild?.members?.cache?.get?.(userId);
-        if (member?.user?.bot || member?.bot) continue;
+        if (isVoiceStateBot(voiceState, userId, guildId)) continue;
         setVoicePresence(
           userId,
           member?.displayName ??
@@ -372,7 +372,9 @@ export function createVoiceOrchestrator({
     if (members && typeof members.values === "function") {
       for (const member of members.values()) {
         const userId = member?.id ?? member?.user?.id;
-        if (!userId || member?.voice?.channelId !== channelId || member?.user?.bot || member?.bot) continue;
+        if (!userId || member?.voice?.channelId !== channelId || isVoiceStateBot({ member }, userId, guildId)) {
+          continue;
+        }
         setVoicePresence(
           userId,
           member?.displayName ??
@@ -403,7 +405,7 @@ export function createVoiceOrchestrator({
     const member =
       voiceState?.member ??
       state.client?.guilds?.cache?.get?.(guildId)?.members?.cache?.get?.(userId);
-    return Boolean(member?.user?.bot ?? member?.bot);
+    return Boolean(member?.user?.bot ?? member?.bot ?? lookupBot(userId, guildId));
   }
 
   function handleHumanVoiceState(oldState, newState) {

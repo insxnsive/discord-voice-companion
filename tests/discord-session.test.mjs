@@ -2604,6 +2604,69 @@ test("voice presence clears on leave and seeds the replacement session without a
   assert.match(context.content, /recentArrivals\W*\[\]/i);
 });
 
+test("voice room seed excludes cached bots when guild member data is missing", async () => {
+  const shapes = makeRealVoiceDeps();
+  const cached = makePresenceGuild([]);
+  cached.states.set("cached-bot", { id: "cached-bot", channelId: "c1", guildId: "g1", guild: { id: "g1" } });
+  cached.states.set("cached-human", { id: "cached-human", channelId: "c1", guildId: "g1", guild: { id: "g1" } });
+  const client = new EventEmitter();
+  client.user = { id: "bot-1" };
+  client.users = {
+    cache: new Map([
+      ["cached-bot", { id: "cached-bot", bot: true, username: "CachedBot" }],
+      ["cached-human", { id: "cached-human", bot: false, username: "CachedHuman" }],
+    ]),
+  };
+  client.guilds = { cache: new Map([["g1", cached.guild]]) };
+  const llm = makeLlm();
+  const { orchestrator, vad } = buildOrchestrator({ client, llmClient: llm, voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  await vad.captured.callbacks.onSpeechEnd({ userId: "cached-human", displayName: "CachedHuman", pcm16kMono: PCM16K, endedAt: 0 });
+  const context = llm.state.messagesLog.at(-1).find((message) => /room presence/i.test(message.content));
+  assert.ok(context);
+  const presenceData = JSON.parse(context.content.slice(context.content.indexOf(": ") + 2));
+  assert.deepEqual(presenceData.currentRoster, ["CachedHuman"]);
+  assert.deepEqual(presenceData.recentArrivals, []);
+});
+
+test("voice presence arrivals exclude cached bots when guild member data is missing", async () => {
+  const shapes = makeRealVoiceDeps();
+  const cached = makePresenceGuild([]);
+  const client = new EventEmitter();
+  client.user = { id: "bot-1" };
+  client.users = {
+    cache: new Map([
+      ["cached-bot", { id: "cached-bot", bot: true, username: "CachedBot" }],
+      ["cached-human", { id: "cached-human", bot: false, username: "CachedHuman" }],
+    ]),
+  };
+  client.guilds = { cache: new Map([["g1", cached.guild]]) };
+  const llm = makeLlm();
+  const { orchestrator, vad } = buildOrchestrator({ client, llmClient: llm, voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  client.emit(
+    "voiceStateUpdate",
+    { id: "cached-bot", channelId: null, guildId: "g1", guild: { id: "g1" } },
+    { id: "cached-bot", channelId: "c1", guildId: "g1", guild: { id: "g1" } },
+  );
+  client.emit(
+    "voiceStateUpdate",
+    { id: "cached-human", channelId: null, guildId: "g1", guild: { id: "g1" } },
+    { id: "cached-human", channelId: "c1", guildId: "g1", guild: { id: "g1" } },
+  );
+
+  await vad.captured.callbacks.onSpeechEnd({ userId: "cached-human", displayName: "CachedHuman", pcm16kMono: PCM16K, endedAt: 0 });
+  const context = llm.state.messagesLog.at(-1).find((message) => /room presence/i.test(message.content));
+  assert.ok(context);
+  const presenceData = JSON.parse(context.content.slice(context.content.indexOf(": ") + 2));
+  assert.deepEqual(presenceData.recentArrivals, ["CachedHuman"]);
+  assert.deepEqual(presenceData.currentRoster, ["CachedHuman"]);
+});
+
 test("connection stateChange follows joinConfig and disconnects cleanly", async () => {
   const shapes = makeRealVoiceDeps();
   const { orchestrator } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null });
