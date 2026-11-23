@@ -3442,6 +3442,63 @@ test("voice timing does not call a force-destroyed stream a drain", async () => 
   await turn;
 });
 
+test("voice timing leaves a zero-queue ended stream unknown", async () => {
+  let clock = 0;
+  let releaseReply;
+  const replyGate = new Promise((resolve) => {
+    releaseReply = resolve;
+  });
+  const llm = {
+    async shouldChimeIn() {
+      return { chimeIn: true, reason: "gate_yes" };
+    },
+    async streamReply({ onClause }) {
+      onClause("Hi.");
+      await replyGate;
+      return { fullText: "Hi." };
+    },
+  };
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    now: () => clock++,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({
+    userId: "u1",
+    displayName: "Ana",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 0,
+  });
+  for (let i = 0; i < 50 && shapes.played.length === 0; i += 1) await tick(2);
+  const resource = shapes.played.at(-1);
+  for (let i = 0; i < 50; i += 1) {
+    if (orchestrator.getStatus().timingLast?.firstAcceptedFrameMs !== null) break;
+    await tick(2);
+  }
+
+  resource.stream.end();
+  Object.defineProperty(resource.stream, "readableEnded", { value: false, configurable: true });
+  Object.defineProperty(resource.stream, "readableLength", { value: 0, configurable: true });
+  shapes.player.emit(
+    "stateChange",
+    { status: "playing", resource },
+    { status: "idle", resource },
+  );
+
+  const idle = orchestrator.getStatus().timingLast;
+  assert.equal(idle.stopReason, null);
+  assert.equal(idle.idleObservation, "unknown");
+  assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+
+  releaseReply();
+  await turn;
+});
+
 test("voice timing attributes player errors only to the matching resource", async () => {
   let clock = 0;
   let releaseReply;

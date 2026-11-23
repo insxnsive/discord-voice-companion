@@ -1603,7 +1603,7 @@ export function createVoiceOrchestrator({
                   (queueDepth ?? 0) === 0 ? "output_open_empty_queue" : "unknown";
               } else if (writableEnded === true && readableEnded && (queueDepth ?? 0) === 0) {
                 idleObservation = "output_drained";
-              } else if (writableEnded === true) {
+              } else if (writableEnded === true && (queueDepth ?? 0) > 0) {
                 idleObservation = "output_ended_with_queue";
               }
               try {
