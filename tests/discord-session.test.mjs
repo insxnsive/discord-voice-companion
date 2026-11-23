@@ -166,6 +166,7 @@ function makePlayerSink() {
     playing: false,
     playOpusFrame(packet) {
       frames.push(Buffer.from(packet));
+      this.playing = true;
     },
     stop() {
       this.stopped += 1;
@@ -237,6 +238,32 @@ function makeRealVoiceDeps() {
     },
   };
   return { deps, speaking, subscriptions, played, connection, player };
+}
+
+function makeReplacingVoiceDeps() {
+  const shapes = makeRealVoiceDeps();
+  let attached = null;
+  shapes.player.play = (resource) => {
+    if (attached && attached !== resource) {
+      attached.retired = true;
+      attached.stream.destroy();
+    }
+    attached = resource;
+    resource.retired = false;
+    shapes.played.push(resource);
+    return resource;
+  };
+  shapes.player.attached = () => attached;
+  return shapes;
+}
+
+function makeStatefulPlayerSink() {
+  const sink = makePlayerSink();
+  sink.playOpusFrame = (packet) => {
+    sink.frames.push(Buffer.from(packet));
+    sink.playing = true;
+  };
+  return sink;
 }
 
 function makeFillerScheduler() {
@@ -848,7 +875,7 @@ test("conversation history respects maxHistoryTurns", async () => {
 
 test("chime gate receives mode, speaker, timings, and lastBotReplyAt", async () => {
   const llm = makeLlm();
-  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  const { orchestrator, vad, playerSink } = buildOrchestrator({ llmClient: llm });
   await orchestrator.start();
   await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
   orchestrator.setChimeMode("always");
@@ -867,14 +894,979 @@ test("chime gate receives mode, speaker, timings, and lastBotReplyAt", async () 
     durationMs: 300,
     endedAt: 100,
   });
+  await vad.captured.callbacks.onSpeechEnd({
+    userId: "u2",
+    displayName: "Bea",
+    pcm16kMono: PCM16K,
+    durationMs: 300,
+    endedAt: 200,
+  });
 
   assert.equal(llm.state.gateArgs[0].chimeMode, "always");
   assert.equal(llm.state.gateArgs[0].speakerName, "Ana");
+  assert.equal(llm.state.gateArgs[0].userId, "u1");
   assert.equal(llm.state.gateArgs[0].lastBotReplyAt, null);
+  assert.equal(llm.state.gateArgs[0].lastBotReplyUserId, null);
   assert.ok(llm.state.gateArgs[1].lastBotReplyAt > 0);
+  assert.equal(llm.state.gateArgs[1].userId, "u1");
+  assert.equal(llm.state.gateArgs[1].lastBotReplyUserId, "u1");
+  assert.equal(llm.state.gateArgs[2].userId, "u2");
+  assert.equal(llm.state.gateArgs[2].lastBotReplyUserId, "u1");
+  assert.ok(playerSink.frames.length > 0);
   assert.ok("followUpWindowMs" in llm.state.gateArgs[0]);
   assert.ok("gateTimeoutMs" in llm.state.gateArgs[0]);
   assert.ok(llm.state.gateArgs[0].signal instanceof AbortSignal);
+});
+
+test("barge-in only aborts the turn for its speaker", async () => {
+  const llm = makeLlm({ blockStream: true });
+  const { orchestrator, vad, playerSink } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const active = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  await tick(0);
+  assert.equal(llm.state.streamSignal?.aborted, false);
+  vad.captured.callbacks.onBargeIn({ userId: "u2" });
+  assert.equal(llm.state.streamSignal?.aborted, false);
+  vad.captured.callbacks.onBargeIn({ userId: "u1" });
+  assert.equal(llm.state.streamSignal?.aborted, true);
+  assert.ok(playerSink.stopped > 0);
+  await active;
+  await orchestrator.close();
+});
+
+test("candidate deadlines cannot stop a committed turn or mutate replacement playback", async () => {
+  let sttCalls = 0;
+  let candidateSignal;
+  let releaseReply;
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe(_pcm, { signal } = {}) {
+      sttCalls += 1;
+      if (sttCalls === 2) {
+        candidateSignal = signal;
+        return await new Promise(() => {});
+      }
+      return "hello there";
+    },
+  };
+  const llm = makeLlm();
+  llm.streamReply = async ({ signal, onClause }) => {
+    llm.state.streamSignal = signal;
+    onClause?.("Hello there.");
+    await new Promise((resolve) => { releaseReply = resolve; });
+    return { fullText: "Hello there." };
+  };
+  const { orchestrator, vad, playerSink, filler } = buildOrchestrator({ sttAdapter: stt, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = new Map();
+  let timerId = 0;
+  globalThis.setTimeout = (fn) => { const id = ++timerId; timers.set(id, fn); return id; };
+  globalThis.clearTimeout = (id) => timers.delete(id);
+  try {
+    const turnA = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+    while (!llm.state.streamSignal || playerSink.frames.length === 0) await Promise.resolve();
+    const stopCount = playerSink.stopped;
+    vad.captured.callbacks.onSpeechEnd({ userId: "u2", displayName: "Bea", pcm16kMono: PCM16K, durationMs: 300 });
+    while (!candidateSignal) await Promise.resolve();
+    const framesBeforeFiller = playerSink.frames.length;
+    filler.state.onFire?.();
+    assert.equal(playerSink.frames.length, framesBeforeFiller);
+    const candidateDeadline = [...timers.values()].at(-1);
+    candidateDeadline();
+    assert.equal(llm.state.streamSignal.aborted, false);
+    assert.equal(playerSink.stopped, stopCount);
+    assert.equal(orchestrator.getStatus().lastError, null);
+    releaseReply();
+    await turnA;
+    assert.equal(orchestrator.getStatus().lastError, null);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    await orchestrator.close();
+  }
+});
+
+test("reset cleans pending turns and stale deadlines cannot stop new-session playback", async () => {
+  let sttCalls = 0;
+  let staleSignal;
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe(_pcm, { signal } = {}) {
+      sttCalls += 1;
+      if (sttCalls === 1) return "hello";
+      if (sttCalls === 2) {
+        staleSignal = signal;
+        return await new Promise(() => {});
+      }
+      return "hello again";
+    },
+  };
+  const releases = [];
+  const llm = makeLlm();
+  llm.streamReply = async ({ signal, onClause }) => {
+    llm.state.streamCalls += 1;
+    llm.state.streamSignal = signal;
+    onClause?.("Hello.");
+    await new Promise((resolve) => releases.push(resolve));
+    return { fullText: "Hello." };
+  };
+  const { orchestrator, vad, playerSink } = buildOrchestrator({ sttAdapter: stt, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = new Map();
+  let timerId = 0;
+  globalThis.setTimeout = (fn) => { const id = ++timerId; timers.set(id, fn); return id; };
+  globalThis.clearTimeout = (id) => timers.delete(id);
+  try {
+    const oldTurn = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+    while (llm.state.streamCalls < 1 || playerSink.frames.length === 0) await Promise.resolve();
+    releases[0]();
+    await oldTurn;
+    vad.captured.callbacks.onSpeechEnd({ userId: "u2", displayName: "Bea", pcm16kMono: PCM16K, durationMs: 300 });
+    while (!staleSignal) await Promise.resolve();
+    const staleDeadline = [...timers.values()].at(-1);
+    await orchestrator.leaveChannel({ guildId: "g1" });
+    assert.equal(staleSignal.aborted, true);
+    await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+    const newTurn = vad.captured.callbacks.onSpeechEnd({ userId: "u3", displayName: "Cory", pcm16kMono: PCM16K, durationMs: 300 });
+    while (llm.state.streamCalls < 2 || playerSink.frames.length === 0) await Promise.resolve();
+    const stops = playerSink.stopped;
+    staleDeadline();
+    assert.equal(playerSink.stopped, stops);
+    assert.equal(orchestrator.getStatus().lastError, null);
+    releases[1]();
+    await newTurn;
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    await orchestrator.close();
+  }
+});
+
+test("same-speaker pending turns supersede and pending turn count is bounded", async () => {
+  let sttCalls = 0;
+  const pendingSignals = [];
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe(_pcm, { signal } = {}) {
+      sttCalls += 1;
+      if (sttCalls === 1) return "hello";
+      pendingSignals.push(signal);
+      return await new Promise((resolve) => {
+        if (signal.aborted) { resolve(""); return; }
+        signal.addEventListener("abort", () => resolve(""), { once: true });
+      });
+    },
+  };
+  const llm = makeLlm();
+  let releaseA;
+  llm.streamReply = async ({ signal }) => {
+    llm.state.streamSignal = signal;
+    await new Promise((resolve) => { releaseA = resolve; });
+    return { fullText: "done" };
+  };
+  const { orchestrator, vad } = buildOrchestrator({ sttAdapter: stt, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  globalThis.setTimeout = () => 1;
+  globalThis.clearTimeout = () => {};
+  try {
+    const activeA = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+    while (!llm.state.streamSignal) await Promise.resolve();
+    vad.captured.callbacks.onSpeechEnd({ userId: "same", displayName: "Bea", pcm16kMono: PCM16K, durationMs: 300 });
+    while (pendingSignals.length < 1) await Promise.resolve();
+    vad.captured.callbacks.onSpeechEnd({ userId: "same", displayName: "Bea", pcm16kMono: PCM16K, durationMs: 300 });
+    while (pendingSignals.length < 2) await Promise.resolve();
+    assert.equal(pendingSignals[0].aborted, true);
+    assert.equal(pendingSignals[1].aborted, false);
+    assert.equal(llm.state.streamSignal.aborted, false);
+    for (let i = 0; i < 9; i += 1) {
+      vad.captured.callbacks.onSpeechEnd({ userId: `u${i}`, displayName: "Speaker", pcm16kMono: PCM16K, durationMs: 300 });
+      while (pendingSignals.length < Math.min(i + 3, 9)) await Promise.resolve();
+    }
+    assert.equal(pendingSignals.length, 9);
+    assert.equal(llm.state.streamSignal.aborted, false);
+    releaseA();
+    await activeA;
+    await orchestrator.close();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    await orchestrator.close();
+  }
+});
+
+test("draining playback only accepts barge-in from its playback owner", async () => {
+  const { orchestrator, vad, playerSink } = buildOrchestrator();
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  assert.ok(playerSink.frames.length > 0);
+  const stops = playerSink.stopped;
+  vad.captured.callbacks.onBargeIn({ userId: "u2" });
+  vad.captured.callbacks.onBargeIn({});
+  assert.equal(playerSink.stopped, stops);
+  vad.captured.callbacks.onBargeIn({ userId: "u1" });
+  assert.ok(playerSink.stopped > stops);
+  await orchestrator.close();
+});
+
+test("failed TTS does not grant follow-up credit", async () => {
+  const tts = makeTts();
+  tts.synthesizeClause = async () => { throw new Error("synthetic TTS failure"); };
+  const llm = makeLlm();
+  const { orchestrator, vad } = buildOrchestrator({ ttsAdapter: tts, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  assert.equal(llm.state.gateArgs[1].lastBotReplyAt, null);
+  assert.equal(llm.state.gateArgs[1].lastBotReplyUserId, null);
+  await orchestrator.close();
+});
+
+test("older same-speaker fillers cannot stop newer playback in-session or after rejoin", async () => {
+  const gates = [];
+  const llm = makeLlm();
+  llm.shouldChimeIn = () => new Promise((resolve) => gates.push(resolve));
+  const fillers = [];
+  const sink = makePlayerSink();
+  sink.playOpusFrame = (packet) => { sink.frames.push(Buffer.from(packet)); sink.playing = true; };
+  sink.stop = () => { sink.stopped += 1; sink.playing = false; };
+  const reactionPool = { pick: (text) => ({ frames48kOpus: [Buffer.from(text)] }) };
+  const scheduleReactionFillerImpl = ({ onFire }) => {
+    const item = { cancelled: false, fire() { if (!item.cancelled) onFire(); } };
+    fillers.push(item);
+    return { cancel() { item.cancelled = true; } };
+  };
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm, playerSink: sink, reactionPool, scheduleReactionFillerImpl });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  try {
+    const turnA = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+    while (gates.length < 1 || fillers.length < 1) await Promise.resolve();
+    fillers[0].fire();
+    assert.equal(sink.playing, true);
+
+    const turnB = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+    while (gates.length < 2 || fillers.length < 2) await Promise.resolve();
+    fillers[1].fire();
+    assert.equal(orchestrator.getStatus().isBotSpeaking, true);
+    const sameSessionStops = sink.stopped;
+    gates[0]({ shouldReply: false });
+    await turnA;
+    assert.equal(sink.stopped, sameSessionStops);
+    assert.equal(sink.playing, true);
+    assert.equal(orchestrator.getStatus().isBotSpeaking, true);
+
+    await orchestrator.leaveChannel({ guildId: "g1" });
+    await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+    const turnC = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+    while (gates.length < 3 || fillers.length < 3) await Promise.resolve();
+    fillers[2].fire();
+    const rejoinStops = sink.stopped;
+    gates[1]({ shouldReply: false });
+    await turnB;
+    assert.equal(sink.stopped, rejoinStops);
+    assert.equal(sink.playing, true);
+    assert.equal(orchestrator.getStatus().isBotSpeaking, true);
+    gates[2]({ shouldReply: false });
+    await turnC;
+    assert.ok(sink.stopped > rejoinStops);
+    assert.equal(sink.playing, false);
+    assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+  } finally {
+    await orchestrator.close();
+  }
+});
+
+test("reset retains canceled provider operations in the eight-operation cap until settled", async () => {
+  const gates = [];
+  let unresolved = 0;
+  let maxUnresolved = 0;
+  const llm = makeLlm();
+  llm.shouldChimeIn = () => {
+    unresolved += 1;
+    maxUnresolved = Math.max(maxUnresolved, unresolved);
+    return new Promise((resolve) => gates.push((value) => { unresolved -= 1; resolve(value); }));
+  };
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turns = [];
+  try {
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "old", displayName: "Old", pcm16kMono: PCM16K, durationMs: 300 }));
+    while (gates.length < 1) await Promise.resolve();
+    await orchestrator.leaveChannel({ guildId: "g1" });
+    await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+    for (let i = 0; i < 8; i += 1) {
+      turns.push(vad.captured.callbacks.onSpeechEnd({ userId: `u${i}`, displayName: "Speaker", pcm16kMono: PCM16K, durationMs: 300 }));
+      for (let j = 0; j < 12; j += 1) await Promise.resolve();
+    }
+    assert.equal(gates.length, 8);
+    assert.equal(maxUnresolved, 8);
+    gates[0]({ shouldReply: false });
+    await turns[0];
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "recovered", displayName: "Speaker", pcm16kMono: PCM16K, durationMs: 300 }));
+    for (let j = 0; j < 12; j += 1) await Promise.resolve();
+    assert.equal(gates.length, 9);
+    assert.equal(maxUnresolved, 8);
+    for (const settle of gates.slice(1)) settle({ shouldReply: false });
+    await Promise.all(turns.slice(1));
+    assert.equal(unresolved, 0);
+  } finally {
+    await orchestrator.close();
+  }
+});
+
+test("canceled STT that ignores abort occupies a slot across reset until it settles", async () => {
+  const settles = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const stt = {
+    name: () => "manual-stt",
+    close() {},
+    transcribe() {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise((resolve) => settles.push((transcript) => { inFlight -= 1; resolve(transcript); }));
+    },
+  };
+  const llm = makeLlm();
+  const { orchestrator, vad } = buildOrchestrator({ sttAdapter: stt, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turns = [];
+  try {
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "old", displayName: "Old", pcm16kMono: PCM16K, durationMs: 300 }));
+    while (settles.length < 1) await Promise.resolve();
+    await orchestrator.leaveChannel({ guildId: "g1" });
+    await orchestrator.joinChannel({ guildId: "g1", channelId: "c2" });
+    for (let i = 0; i < 8; i += 1) {
+      turns.push(vad.captured.callbacks.onSpeechEnd({ userId: `u${i}`, displayName: "Speaker", pcm16kMono: PCM16K, durationMs: 300 }));
+      for (let j = 0; j < 12; j += 1) await Promise.resolve();
+    }
+    assert.equal(settles.length, 8);
+    assert.equal(maxInFlight, 8);
+    settles[0]("stale transcript");
+    await turns[0];
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "recovered", displayName: "Speaker", pcm16kMono: PCM16K, durationMs: 300 }));
+    for (let j = 0; j < 12; j += 1) await Promise.resolve();
+    assert.equal(settles.length, 9);
+    assert.equal(maxInFlight, 8);
+    for (const settle of settles.slice(1)) settle("");
+    await Promise.all(turns.slice(1));
+    assert.equal(inFlight, 0);
+  } finally {
+    await orchestrator.close();
+  }
+});
+
+test("same-speaker canceled gate still counts until it settles and admission recovers", async () => {
+  const gates = [];
+  const gateSignals = [];
+  let unresolved = 0;
+  let maxUnresolved = 0;
+  const llm = makeLlm();
+  llm.shouldChimeIn = ({ signal }) => {
+    gateSignals.push(signal);
+    unresolved += 1;
+    maxUnresolved = Math.max(maxUnresolved, unresolved);
+    return new Promise((resolve) => gates.push((value) => { unresolved -= 1; resolve(value); }));
+  };
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turns = [];
+  try {
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "same", displayName: "Same", pcm16kMono: PCM16K, durationMs: 300 }));
+    while (gates.length < 1) await Promise.resolve();
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "same", displayName: "Same", pcm16kMono: PCM16K, durationMs: 300 }));
+    while (gates.length < 2) await Promise.resolve();
+    assert.equal(gateSignals[0].aborted, true);
+    assert.equal(gateSignals[1].aborted, false);
+    for (let i = 0; i < 6; i += 1) {
+      turns.push(vad.captured.callbacks.onSpeechEnd({ userId: `u${i}`, displayName: "Speaker", pcm16kMono: PCM16K, durationMs: 300 }));
+      while (gates.length < i + 3) await Promise.resolve();
+    }
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "same", displayName: "Same", pcm16kMono: PCM16K, durationMs: 300 }));
+    for (let i = 0; i < 16; i += 1) await Promise.resolve();
+    assert.equal(gates.length, 8);
+    assert.equal(gateSignals[1].aborted, false);
+    gates[0]({ shouldReply: false });
+    await turns[0];
+    turns.push(vad.captured.callbacks.onSpeechEnd({ userId: "same", displayName: "Same", pcm16kMono: PCM16K, durationMs: 300 }));
+    while (gates.length < 9) await Promise.resolve();
+    assert.equal(maxUnresolved, 8);
+    for (const settle of gates.slice(1)) settle({ shouldReply: false });
+    await Promise.all(turns.slice(1));
+    assert.equal(unresolved, 0);
+  } finally {
+    await orchestrator.close();
+  }
+});
+
+test("ownerless barge-in with or without a user ID does not stop playback", async () => {
+  const { orchestrator, vad, playerSink } = buildOrchestrator();
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const stops = playerSink.stopped;
+  vad.captured.callbacks.onBargeIn({ userId: "u1" });
+  vad.captured.callbacks.onBargeIn({});
+  assert.equal(playerSink.stopped, stops);
+  await orchestrator.close();
+});
+
+test("stale idle state cannot clear a replacement playback owner", async () => {
+  const shapes = makeRealVoiceDeps();
+  const { orchestrator, vad } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  const oldResource = shapes.played.at(-1);
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u2", displayName: "Bea", pcm16kMono: PCM16K, durationMs: 300 });
+  const currentResource = shapes.played.at(-1);
+  assert.notEqual(currentResource, oldResource);
+  const beforeStale = shapes.player.stops;
+  shapes.player.emit("stateChange", { status: "playing", resource: oldResource }, { status: "idle", resource: oldResource });
+  orchestrator.muteUser("u2", true);
+  assert.ok(shapes.player.stops > beforeStale);
+
+  orchestrator.muteUser("u2", false);
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u3", displayName: "Cy", pcm16kMono: PCM16K, durationMs: 300 });
+  const currentAfterRearm = shapes.played.at(-1);
+  const beforeIdle = shapes.player.stops;
+  shapes.player.emit("stateChange", { status: "playing", resource: currentAfterRearm }, { status: "idle", resource: currentAfterRearm });
+  orchestrator.muteUser("u3", true);
+  assert.equal(shapes.player.stops, beforeIdle);
+  await orchestrator.close();
+});
+
+test("pending fillers cannot retire another turn's attached reply resource", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  const gates = [];
+  const gateArgs = [];
+  const fillerCallbacks = [];
+  const llm = {
+    state: { gateArgs },
+    shouldChimeIn(args) {
+      gateArgs.push(args);
+      return new Promise((resolve) => gates.push(resolve));
+    },
+    async streamReply({ onToken }) {
+      onToken("audible reply.");
+      return { fullText: "audible reply." };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+    scheduleReactionFillerImpl: ({ onFire }) => {
+      fillerCallbacks.push(onFire);
+      return { cancel() {} };
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turnA = vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  const turnB = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 2 || fillerCallbacks.length < 2) await tick(0);
+
+  fillerCallbacks[0]();
+  const resourceA = shapes.player.attached();
+  const packetsA = [];
+  resourceA.stream.on("data", (packet) => packetsA.push(Buffer.from(packet)));
+  fillerCallbacks[1]();
+  const bPreservedAResource = shapes.player.attached() === resourceA;
+
+  gates[0]({ shouldReply: true });
+  await turnA;
+  const replyPackets = packetsA.filter((packet) => packet[0] === 0xaa);
+  const replyReachedAttachedResource = replyPackets.length > 0;
+  const replyResourceStayedLive = resourceA.retired === false;
+  gates[1]({ shouldReply: false });
+  await turnB;
+
+  const next = vad.captured.callbacks.onSpeechEnd({ userId: "c", displayName: "C", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 3) await tick(0);
+  const replyCreditGranted = gateArgs[2].lastBotReplyAt > 0;
+  gates[2]({ shouldReply: false });
+  await next;
+  await orchestrator.close();
+  assert.ok(replyReachedAttachedResource, "turn A reply must reach its attached resource");
+  assert.equal(replyResourceStayedLive, true);
+  assert.equal(bPreservedAResource, true, "turn B filler must not replace turn A output");
+  assert.equal(replyCreditGranted, true, "accepted reply frames should grant follow-up credit");
+});
+
+test("a committed reply reattaches output after idle and ignores stale idle", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  let emitClause;
+  let releaseReply;
+  const llm = {
+    async shouldChimeIn() { return { shouldReply: true }; },
+    streamReply({ onClause }) {
+      emitClause = onClause;
+      onClause("first.");
+      return new Promise((resolve) => { releaseReply = () => resolve({ fullText: "first second" }); });
+    },
+  };
+  const tts = makeTts();
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    ttsAdapter: tts,
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const turn = vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!emitClause || !releaseReply || tts.state.calls.length < 1) await tick(0);
+  const oldResource = shapes.player.attached();
+  assert.ok(oldResource);
+
+  shapes.player.emit("stateChange", { status: "playing", resource: oldResource }, { status: "idle", resource: oldResource });
+  assert.equal(orchestrator.getStatus().isBotSpeaking, false);
+  emitClause("second.");
+  for (let i = 0; i < 100 && tts.state.calls.length < 2; i += 1) await tick(0);
+  const freshResourceCreated = shapes.played.length >= 2;
+  const currentResource = shapes.player.attached();
+  let currentPackets = [];
+  if (freshResourceCreated) {
+    currentResource.stream.on("data", (packet) => currentPackets.push(Buffer.from(packet)));
+    await tick(0);
+  }
+  let staleIdlePreserved = false;
+  let currentIdleCleared = false;
+  if (freshResourceCreated) {
+    shapes.player.emit("stateChange", { status: "playing", resource: oldResource }, { status: "idle", resource: oldResource });
+    staleIdlePreserved = orchestrator.getStatus().isBotSpeaking === true;
+    shapes.player.emit("stateChange", { status: "playing", resource: currentResource }, { status: "idle", resource: currentResource });
+    currentIdleCleared = orchestrator.getStatus().isBotSpeaking === false;
+  }
+  releaseReply();
+  await turn;
+  await orchestrator.close();
+  assert.equal(freshResourceCreated, true, "next clause must use a fresh resource");
+  assert.ok(currentPackets.some((packet) => packet[0] === 0xaa), "new resource must receive the next clause");
+  assert.equal(staleIdlePreserved, true, "late old idle must preserve current output state");
+  assert.equal(currentIdleCleared, true, "genuine current idle must clear speaking state");
+});
+
+test("pending filler preserves a draining reply through denial and acceptance", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  const gates = [];
+  const fillerCallbacks = [];
+  let replyTokens = true;
+  const llm = {
+    async shouldChimeIn() {
+      return await new Promise((resolve) => gates.push(resolve));
+    },
+    async streamReply({ onToken }) {
+      if (replyTokens) onToken("queued reply.");
+      return { fullText: replyTokens ? "queued reply." : "accepted later." };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: null,
+    llmClient: llm,
+    scheduleReactionFillerImpl: ({ onFire }) => {
+      fillerCallbacks.push(onFire);
+      return { cancel() {} };
+    },
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+
+  const first = vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 1) await tick(0);
+  gates[0]({ shouldReply: true });
+  await first;
+  const drainingResource = shapes.player.attached();
+  assert.ok(drainingResource?.stream.writableEnded, "completed reply should be draining from its ended stream");
+  const drainingPackets = [];
+  drainingResource.stream.on("data", (packet) => drainingPackets.push(Buffer.from(packet)));
+
+  replyTokens = false;
+  const denied = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 2 || fillerCallbacks.length < 2) await tick(0);
+  fillerCallbacks[1]();
+  const denialPreservedResource = shapes.player.attached() === drainingResource;
+  gates[1]({ shouldReply: false });
+  await denied;
+  const denialDidNotRetire = drainingResource.retired === false;
+
+  const accepted = vad.captured.callbacks.onSpeechEnd({ userId: "c", displayName: "C", pcm16kMono: PCM16K, durationMs: 300 });
+  while (gates.length < 3 || fillerCallbacks.length < 3) await tick(0);
+  fillerCallbacks[2]();
+  const candidatePreservedResource = shapes.player.attached() === drainingResource;
+  replyTokens = true;
+  gates[2]({ shouldReply: true });
+  await accepted;
+  const acceptanceTookOver = shapes.player.attached() !== drainingResource;
+  const acceptedReplyRetiredOldResource = drainingResource.retired === true;
+  await orchestrator.close();
+  assert.equal(denialPreservedResource, true, "pending filler must not replace draining reply output");
+  assert.equal(denialDidNotRetire, true, "denial must leave queued reply resource intact");
+  assert.equal(candidatePreservedResource, true, "candidate filler must preserve old reply until acceptance");
+  assert.equal(acceptanceTookOver, true, "accepted turn may take over at commit");
+  assert.equal(acceptedReplyRetiredOldResource, true);
+});
+
+test("an explicitly idle sink releases stale ownership so a later filler can play", async () => {
+  const sink = makeStatefulPlayerSink();
+  const gateArgs = [];
+  let releaseSecondGate;
+  const llm = {
+    state: { gateArgs },
+    shouldChimeIn(args) {
+      gateArgs.push(args);
+      if (gateArgs.length === 1) return { shouldReply: true };
+      return new Promise((resolve) => { releaseSecondGate = resolve; });
+    },
+    async streamReply({ onToken }) {
+      onToken("reply.");
+      return { fullText: "reply." };
+    },
+  };
+  const fillerCallbacks = [];
+  const { orchestrator, vad } = buildOrchestrator({
+    playerSink: sink,
+    llmClient: llm,
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+    scheduleReactionFillerImpl: ({ onFire }) => {
+      fillerCallbacks.push(onFire);
+      return { cancel() {} };
+    },
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  sink.playing = false;
+  const before = sink.frames.length;
+  const candidate = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!releaseSecondGate || fillerCallbacks.length < 2) await tick(0);
+  fillerCallbacks[1]();
+  const fillerPlayed = sink.frames.length > before;
+  releaseSecondGate({ shouldReply: false });
+  await candidate;
+  await orchestrator.close();
+  assert.equal(fillerPlayed, true, "explicit sink idle must release the previous turn's owner");
+});
+
+test("an old speaker barge-in after explicit sink idle does not stop playback", async () => {
+  const sink = makeStatefulPlayerSink();
+  const { orchestrator, vad } = buildOrchestrator({ playerSink: sink });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  sink.playing = false;
+  const stopsBefore = sink.stopped;
+  vad.captured.callbacks.onBargeIn({ userId: "a" });
+  const stopsAfter = sink.stopped;
+  await orchestrator.close();
+  assert.equal(stopsAfter, stopsBefore, "idle sink ownership must be cleared without stopping playback again");
+});
+
+test("a sink without a status method retains owner matching", async () => {
+  const sink = makeStatefulPlayerSink();
+  const gates = [];
+  const gateArgs = [];
+  const fillers = [];
+  const llm = {
+    shouldChimeIn(args) {
+      gateArgs.push(args);
+      if (gateArgs.length === 1) return { shouldReply: true };
+      return new Promise((resolve) => gates.push(resolve));
+    },
+    async streamReply({ onToken }) {
+      onToken("reply.");
+      return { fullText: "reply." };
+    },
+  };
+  const { orchestrator, vad } = buildOrchestrator({
+    playerSink: sink,
+    llmClient: llm,
+    scheduleReactionFillerImpl: ({ onFire }) => { fillers.push(onFire); return { cancel() {} }; },
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  delete sink.isPlaying;
+  const before = sink.frames.length;
+  const candidate = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (fillers.length < 2) await tick(0);
+  fillers[1]();
+  const framesUnchanged = sink.frames.length === before;
+  gates[0]?.({ shouldReply: false });
+  await candidate;
+  await orchestrator.close();
+  assert.equal(framesUnchanged, true, "missing sink status must not be treated as explicit idle");
+});
+
+test("B barge-in aborts B without stopping A's draining resource", async () => {
+  const shapes = makeRealVoiceDeps();
+  const llm = makeLlm();
+  let secondSignal;
+  llm.streamReply = async ({ signal, onToken }) => {
+    llm.state.streamCalls += 1;
+    if (llm.state.streamCalls === 2) {
+      secondSignal = signal;
+      await new Promise((resolve, reject) => {
+        if (signal.aborted) return reject(abortError());
+        signal.addEventListener("abort", () => reject(abortError()), { once: true });
+      });
+    }
+    onToken?.("reply.");
+    return { fullText: "reply." };
+  };
+  const { orchestrator, vad } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  const resourceA = shapes.played.at(-1);
+  const turnB = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!secondSignal) await tick(0);
+  const stopsBefore = shapes.player.stops;
+  vad.captured.callbacks.onBargeIn({ userId: "b" });
+  const bWasAborted = secondSignal.aborted;
+  const aWasNotStopped = shapes.player.stops === stopsBefore && shapes.played.includes(resourceA);
+  await turnB;
+  await orchestrator.close();
+  assert.equal(bWasAborted, true, "B barge-in must cancel B's current turn");
+  assert.equal(aWasNotStopped, true, "B cancellation must preserve A's draining resource");
+});
+
+test("A barge-in stops A while B's current turn remains live", async () => {
+  const shapes = makeRealVoiceDeps();
+  const llm = makeLlm();
+  let secondSignal;
+  let releaseSecondReply;
+  llm.streamReply = async ({ signal, onToken }) => {
+    llm.state.streamCalls += 1;
+    if (llm.state.streamCalls === 2) {
+      secondSignal = signal;
+      await new Promise((resolve, reject) => {
+        releaseSecondReply = resolve;
+        signal.addEventListener("abort", () => reject(abortError()), { once: true });
+      });
+    }
+    onToken?.("reply.");
+    return { fullText: "reply." };
+  };
+  const { orchestrator, vad } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  const resourceA = shapes.played.at(-1);
+  const turnB = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!secondSignal || !releaseSecondReply) await tick(0);
+  const stopsBefore = shapes.player.stops;
+  vad.captured.callbacks.onBargeIn({ userId: "a" });
+  const aWasStopped = shapes.player.stops > stopsBefore;
+  const bRemainsLive = secondSignal.aborted === false;
+  const oldResourceRetired = resourceA.stream.destroyed || !orchestrator.getStatus().isBotSpeaking;
+  releaseSecondReply();
+  await turnB;
+  await orchestrator.close();
+  assert.equal(aWasStopped, true, "A's matching interruption must stop A's draining audio");
+  assert.equal(oldResourceRetired, true);
+  assert.equal(bRemainsLive, true, "A's interruption must not abort B's current turn");
+});
+
+test("muting current B does not stop A's draining resource", async () => {
+  const shapes = makeRealVoiceDeps();
+  const llm = makeLlm();
+  let secondSignal;
+  llm.streamReply = async ({ signal, onToken }) => {
+    llm.state.streamCalls += 1;
+    if (llm.state.streamCalls === 2) {
+      secondSignal = signal;
+      await new Promise((resolve, reject) => {
+        if (signal.aborted) return reject(abortError());
+        signal.addEventListener("abort", () => reject(abortError()), { once: true });
+      });
+    }
+    onToken?.("reply.");
+    return { fullText: "reply." };
+  };
+  const { orchestrator, vad } = buildOrchestrator({ voiceDeps: shapes.deps, playerSink: null, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  const stopsBefore = shapes.player.stops;
+  const turnB = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!secondSignal) await tick(0);
+  orchestrator.muteUser("b", true);
+  const bWasAborted = secondSignal.aborted;
+  const aWasNotStopped = shapes.player.stops === stopsBefore;
+  await turnB;
+  await orchestrator.close();
+  assert.equal(bWasAborted, true, "muting B must cancel B's current turn");
+  assert.equal(aWasNotStopped, true, "muting B must preserve A's separate draining resource");
+});
+
+test("a status-only sink cannot clear the native draining resource owner", async () => {
+  const shapes = makeReplacingVoiceDeps();
+  const gateArgs = [];
+  let releaseSecondGate;
+  const llm = {
+    shouldChimeIn(args) {
+      gateArgs.push(args);
+      if (gateArgs.length === 1) return { shouldReply: true };
+      return new Promise((resolve) => { releaseSecondGate = resolve; });
+    },
+    async streamReply({ onToken }) {
+      onToken("native reply.");
+      return { fullText: "native reply." };
+    },
+  };
+  const fillerCallbacks = [];
+  const statusOnlySink = { isPlaying: () => false };
+  const { orchestrator, vad } = buildOrchestrator({
+    voiceDeps: shapes.deps,
+    playerSink: statusOnlySink,
+    llmClient: llm,
+    scheduleReactionFillerImpl: ({ onFire }) => {
+      fillerCallbacks.push(onFire);
+      return { cancel() {} };
+    },
+    reactionPool: makeReactionPool({ frames48kOpus: [Buffer.from("filler")], pcm24k: null }),
+  });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "a", displayName: "A", pcm16kMono: PCM16K, durationMs: 300 });
+  const replyResource = shapes.player.attached();
+  const queuedFrames = replyResource.stream.readableLength;
+  assert.ok(queuedFrames > 0, "reply frames should remain unread in the native resource");
+
+  const candidate = vad.captured.callbacks.onSpeechEnd({ userId: "b", displayName: "B", pcm16kMono: PCM16K, durationMs: 300 });
+  while (!releaseSecondGate || fillerCallbacks.length < 2) await tick(0);
+  fillerCallbacks[1]();
+  const originalResourcePreserved = shapes.player.attached() === replyResource;
+  const originalFramesPreserved = replyResource.stream.readableLength === queuedFrames;
+  const replyResourceWasNotRetired = replyResource.retired === false;
+
+  releaseSecondGate({ shouldReply: false });
+  await candidate;
+  await orchestrator.close();
+  assert.equal(originalResourcePreserved, true, "status-only sink must not replace native playback");
+  assert.equal(originalFramesPreserved, true, "pending filler must preserve the unread reply packets");
+  assert.equal(replyResourceWasNotRetired, true);
+});
+
+test("a successful empty reply gives no follow-up credit", async () => {
+  const llm = makeLlm();
+  llm.streamReply = async () => ({ fullText: "" });
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  assert.equal(llm.state.gateArgs[1].lastBotReplyAt, null);
+  assert.equal(llm.state.gateArgs[1].lastBotReplyUserId, null);
+  await orchestrator.close();
+});
+
+test("a successful TTS synthesis that produces no reply frames gives no follow-up credit", async () => {
+  const tts = makeTts();
+  tts.synthesizeClause = async () => {};
+  const llm = makeLlm({ tokens: ["There is no emitted audio."] });
+  const { orchestrator, vad, playerSink } = buildOrchestrator({ ttsAdapter: tts, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  assert.equal(playerSink.frames.length, 0);
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  assert.equal(llm.state.gateArgs[1].lastBotReplyAt, null);
+  await orchestrator.close();
+});
+
+test("filler-only playback does not grant follow-up credit", async () => {
+  const llm = makeLlm({ blockGate: true });
+  llm.streamReply = async () => ({ fullText: "" });
+  const { orchestrator, vad, filler, playerSink } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const first = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  await tick(0);
+  filler.state.onFire();
+  assert.ok(playerSink.frames.length > 0);
+  llm.releaseGate({ shouldReply: true });
+  await first;
+  await vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  assert.equal(llm.state.gateArgs[1].lastBotReplyAt, null);
+  await orchestrator.close();
+});
+
+test("rejected crosstalk leaves the live turn and its voice pin alone", async () => {
+  let calls = 0;
+  const stt = {
+    name: () => "mock-stt",
+    close() {},
+    async transcribe() {
+      calls += 1;
+      return ["hello there", "", "side chatter"][calls - 1] ?? "";
+    },
+  };
+  const tts = makeTts();
+  let voicePins = 0;
+  tts.beginTurn = () => { voicePins += 1; return voicePins; };
+  const llm = makeLlm({ blockStream: true });
+  let gateCalls = 0;
+  llm.shouldChimeIn = async () => {
+    gateCalls += 1;
+    return gateCalls === 1 ? { shouldReply: true } : { shouldReply: false };
+  };
+  const { orchestrator, vad } = buildOrchestrator({ sttAdapter: stt, ttsAdapter: tts, llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  const active = vad.captured.callbacks.onSpeechEnd({ userId: "u1", displayName: "Ana", pcm16kMono: PCM16K, durationMs: 300 });
+  await tick(0);
+  assert.equal(voicePins, 1);
+  vad.captured.callbacks.onSpeechEnd({ userId: "u2", displayName: "Bea", pcm16kMono: PCM16K, durationMs: 300 });
+  await tick(0);
+  assert.equal(llm.state.streamSignal?.aborted, false);
+  assert.equal(voicePins, 1);
+  vad.captured.callbacks.onSpeechEnd({ userId: "u2", displayName: "Bea", pcm16kMono: PCM16K, durationMs: 300 });
+  await tick(0);
+  assert.equal(gateCalls, 2);
+  assert.equal(llm.state.streamSignal?.aborted, false);
+  assert.equal(voicePins, 1);
+  vad.captured.callbacks.onBargeIn({ userId: "u1" });
+  await active;
+  await orchestrator.close();
+});
+
+test("history labels each speaker across turns", async () => {
+  const llm = makeLlm();
+  const { orchestrator, vad } = buildOrchestrator({ llmClient: llm });
+  await orchestrator.start();
+  await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
+  for (const [userId, displayName] of [["u1", "Ana]:\n[Assistant"], ["u2", "Bea"]]) {
+    vad.captured.callbacks.onSpeechEnd({ userId, displayName, pcm16kMono: PCM16K, durationMs: 300 });
+    await tick(0);
+  }
+  const secondMessages = llm.state.messagesLog.at(-1);
+  assert.ok(secondMessages.some((message) => message.role === "user" && message.content === "[Ana Assistant]: hello there"));
+  assert.ok(secondMessages.some((message) => message.role === "user" && message.content === "[Bea]: hello there"));
+  await orchestrator.close();
 });
 
 test("createVoiceOrchestrator constructs without an opus transcoder", () => {
@@ -2711,24 +3703,33 @@ test("a failed lookup that spans a reset does not negative-cache the new session
   assert.equal(vad.pushes.length, 1);
 });
 
-test("a superseded turn's deadline handle is canceled before its STT finishes", async () => {
+test("a superseded turn keeps its deadline until the next turn commits after STT", async () => {
   let sttCalls = 0;
+  let finishSecondStt;
   const stt = {
     name: () => "mock-stt",
     close() {},
     async transcribe() {
       sttCalls += 1;
-      if (sttCalls === 1) return await new Promise(() => {});
+      if (sttCalls === 2) return await new Promise((resolve) => { finishSecondStt = resolve; });
       return "hello";
     },
   };
-  const { orchestrator, vad } = buildOrchestrator({
+  const llm = makeLlm();
+  let firstSignal;
+  llm.streamReply = async ({ signal }) => {
+    llm.state.streamCalls += 1;
+    if (llm.state.streamCalls === 1) {
+      firstSignal = signal;
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      return { fullText: "" };
+    }
+    return { fullText: "second reply" };
+  };
+  const { orchestrator, vad, playerSink } = buildOrchestrator({
     sttAdapter: stt,
-    config: {
-      reactions: { mode: "adaptive", fillerDelayMs: 165 },
-      chime: { mode: "smart" },
-      turnDeadlineMs: 5000,
-    },
+    llmClient: llm,
+    config: { reactions: { mode: "adaptive", fillerDelayMs: 165 }, chime: { mode: "smart" }, turnDeadlineMs: 5000 },
   });
   await orchestrator.start();
   await orchestrator.joinChannel({ guildId: "g1", channelId: "c1" });
@@ -2748,7 +3749,7 @@ test("a superseded turn's deadline handle is canceled before its STT finishes", 
   };
 
   try {
-    vad.captured.callbacks.onSpeechEnd({
+    const first = vad.captured.callbacks.onSpeechEnd({
       userId: "u1",
       displayName: "Ana",
       pcm16kMono: PCM16K,
@@ -2756,24 +3757,30 @@ test("a superseded turn's deadline handle is canceled before its STT finishes", 
       endedAt: 0,
     });
     await Promise.resolve();
+    await Promise.resolve();
     const firstDeadline = scheduled.keys().next().value;
     assert.ok(firstDeadline !== undefined);
 
     const second = vad.captured.callbacks.onSpeechEnd({
-      userId: "u1",
-      displayName: "Ana",
+      userId: "u2",
+      displayName: "Bea",
       pcm16kMono: PCM16K,
       durationMs: 300,
       endedAt: 100,
     });
-    await Promise.resolve();
-
+    while (!finishSecondStt) await Promise.resolve();
+    assert.equal(scheduled.has(firstDeadline), true);
+    finishSecondStt("hello again");
+    await second;
     assert.equal(scheduled.has(firstDeadline), false);
+    assert.equal(firstSignal.aborted, true);
+    assert.ok(playerSink.stopped > 0);
     assert.equal(orchestrator.getStatus().lastError, null);
 
     globalThis.setTimeout = realSetTimeout;
     globalThis.clearTimeout = realClearTimeout;
-    await second;
+    await first;
+    await orchestrator.close();
   } finally {
     globalThis.setTimeout = realSetTimeout;
     globalThis.clearTimeout = realClearTimeout;

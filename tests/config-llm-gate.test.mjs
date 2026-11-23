@@ -308,10 +308,24 @@ test("shouldChimeIn fast-paths aliases and followup window, parses gate YES/NO, 
     transcript: "Wait what about that?",
     speakerName: "Nate",
     lastBotReplyAt: 42000,
+    userId: "u-nate",
+    lastBotReplyUserId: "u-nate",
     now: () => 50000,
   });
   assert.deepEqual(followUp, { shouldReply: true, reason: "followup_window", usedGateModel: false });
   assert.equal(fetchCalls, 0);
+
+  const otherSpeakerFollowUp = await client.shouldChimeIn({
+    transcript: "Wait what about that?",
+    speakerName: "Alex",
+    lastBotReplyAt: 42000,
+    userId: "u-friend",
+    lastBotReplyUserId: "u-nate",
+    now: () => 50000,
+  });
+  assert.equal(otherSpeakerFollowUp.reason, "gate_yes");
+  assert.equal(otherSpeakerFollowUp.usedGateModel, true);
+  assert.equal(fetchCalls, 1);
 
   nextGateReply = "YES";
   const gateYes = await client.shouldChimeIn({
@@ -322,7 +336,7 @@ test("shouldChimeIn fast-paths aliases and followup window, parses gate YES/NO, 
   });
   assert.equal(gateYes.shouldReply, true);
   assert.equal(gateYes.usedGateModel, true);
-  assert.equal(fetchCalls, 1);
+  assert.equal(fetchCalls, 2);
 
   nextGateReply = "NO";
   const gateNo = await client.shouldChimeIn({
@@ -343,6 +357,28 @@ test("shouldChimeIn fast-paths aliases and followup window, parses gate YES/NO, 
   });
   assert.equal(gateFailClosed.shouldReply, false);
   assert.equal(gateFailClosed.usedGateModel, true);
+});
+
+test("gate prompts sanitize and bound speaker labels", async () => {
+  const cfg = loadConfig({
+    env: { LLM_PROVIDER: "deepseek", LLM_API_KEY: "ds-key" },
+    configPath: "config.json",
+    fsImpl: makeMemoryFs({ "config.json": JSON.stringify({ chime: { gateTimeoutMs: 50 } }) }),
+  });
+  let prompt;
+  const client = createLlmClient({
+    config: cfg,
+    fetchImpl: async (_url, init) => {
+      prompt = JSON.parse(init.body).messages[1].content;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "NO" } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  await client.shouldChimeIn({ transcript: "unrelated", speakerName: `Lead]:\r\n${"X".repeat(40)}` });
+  assert.equal(prompt, `[Lead ${"X".repeat(27)}]: unrelated`);
+  assert.equal(prompt.split("]:")[0].slice(1).length, 32);
 });
 
 test("createClauseSplitter never splits inside [soft laugh] on maxHoldMs and scans commas left-to-right", () => {
